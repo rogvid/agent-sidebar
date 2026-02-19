@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Source common utilities
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=git-wt-common.sh
+source "${SCRIPT_DIR}/git-wt-common.sh"
+
+# Usage information
+usage() {
+  cat <<EOF
+Usage: git-wt-add [OPTIONS] <branch-name>
+       git-wt-add [OPTIONS] -b <base-branch> <new-branch>
+
+Create a new git worktree or switch to existing one.
+
+OPTIONS:
+  -b <base>     Create new branch from specific base branch
+  -t            Open in tmux session after creation
+  -h, --help    Show this help message
+
+EXAMPLES:
+  git-wt-add feat/new-feature        # Create or switch to worktree
+  git-wt-add -b main feat/hotfix     # Create from main branch
+  git-wt-add -t chore/cleanup        # Create and open in tmux
+
+The worktree will be created in a sibling 'worktrees/' directory with the
+naming format: <repo>-<type>-<branch-slug>
+
+Example: feat/user-auth -> dotfiles-feat-user-auth
+EOF
+  exit 0
+}
+
+# Parse command line arguments
+OPEN_TMUX=false
+BASE_BRANCH=""
+BRANCH_NAME=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      usage
+      ;;
+    -t)
+      OPEN_TMUX=true
+      shift
+      ;;
+    -b)
+      if [[ $# -lt 2 ]]; then
+        error "Option -b requires a base branch argument"
+        exit 1
+      fi
+      BASE_BRANCH="$2"
+      shift 2
+      ;;
+    -*)
+      error "Unknown option: $1"
+      usage
+      ;;
+    *)
+      if [[ -z "${BRANCH_NAME}" ]]; then
+        BRANCH_NAME="$1"
+      else
+        error "Too many arguments"
+        usage
+      fi
+      shift
+      ;;
+  esac
+done
+
+# Validate arguments
+if [[ -z "${BRANCH_NAME}" ]]; then
+  error "Branch name is required"
+  usage
+fi
+
+# Validate environment
+validate_in_git_repo
+validate_projects_structure
+
+# Get repository information
+REPO_ROOT="$(get_repo_root)"
+REPO_NAME="$(get_repo_name)"
+WORKTREES_ROOT="$(get_worktrees_root)"
+
+# Format worktree name and path
+WORKTREE_NAME="$(format_worktree_name "${REPO_NAME}" "${BRANCH_NAME}")"
+WORKTREE_PATH="${WORKTREES_ROOT}/${WORKTREE_NAME}"
+
+# Check if worktree already exists
+if worktree_exists "${WORKTREE_PATH}"; then
+  info "Worktree already exists: ${WORKTREE_NAME}"
+  echo "  Path: ${WORKTREE_PATH}"
+  existing_branch="$(get_worktree_branch "${WORKTREE_PATH}")"
+  echo "  Branch: ${existing_branch}"
+  echo ""
+  
+  # Switch to it if tmux flag is set
+  if [[ "${OPEN_TMUX}" == true ]]; then
+    if command -v tmux-sessionizer >/dev/null 2>&1; then
+      exec tmux-sessionizer "${WORKTREE_PATH}"
+    else
+      warning "tmux-sessionizer not found, opening directory instead"
+      cd "${WORKTREE_PATH}" && exec "${SHELL}"
+    fi
+  else
+    echo "To switch to it:"
+    echo "  cd ${WORKTREE_PATH}"
+  fi
+  exit 0
+fi
+
+# Check if branch exists
+BRANCH_STATUS="$(branch_exists "${BRANCH_NAME}")"
+
+# Create worktree based on branch status
+echo "Creating worktree: ${WORKTREE_NAME}"
+echo ""
+
+case "${BRANCH_STATUS}" in
+  local)
+    # Branch exists locally, create worktree from it
+    info "Using existing local branch: ${BRANCH_NAME}"
+    git worktree add "${WORKTREE_PATH}" "${BRANCH_NAME}"
+    ;;
+    
+  remote)
+    # Branch exists on remote, create worktree with tracking
+    info "Checking out remote branch: origin/${BRANCH_NAME}"
+    git worktree add "${WORKTREE_PATH}" -b "${BRANCH_NAME}" --track "origin/${BRANCH_NAME}"
+    ;;
+    
+  none)
+    # Branch doesn't exist, create new branch
+    if [[ -n "${BASE_BRANCH}" ]]; then
+      info "Creating new branch '${BRANCH_NAME}' from '${BASE_BRANCH}'"
+      git worktree add "${WORKTREE_PATH}" -b "${BRANCH_NAME}" "${BASE_BRANCH}"
+    else
+      info "Creating new branch: ${BRANCH_NAME}"
+      git worktree add "${WORKTREE_PATH}" -b "${BRANCH_NAME}"
+    fi
+    ;;
+esac
+
+echo ""
+success "✓ Worktree created successfully"
+echo "  Branch: ${BRANCH_NAME}"
+echo "  Path: ${WORKTREE_PATH}"
+echo ""
+
+# Open in tmux if requested
+if [[ "${OPEN_TMUX}" == true ]]; then
+  if command -v tmux-sessionizer >/dev/null 2>&1; then
+    exec tmux-sessionizer "${WORKTREE_PATH}"
+  else
+    warning "tmux-sessionizer not found, opening directory instead"
+    cd "${WORKTREE_PATH}" && exec "${SHELL}"
+  fi
+else
+  echo "To switch to it:"
+  echo "  cd ${WORKTREE_PATH}"
+fi

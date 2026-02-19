@@ -1,0 +1,225 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Source common utilities
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=git-wt-common.sh
+source "${SCRIPT_DIR}/git-wt-common.sh"
+
+# Usage information
+usage() {
+  cat <<EOF
+Usage: git-wt-prune [OPTIONS]
+
+Remove all worktrees for branches that have been merged into main.
+
+OPTIONS:
+  --dry-run       Show what would be removed without actually removing
+  -f, --force     Force removal without confirmation
+  -d, --delete    Also delete the merged branches
+  -h, --help      Show this help message
+
+EXAMPLES:
+  git-wt-prune              # Interactive removal of merged worktrees
+  git-wt-prune --dry-run    # Show what would be removed
+  git-wt-prune -f -d        # Force remove and delete merged branches
+EOF
+  exit 0
+}
+
+# Parse command line arguments
+DRY_RUN=false
+FORCE=false
+DELETE_BRANCHES=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      usage
+      ;;
+    --dry-run)
+      DRY_RUN=true
+      shift
+      ;;
+    -f|--force)
+      FORCE=true
+      shift
+      ;;
+    -d|--delete)
+      DELETE_BRANCHES=true
+      shift
+      ;;
+    -*)
+      error "Unknown option: $1"
+      usage
+      ;;
+    *)
+      error "Unexpected argument: $1"
+      usage
+      ;;
+  esac
+done
+
+# Validate environment
+validate_in_git_repo
+
+# Get repository information
+REPO_ROOT="$(get_repo_root)"
+MAIN_BRANCH="$(get_main_branch)"
+
+# Function to get worktree list
+get_worktree_list() {
+  declare -a WORKTREES_DATA=()
+  CURRENT_WT=""
+  CURRENT_BRANCH_WT=""
+  IS_MAIN_REPO=false
+  
+  while IFS= read -r line; do
+    if [[ "${line}" =~ ^worktree\ (.+)$ ]]; then
+      # Save previous worktree if it's not the main repo
+      if [[ -n "${CURRENT_WT}" ]] && [[ "${IS_MAIN_REPO}" == false ]] && [[ "${CURRENT_WT}" != "${REPO_ROOT}" ]]; then
+        WORKTREES_DATA+=("${CURRENT_WT}|${CURRENT_BRANCH_WT}")
+      fi
+      
+      CURRENT_WT="${BASH_REMATCH[1]}"
+      CURRENT_BRANCH_WT=""
+      IS_MAIN_REPO=false
+      
+    elif [[ "${line}" =~ ^branch\ refs/heads/(.+)$ ]]; then
+      CURRENT_BRANCH_WT="${BASH_REMATCH[1]}"
+      
+    elif [[ "${line}" =~ ^bare$ ]]; then
+      IS_MAIN_REPO=true
+    fi
+  done < <(git worktree list --porcelain)
+  
+  # Save last worktree if it's not the main repo
+  if [[ -n "${CURRENT_WT}" ]] && [[ "${IS_MAIN_REPO}" == false ]] && [[ "${CURRENT_WT}" != "${REPO_ROOT}" ]]; then
+    WORKTREES_DATA+=("${CURRENT_WT}|${CURRENT_BRANCH_WT}")
+  fi
+  
+  # Return the array
+  printf '%s\n' "${WORKTREES_DATA[@]}"
+}
+
+# Get all worktrees
+WORKTREE_LIST="$(get_worktree_list)"
+
+if [[ -z "${WORKTREE_LIST}" ]]; then
+  echo "No worktrees found."
+  exit 0
+fi
+
+# Find merged worktrees
+declare -a MERGED_WORKTREES=()
+
+while IFS='|' read -r wt_path wt_branch; do
+  if is_branch_merged "${wt_branch}"; then
+    MERGED_WORKTREES+=("${wt_path}|${wt_branch}")
+  fi
+done <<< "${WORKTREE_LIST}"
+
+# Check if there are merged worktrees
+if [[ ${#MERGED_WORKTREES[@]} -eq 0 ]]; then
+  success "No merged worktrees found. Nothing to prune."
+  exit 0
+fi
+
+# Display merged worktrees
+if [[ "${DRY_RUN}" == true ]]; then
+  echo -e "${COLOR_YELLOW}[DRY RUN]${COLOR_RESET} Would remove ${#MERGED_WORKTREES[@]} merged worktree(s):"
+else
+  echo "Found ${#MERGED_WORKTREES[@]} merged worktree(s):"
+fi
+
+echo ""
+for entry in "${MERGED_WORKTREES[@]}"; do
+  IFS='|' read -r wt_path wt_branch <<< "${entry}"
+  wt_name="$(basename "${wt_path}")"
+  printf "  ${COLOR_GREEN}✓${COLOR_RESET} %-35s %-25s %b\n" \
+    "${wt_name}" \
+    "${wt_branch}" \
+    "${COLOR_DIM}${wt_path}${COLOR_RESET}"
+done
+echo ""
+
+# Exit if dry run
+if [[ "${DRY_RUN}" == true ]]; then
+  if [[ "${DELETE_BRANCHES}" == true ]]; then
+    echo "Would also delete the merged branches."
+  fi
+  exit 0
+fi
+
+# Confirm removal unless force flag is set
+if [[ "${FORCE}" != true ]]; then
+  if [[ "${DELETE_BRANCHES}" == true ]]; then
+    read -rp "Remove these worktrees and delete their branches? [y/N]: " confirm
+  else
+    read -rp "Remove these worktrees? [y/N]: " confirm
+  fi
+  
+  if [[ ! "${confirm}" =~ ^[Yy]$ ]]; then
+    echo "Aborted."
+    exit 0
+  fi
+fi
+
+# Remove worktrees
+echo ""
+REMOVED_COUNT=0
+declare -a REMOVED_BRANCHES=()
+
+for entry in "${MERGED_WORKTREES[@]}"; do
+  IFS='|' read -r wt_path wt_branch <<< "${entry}"
+  wt_name="$(basename "${wt_path}")"
+  
+  echo -n "Removing ${wt_name}... "
+  
+  if git worktree remove "${wt_path}" 2>/dev/null; then
+    success "✓"
+    REMOVED_COUNT=$((REMOVED_COUNT + 1))
+    REMOVED_BRANCHES+=("${wt_branch}")
+  else
+    # Try force remove
+    if git worktree remove --force "${wt_path}" 2>/dev/null; then
+      success "✓ (forced)"
+      REMOVED_COUNT=$((REMOVED_COUNT + 1))
+      REMOVED_BRANCHES+=("${wt_branch}")
+    else
+      error "✗ (failed)"
+    fi
+  fi
+done
+
+echo ""
+success "Removed ${REMOVED_COUNT} worktree(s)."
+
+# Delete branches if requested
+if [[ "${DELETE_BRANCHES}" == true ]] && [[ ${#REMOVED_BRANCHES[@]} -gt 0 ]]; then
+  echo ""
+  echo "Deleting merged branches..."
+  
+  DELETED_COUNT=0
+  for branch in "${REMOVED_BRANCHES[@]}"; do
+    echo -n "Deleting ${branch}... "
+    
+    if git branch -d "${branch}" 2>/dev/null; then
+      success "✓"
+      DELETED_COUNT=$((DELETED_COUNT + 1))
+    else
+      warning "✗ (failed or still in use)"
+    fi
+  done
+  
+  echo ""
+  success "Deleted ${DELETED_COUNT} branch(es)."
+fi
+
+# Suggest branch cleanup if branches weren't deleted
+if [[ "${DELETE_BRANCHES}" != true ]] && [[ ${#REMOVED_BRANCHES[@]} -gt 0 ]]; then
+  echo ""
+  info "Tip: The branches still exist. To delete them, run:"
+  echo "  git-wt-prune -d"
+  echo "  or manually: git branch -d <branch-name>"
+fi
