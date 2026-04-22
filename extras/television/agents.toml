@@ -1,0 +1,33 @@
+[metadata]
+name = "agents"
+description = "Monitor active agentic coding sessions (Claude, Codex, Pi) in tmux"
+
+[source]
+command = "bash agent-scan.sh"
+ansi = true
+output = "{strip_ansi|split: :2}"
+
+[preview]
+command = "tmux capture-pane -t '{strip_ansi|split: :4}' -p -T 2>/dev/null"
+ansi = true
+
+[ui]
+direction = "portrait"
+
+[ui.preview_panel]
+size = 70
+
+[keybindings]
+enter = "actions:attach"
+ctrl-d = ["actions:kill_session", "reload_source"]
+ctrl-r = "reload_source"
+
+[actions.attach]
+description = "Switch to agent pane"
+command = "tmux switch-client -t '{strip_ansi|split: :4}' 2>/dev/null || tmux attach-session -t '{strip_ansi|split: :4}'"
+mode = "execute"
+
+[actions.kill_session]
+description = "Kill agent session"
+command = "tmux kill-session -t '{strip_ansi|split: :2}'"
+mode = "fork"
