@@ -151,36 +151,46 @@ if [[ -z "${TARGET}" ]]; then
     SHOW_PREVIEW=true
   fi
 
+  # Determine available width for the display column (fzf uses ~50% when preview is shown)
+  if [[ "${SHOW_PREVIEW}" == true ]]; then
+    DISPLAY_WIDTH=$(( FULL_WIDTH / 2 - 4 ))
+  else
+    DISPLAY_WIDTH=$(( FULL_WIDTH - 4 ))
+  fi
+
   # Format for fzf display (tab-delimited: display \t branch \t path)
   FZF_INPUT=""
   while IFS='|' read -r wt_path wt_branch; do
-    wt_name="$(basename "${wt_path}")"
-
     # Determine primary status
     if is_branch_merged "${wt_branch}"; then
       symbol="✓"
-      status="${COLOR_GREEN}[MERGED]${COLOR_RESET}"
+      tags_plain="[MERGED]"
+      tags="${COLOR_GREEN}[MERGED]${COLOR_RESET}"
     elif [[ -z "$(git branch -r --list "origin/${wt_branch}")" ]]; then
       symbol="!"
-      status="${COLOR_RED}[UNTRACKED]${COLOR_RESET}"
+      tags_plain="[UNTRACKED]"
+      tags="${COLOR_RED}[UNTRACKED]${COLOR_RESET}"
     else
       symbol="•"
-      status="${COLOR_BLUE}[ACTIVE]${COLOR_RESET}"
+      tags_plain="[ACTIVE]"
+      tags="${COLOR_BLUE}[ACTIVE]${COLOR_RESET}"
     fi
 
     # Check for uncommitted changes
     if [[ -n "$(git -C "${wt_path}" status --porcelain 2>/dev/null)" ]]; then
-      status+=" ${COLOR_YELLOW}[DIRTY]${COLOR_RESET}"
+      tags_plain="[DIRTY] ${tags_plain}"
+      tags="${COLOR_YELLOW}[DIRTY]${COLOR_RESET} ${tags}"
     fi
 
-    # Use fixed-width columns — fzf pane width is unpredictable so avoid right-alignment
-    if [[ "${SHOW_PREVIEW}" == true ]]; then
-      display="$(printf "  %s %-40s ${COLOR_DIM}%-45s${COLOR_RESET}  %b" \
-        "${symbol}" "${wt_branch}" "${wt_name}" "${status}")"
-    else
-      display="$(printf "  %s %-40s %b" \
-        "${symbol}" "${wt_branch}" "${status}")"
-    fi
+    # Build display: "  symbol branch   <padding>   tags"
+    # Left side: "  symbol branch" (4 chars prefix + branch length)
+    left_len=$(( 4 + ${#wt_branch} ))
+    tags_len=${#tags_plain}
+    padding=$(( DISPLAY_WIDTH - left_len - tags_len ))
+    (( padding < 2 )) && padding=2
+    spaces="$(printf '%*s' "${padding}" '')"
+
+    display="  ${symbol} ${wt_branch}${spaces}${tags}"
 
     FZF_INPUT+="${display}"$'\t'"${wt_branch}"$'\t'"${wt_path}"$'\n'
   done <<< "${WORKTREE_LIST}"
