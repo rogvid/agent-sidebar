@@ -3,9 +3,10 @@ name = "agents"
 description = "Monitor active agentic coding sessions (Claude, Codex, Pi) in tmux"
 
 [source]
-command = "bash agent-scan.sh"
+command = "agent-scan"
 ansi = true
 output = "{strip_ansi|split: :2}"
+watch = 2.0
 
 [preview]
 command = "tmux capture-pane -t '{strip_ansi|split: :4}' -p -T 2>/dev/null"
