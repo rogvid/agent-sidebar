@@ -1,0 +1,542 @@
+#!/usr/bin/env -S uv run --script
+# vim: set ft=python:
+# -*- mode: python -*-
+# language: python
+# /// script
+# requires-python = ">=3.13"
+# dependencies = [
+#   "psutil==7.2.2",
+# ]
+# ///
+"""agent-scan — report active agentic coding sessions across tmux.
+
+Subcommands:
+  scan         (default) print one row per session with state
+  install      wire Claude Code lifecycle hooks into ~/.claude/settings.json
+  uninstall    remove our hook entries; --purge also clears the state dir
+  status       show install state + state-dir contents
+  hook EVENT   internal: invoked by the hooks themselves; reads JSON on stdin
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from collections import deque
+from dataclasses import dataclass
+from pathlib import Path
+
+import psutil
+
+HOOK_EVENTS = (
+    "SessionStart",
+    "UserPromptSubmit",
+    "Stop",
+    "Notification",
+    "PermissionRequest",
+    "SessionEnd",
+)
+
+AGENT_NAMES = frozenset({"claude", "codex", "pi"})
+
+EVENT_TO_STATE = {
+    "SessionStart": "idle",
+    "Stop": "idle",
+    "UserPromptSubmit": "running",
+    "Notification": "waiting",
+    "PermissionRequest": "waiting",
+    "SessionEnd": "end",
+}
+
+SCRIPT_PATH = Path(__file__).resolve()
+SETTINGS_FILE = Path.home() / ".claude" / "settings.json"
+STATE_DIR = (
+    Path(os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache"))
+    / "claude-agent-state"
+)
+
+RESET = "\033[0m"
+BLUE, YELLOW, GREEN, CYAN, DIM, RED = (
+    "\033[34m", "\033[33m", "\033[32m", "\033[36m", "\033[2m", "\033[31m",
+)
+STATE_COLOR = {"running": BLUE, "waiting": YELLOW, "idle": GREEN}
+
+
+def color_state(state: str) -> tuple[str, str]:
+    color = STATE_COLOR.get(state, DIM)
+    return f"{color}●{RESET}", f"{color}{state}{RESET}"
+
+
+def print_row(state: str, session: str, agent: str, pane: str) -> None:
+    dot, word = color_state(state)
+    print(f"{dot} {word} {session} {CYAN}{agent}{RESET} {pane}")
+
+
+# --- tmux ---
+
+@dataclass(frozen=True)
+class TmuxPane:
+    pane_id: str
+    session: str
+    pid: int
+
+
+def list_tmux_panes() -> dict[str, TmuxPane]:
+    try:
+        r = subprocess.run(
+            ["tmux", "list-panes", "-a", "-F",
+             "#{pane_id} #{session_name} #{pane_pid}"],
+            capture_output=True, text=True, timeout=2,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return {}
+    if r.returncode != 0:
+        return {}
+    panes: dict[str, TmuxPane] = {}
+    for line in r.stdout.splitlines():
+        parts = line.split(maxsplit=2)
+        if len(parts) < 3:
+            continue
+        pane_id, session, pid = parts
+        try:
+            panes[pane_id] = TmuxPane(pane_id, session, int(pid))
+        except ValueError:
+            continue
+    return panes
+
+
+def tmux_pane_pid(pane_id: str) -> int | None:
+    try:
+        r = subprocess.run(
+            ["tmux", "display-message", "-p", "-t", pane_id, "#{pane_pid}"],
+            capture_output=True, text=True, timeout=2,
+        )
+        return int(r.stdout.strip())
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return None
+
+
+# --- process tree ---
+
+def find_agent_in_tree(root_pid: int) -> str | None:
+    """BFS from root_pid; return name of first descendant in AGENT_NAMES."""
+    try:
+        root = psutil.Process(root_pid)
+    except psutil.NoSuchProcess:
+        return None
+    queue: deque[psutil.Process] = deque([root])
+    while queue:
+        proc = queue.popleft()
+        try:
+            name = proc.name()
+            if name in AGENT_NAMES:
+                return name
+            queue.extend(proc.children())
+        except psutil.Error:
+            continue
+    return None
+
+
+def find_ancestor_agent_pid(start_pid: int) -> int | None:
+    """Walk up from start_pid; return PID of first agent ancestor or None."""
+    try:
+        proc = psutil.Process(start_pid)
+    except psutil.NoSuchProcess:
+        return None
+    chain = [proc]
+    try:
+        chain.extend(proc.parents())
+    except psutil.Error:
+        pass
+    for p in chain:
+        try:
+            if p.name() in AGENT_NAMES:
+                return p.pid
+        except psutil.Error:
+            continue
+    return None
+
+
+def agent_pid_alive(pid: int) -> bool:
+    try:
+        proc = psutil.Process(pid)
+        return proc.is_running() and proc.name() in AGENT_NAMES
+    except (psutil.NoSuchProcess, psutil.Error):
+        return False
+
+
+# --- state file io ---
+
+def read_state(path: Path) -> dict | None:
+    try:
+        return json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def write_state(path: Path, data: dict) -> None:
+    tmp = path.parent / f"{path.name}.tmp.{os.getpid()}"
+    tmp.write_text(json.dumps(data))
+    tmp.replace(path)
+
+
+# --- subcommand: hook ---
+
+def cmd_hook(event: str | None) -> int:
+    if not event:
+        return 0
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+    raw = sys.stdin.read()
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return 0
+
+    session_id = payload.get("session_id")
+    if not session_id:
+        return 0
+
+    state = EVENT_TO_STATE.get(event, "idle")
+    state_file = STATE_DIR / f"{session_id}.json"
+
+    if state == "end":
+        state_file.unlink(missing_ok=True)
+        return 0
+
+    now = int(time.time())
+    existing = read_state(state_file) if state_file.exists() else None
+
+    if existing is not None:
+        existing["state"] = state
+        existing["updated_at"] = now
+        write_state(state_file, existing)
+        return 0
+
+    pane_id = os.environ.get("TMUX_PANE", "")
+    pane_pid = tmux_pane_pid(pane_id) if pane_id else None
+    agent_pid = find_ancestor_agent_pid(os.getpid())
+
+    write_state(state_file, {
+        "session_id": session_id,
+        "tmux_pane": pane_id,
+        "tmux_pane_pid": str(pane_pid) if pane_pid else "",
+        "agent_pid": str(agent_pid) if agent_pid else "",
+        "state": state,
+        "started_at": now,
+        "updated_at": now,
+    })
+    return 0
+
+
+# --- install / uninstall / status ---
+
+def _hook_targets_us(command: str) -> bool:
+    """True if this hook command's first token is our script path.
+
+    Plain `startswith` is wrong: `/path/agent-scan.sh` starts with
+    `/path/agent-scan`, which would match the bash version's hooks too.
+    """
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return False
+    return bool(tokens) and tokens[0] == str(SCRIPT_PATH)
+
+
+def hook_install_count() -> tuple[int, int]:
+    if not SETTINGS_FILE.exists():
+        return 0, len(HOOK_EVENTS)
+    try:
+        settings = json.loads(SETTINGS_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        return 0, len(HOOK_EVENTS)
+    hooks = settings.get("hooks", {}) or {}
+    installed = sum(
+        1 for event in HOOK_EVENTS
+        if any(
+            _hook_targets_us(h.get("command") or "")
+            for entry in hooks.get(event, [])
+            for h in entry.get("hooks", [])
+        )
+    )
+    return installed, len(HOOK_EVENTS)
+
+
+def cmd_install() -> int:
+    if not SETTINGS_FILE.exists():
+        print(f"{RED}✗{RESET} {SETTINGS_FILE} not found", file=sys.stderr)
+        return 1
+    try:
+        settings = json.loads(SETTINGS_FILE.read_text())
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"{RED}✗{RESET} {SETTINGS_FILE} invalid JSON: {e}", file=sys.stderr)
+        return 1
+
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+    backup = SETTINGS_FILE.with_name(f"{SETTINGS_FILE.name}.bak.{int(time.time())}")
+    backup.write_text(json.dumps(settings, indent=2))
+
+    settings.setdefault("hooks", {})
+    path_str = str(SCRIPT_PATH)
+    quoted = shlex.quote(path_str)
+    added = 0
+    for event in HOOK_EVENTS:
+        entries = settings["hooks"].setdefault(event, [])
+        already = any(
+            _hook_targets_us(h.get("command") or "")
+            for entry in entries
+            for h in entry.get("hooks", [])
+        )
+        if already:
+            continue
+        entries.append({
+            "matcher": "",
+            "hooks": [{
+                "type": "command",
+                "command": f"{quoted} hook {event}",
+                "timeout": 5,
+                "async": True,
+            }],
+        })
+        added += 1
+
+    SETTINGS_FILE.write_text(json.dumps(settings, indent=2))
+    inst, total = hook_install_count()
+    print(f"{GREEN}✓{RESET} agent-scan installed ({inst}/{total} hooks)")
+    print(f"  settings: {SETTINGS_FILE}")
+    print(f"  backup:   {backup}")
+    print(f"  state:    {STATE_DIR}")
+    if added == 0:
+        print(f"  {DIM}(no changes — already installed){RESET}")
+    return 0
+
+
+def cmd_uninstall(purge: bool = False) -> int:
+    if SETTINGS_FILE.exists():
+        try:
+            settings = json.loads(SETTINGS_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            print(f"{RED}✗{RESET} {SETTINGS_FILE} invalid JSON", file=sys.stderr)
+            return 1
+        backup = SETTINGS_FILE.with_name(f"{SETTINGS_FILE.name}.bak.{int(time.time())}")
+        backup.write_text(json.dumps(settings, indent=2))
+
+        hooks = settings.get("hooks", {}) or {}
+        cleaned: dict = {}
+        for event, entries in hooks.items():
+            kept_entries = []
+            for entry in entries:
+                kept_hooks = [
+                    h for h in entry.get("hooks", [])
+                    if not _hook_targets_us(h.get("command") or "")
+                ]
+                if kept_hooks:
+                    new_entry = dict(entry)
+                    new_entry["hooks"] = kept_hooks
+                    kept_entries.append(new_entry)
+            if kept_entries:
+                cleaned[event] = kept_entries
+        settings["hooks"] = cleaned
+        SETTINGS_FILE.write_text(json.dumps(settings, indent=2))
+        print(f"{GREEN}✓{RESET} agent-scan hooks removed")
+        print(f"  backup: {backup}")
+    else:
+        print(f"{DIM}settings.json not found; nothing to uninstall{RESET}")
+
+    if purge:
+        shutil.rmtree(STATE_DIR, ignore_errors=True)
+        print(f"{GREEN}✓{RESET} state dir purged: {STATE_DIR}")
+    return 0
+
+
+def cmd_status() -> int:
+    print(f"agent-scan: {SCRIPT_PATH}")
+    print(f"settings:   {SETTINGS_FILE}")
+    print()
+    if not SETTINGS_FILE.exists():
+        print(f"{RED}✗{RESET} settings.json not found")
+        return 0
+    try:
+        settings = json.loads(SETTINGS_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        print(f"{RED}✗{RESET} settings.json invalid JSON")
+        return 1
+    hooks = settings.get("hooks", {}) or {}
+    for event in HOOK_EVENTS:
+        installed = any(
+            _hook_targets_us(h.get("command") or "")
+            for entry in hooks.get(event, [])
+            for h in entry.get("hooks", [])
+        )
+        marker = f"{GREEN}✓{RESET}" if installed else f"{RED}✗{RESET}"
+        print(f"  {marker} {event}")
+    print()
+    inst, total = hook_install_count()
+    print(f"installed: {inst}/{total} hook events")
+    files = sum(1 for _ in STATE_DIR.glob("*.json")) if STATE_DIR.is_dir() else 0
+    print(f"state dir: {STATE_DIR} ({files} file(s))")
+    return 0
+
+
+# --- subcommand: scan ---
+
+APPROVAL_PATTERNS = (
+    "Allow once", "Allow always", "[Y/n]", "[y/N]",
+    "Do you want", "Permission", "permission",
+    "Press Enter", "Plan mode", "yes/no", "Confirm",
+)
+RUNNING_PATTERNS = (
+    "esc to interrupt", "Esc to interrupt",
+    "ctrl+c to interrupt", "Ctrl+C to interrupt",
+    "tokens ·", "thought for ",
+)
+
+
+def classify_pane_content(pane_id: str) -> str:
+    try:
+        r = subprocess.run(
+            ["tmux", "capture-pane", "-t", pane_id, "-p"],
+            capture_output=True, text=True, timeout=2,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return "idle"
+    tail = "\n".join(r.stdout.splitlines()[-12:])
+    if any(p in tail for p in APPROVAL_PATTERNS):
+        return "waiting"
+    if any(p in tail for p in RUNNING_PATTERNS):
+        return "running"
+    return "idle"
+
+
+def warn_install_state() -> None:
+    inst, total = hook_install_count()
+    if inst == 0:
+        msg = f"agent-scan hooks not installed (0/{total}). Run: agent-scan install"
+    elif inst < total:
+        msg = (f"agent-scan hooks partially installed ({inst}/{total}). "
+               "Run: agent-scan install")
+    else:
+        return
+    print(f"{YELLOW}⚠{RESET} {msg}", file=sys.stderr)
+
+
+def cmd_scan() -> int:
+    panes = list_tmux_panes()
+    if not panes:
+        return 0
+
+    warn_install_state()
+
+    seen_session: set[str] = set()
+    seen_pane: set[str] = set()
+
+    if STATE_DIR.is_dir():
+        # Newest mtime first so the latest state file for a given pane wins;
+        # older duplicates get removed below.
+        files = sorted(
+            STATE_DIR.glob("*.json"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for sf in files:
+            data = read_state(sf)
+            if data is None:
+                sf.unlink(missing_ok=True)
+                continue
+
+            pane_id = data.get("tmux_pane", "")
+            state = data.get("state", "idle")
+            recorded_pane_pid = data.get("tmux_pane_pid", "")
+            agent_pid_s = data.get("agent_pid", "")
+
+            tp = panes.get(pane_id)
+            if tp is None:
+                # Pane gone.
+                sf.unlink(missing_ok=True)
+                continue
+
+            # The pane id is the same, but the shell process underneath may
+            # have been replaced (exec, tmux server restart with id reuse).
+            if recorded_pane_pid and str(tp.pid) != recorded_pane_pid:
+                sf.unlink(missing_ok=True)
+                continue
+
+            # The agent process recorded at SessionStart must still be alive.
+            # This is what catches "Claude was killed and a new one started in
+            # the same shell" — the old state file is now stale.
+            if agent_pid_s:
+                try:
+                    if not agent_pid_alive(int(agent_pid_s)):
+                        sf.unlink(missing_ok=True)
+                        continue
+                except ValueError:
+                    sf.unlink(missing_ok=True)
+                    continue
+            else:
+                # Legacy file: no agent_pid recorded. Fall back to "is there
+                # ANY agent in this pane's tree".
+                if not find_agent_in_tree(tp.pid):
+                    sf.unlink(missing_ok=True)
+                    continue
+
+            if pane_id in seen_pane:
+                sf.unlink(missing_ok=True)
+                continue
+            seen_pane.add(pane_id)
+
+            if tp.session in seen_session:
+                continue
+            seen_session.add(tp.session)
+
+            print_row(state, tp.session, "claude", pane_id)
+
+    # Fallback: tmux sessions running an agent that hasn't fired hooks yet.
+    for pane_id, tp in panes.items():
+        if tp.session in seen_session:
+            continue
+        agent = find_agent_in_tree(tp.pid)
+        if agent is None:
+            continue
+        seen_session.add(tp.session)
+        print_row(classify_pane_content(pane_id), tp.session, agent, pane_id)
+
+    return 0
+
+
+# --- dispatch ---
+
+def main() -> int:
+    args = sys.argv[1:]
+    sub = args[0] if args else "scan"
+    rest = args[1:]
+
+    if sub in ("-h", "--help", "help"):
+        assert __doc__
+        print(__doc__.strip())
+        return 0
+    if sub == "scan":
+        return cmd_scan()
+    if sub == "install":
+        return cmd_install()
+    if sub == "uninstall":
+        return cmd_uninstall(purge="--purge" in rest)
+    if sub == "status":
+        return cmd_status()
+    if sub == "hook":
+        return cmd_hook(rest[0] if rest else None)
+
+    print(f"Unknown subcommand: {sub}", file=sys.stderr)
+    print("Usage: agent-scan [scan|install|uninstall|status|hook EVENT]",
+          file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
