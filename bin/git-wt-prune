@@ -65,7 +65,6 @@ validate_in_git_repo
 
 # Get repository information
 REPO_ROOT="$(get_repo_root)"
-MAIN_BRANCH="$(get_main_branch)"
 
 # Function to get worktree list
 get_worktree_list() {

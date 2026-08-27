@@ -81,7 +81,6 @@ validate_in_git_repo
 validate_projects_structure
 
 # Get repository information
-REPO_ROOT="$(get_repo_root)"
 REPO_NAME="$(get_repo_name)"
 WORKTREES_ROOT="$(get_worktrees_root)"
 

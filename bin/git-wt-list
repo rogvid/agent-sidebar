@@ -57,7 +57,6 @@ validate_in_git_repo
 # Get repository information — use git-common-dir to always resolve to the main repo,
 # even when running from inside a worktree
 REPO_ROOT="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")"
-REPO_NAME="$(basename "${REPO_ROOT}")"
 MAIN_BRANCH="$(get_main_branch)"
 
 # Get current branch
