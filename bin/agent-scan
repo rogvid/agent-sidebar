@@ -40,11 +40,17 @@ import psutil
 AGENT_NAMES = frozenset({"claude", "codex", "opencode", "pi"})
 
 RESET = "\033[0m"
-BLUE, YELLOW, GREEN, CYAN, DIM = (
-    "\033[34m", "\033[33m", "\033[32m", "\033[36m", "\033[2m",
+BLUE, YELLOW, GREEN, RED, CYAN, DIM = (
+    "\033[34m", "\033[33m", "\033[32m", "\033[31m", "\033[36m", "\033[2m",
 )
 STATE_COLOR = {"running": BLUE, "waiting": YELLOW, "idle": GREEN}
 STATE_ORDER = {"waiting": 0, "running": 1, "idle": 2}
+
+# Context rot: the further past these a session is, the less its earlier
+# turns are really informing the current one. Thresholds are absolute
+# tokens, not a fraction of the model's window, because rot is a property
+# of how much has been said, not of how much room is left.
+CTX_WARN, CTX_ROT = 100_000, 400_000
 
 # How much of the pane bottom counts as live UI. Claude's footer block is
 # roughly 8 lines (input box borders, statusline, hints), and the spinner
@@ -264,6 +270,30 @@ def classify(lines: list[str]) -> str:
     return "idle"
 
 
+SUFFIX_SCALE = {"k": 1_000, "m": 1_000_000}
+
+
+def context_tokens(text: str) -> int | None:
+    """`145.3k` -> 145300. None when the pane only reports a percentage."""
+    m = re.fullmatch(r"([\d.]+)([kKmM]?)", text)
+    if not m:
+        return None
+    try:
+        value = float(m.group(1))
+    except ValueError:
+        return None
+    return int(value * SUFFIX_SCALE.get(m.group(2).lower(), 1))
+
+
+def context_color(text: str) -> str:
+    tokens = context_tokens(text)
+    if tokens is None:
+        return DIM
+    if tokens >= CTX_ROT:
+        return RED
+    return YELLOW if tokens >= CTX_WARN else GREEN
+
+
 def parse_context(lines: list[str]) -> str:
     for line in reversed(lines[-FOOTER_LINES:]):
         m = CTX_RE.search(line)
@@ -441,7 +471,8 @@ def render(rows: list[Row], color: bool) -> list[str]:
             paint(r.state.ljust(w_state), state_color),
             r.target.ljust(w_target),
             paint(r.agent.ljust(w_agent), CYAN),
-            paint(f"{r.context.rjust(w_ctx)} ctx", DIM),
+            (paint(r.context.rjust(w_ctx), context_color(r.context))
+             + paint(" ctx", DIM)),
             # Undimmed: how long this pane has been in this state is the
             # number you actually triage on.
             r.duration.rjust(w_dur),

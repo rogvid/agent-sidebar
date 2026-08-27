@@ -188,6 +188,21 @@ BLOCK_CASES = (
     ("opencode has none", OPENCODE_IDLE, None),
 )
 
+# Context rot bands: green below 100k, yellow below 400k, red at or above.
+COLOR_CASES = (
+    ("fresh", "72.0k", "GREEN"),
+    ("just under the warn line", "99.9k", "GREEN"),
+    ("warn line is inclusive", "100.0k", "YELLOW"),
+    ("getting long", "337.6k", "YELLOW"),
+    ("rot line is inclusive", "400k", "RED"),
+    ("rotten", "557.3k", "RED"),
+    ("megatokens", "1.2M", "RED"),
+    ("opencode's uppercase suffix", "12.4K", "GREEN"),
+    # A percentage carries no absolute count, so there is nothing to band.
+    ("percentage only", "58%", "DIM"),
+    ("no statusline", "-", "DIM"),
+)
+
 # Fixed clock so the `· done H:MM` arithmetic is deterministic: 2026-08-27
 # at 23:34 local time, the moment these captures were taken.
 NOW = time.mktime((2026, 8, 27, 23, 34, 0, 0, 0, -1))
@@ -242,6 +257,13 @@ def main() -> int:
         print(f"{'ok  ' if ok else 'FAIL'}  block    {name:36} "
               f"want={str(want):8} got={got}")
 
+    for name, sample, want in COLOR_CASES:
+        got = mod.context_color(sample)
+        ok = got == getattr(mod, want)
+        failures += not ok
+        print(f"{'ok  ' if ok else 'FAIL'}  ctxcolor {name:36} "
+              f"want={want:8} got={got!r}")
+
     for name, state, sample, want in DURATION_CASES:
         got = mod.state_duration(state, mod.visible_lines(sample), NOW)
         ok = got == want
@@ -250,7 +272,7 @@ def main() -> int:
               f"want={want:8} got={got}")
 
     total = (len(STATE_CASES) + len(CONTEXT_CASES) + len(AGE_CASES)
-             + len(BLOCK_CASES) + len(DURATION_CASES))
+             + len(BLOCK_CASES) + len(COLOR_CASES) + len(DURATION_CASES))
     print(f"\n{total - failures}/{total} passed")
     return 1 if failures else 0
 
