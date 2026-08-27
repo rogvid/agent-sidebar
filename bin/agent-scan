@@ -50,10 +50,14 @@ import psutil
 AGENT_NAMES = frozenset({"claude", "codex", "opencode", "pi"})
 
 RESET = "\033[0m"
-BLUE, YELLOW, GREEN, RED, MAGENTA, CYAN, DIM = (
-    "\033[34m", "\033[33m", "\033[32m", "\033[31m", "\033[35m",
-    "\033[36m", "\033[2m",
+BLUE, YELLOW, GREEN, RED, MAGENTA, CYAN = (
+    "\033[34m", "\033[33m", "\033[32m", "\033[31m", "\033[35m", "\033[36m",
 )
+# Secondary text is a concrete grey rather than the dim attribute. Dim
+# multiplies against whatever background it lands on, and television paints
+# the selected row on colour 8, which left the dimmed columns unreadable at
+# exactly the moment you were looking at them.
+MUTED = "\033[38;5;250m"
 STATE_COLOR = {
     "blocked": YELLOW,
     "interrupted": MAGENTA,
@@ -166,8 +170,16 @@ CHROME_RE = re.compile(
     r"new task\?|⎿\s+Tip:|Update installed|tmux detected|"
     r"^\s*[❯>]\s*$|^\s*/rc\s*$|^\s*⧉|Total:|Session:|Model:|"
     r"⊙|/status\b|Ask anything|^\s*[│┃|]?\s*[█▀▄]{3,}|"
-    r"^\s*[│┃|]\s*Build\s+·"
+    r"^\s*[│┃|]\s*Build\s+·|You've used \d+%|Approaching your"
 )
+# claude's transient limit notices, drawn right-aligned just above the input
+# box. Both are account-wide, like the block clock.
+WEEKLY_RE = re.compile(r"used\s+(\d+)%\s+of your weekly limit", re.IGNORECASE)
+# From the statusline: `Total: 7.6M` - everything this session has spent.
+TOTAL_RE = re.compile(r"Total:\s*([\d.]+[kKmM]?)")
+# Weekly headroom. Past the second one you are budgeting, not working.
+WEEKLY_WARN, WEEKLY_HIGH = 60, 85
+
 # How much of a message to carry into the row. Long enough to be a sentence,
 # short enough that a runaway line cannot bloat the output.
 MESSAGE_MAX = 160
@@ -461,7 +473,7 @@ def context_tokens(text: str) -> int | None:
 def context_color(text: str) -> str:
     tokens = context_tokens(text)
     if tokens is None:
-        return DIM
+        return MUTED
     if tokens >= CTX_ROT:
         return RED
     return YELLOW if tokens >= CTX_WARN else GREEN
@@ -495,6 +507,32 @@ def parse_age(lines: list[str]) -> str | None:
 
 def parse_block(lines: list[str]) -> str | None:
     return _statusline_duration(lines, BLOCK_RE)
+
+
+def parse_weekly(lines: list[str]) -> str | None:
+    for line in reversed(lines[-TAIL_LINES:]):
+        m = WEEKLY_RE.search(line)
+        if m:
+            return f"{m.group(1)}%"
+    return None
+
+
+def weekly_color(text: str) -> str:
+    m = re.fullmatch(r"(\d+)%", text)
+    if not m:
+        return MUTED
+    percent = int(m.group(1))
+    if percent >= WEEKLY_HIGH:
+        return RED
+    return YELLOW if percent >= WEEKLY_WARN else GREEN
+
+
+def parse_total(lines: list[str]) -> str | None:
+    for line in reversed(lines[-FOOTER_LINES:]):
+        m = TOTAL_RE.search(line)
+        if m:
+            return m.group(1)
+    return None
 
 
 def parse_done(lines: list[str], now: float) -> float | None:
@@ -591,6 +629,8 @@ class Row:
     context: str
     duration: str
     block: str
+    weekly: str
+    total: str
     age: str
     message: str
     flag: str
@@ -623,6 +663,8 @@ def collect_rows() -> list[Row]:
             context=parse_context(lines),
             duration=state_duration(state, lines, now),
             block=parse_block(lines) or "-",
+            weekly=parse_weekly(lines) or "-",
+            total=parse_total(lines) or "-",
             age=parse_age(lines) or format_elapsed(now - agent.started_at),
             message=pick_message(state, lines),
             flag=SHARED_TREE if trees[pane.cwd] > 1 else " ",
@@ -645,28 +687,45 @@ def render(rows: list[Row], color: bool) -> list[str]:
     w_ctx = width("context")
     w_dur = width("duration")
     w_block = width("block")
+    w_weekly = width("weekly")
+    w_total = width("total")
     w_age = width("age")
+
+    # A column nobody can fill is a column nobody should read. The weekly
+    # notice in particular is only on screen once you are close to the
+    # limit, so most of the time it costs nothing.
+    def informative(field: str) -> bool:
+        return any(getattr(r, field) != "-" for r in rows)
+
+    show_weekly, show_total = informative("weekly"), informative("total")
 
     out: list[str] = []
     for r in rows:
-        state_color = STATE_COLOR.get(r.state, DIM)
+        state_color = STATE_COLOR.get(r.state, MUTED)
         # The target sits at field 1, right after the dot and separated from
         # it by exactly one space: that is the contract the television
         # channel splits on to find the pane to attach to or kill.
-        columns = (
+        columns = [
             paint("●", state_color) + " " + r.target.ljust(w_target),
             paint(r.flag, RED),
             paint(r.state.ljust(w_state), state_color),
             paint(r.agent.ljust(w_agent), CYAN),
             (paint(r.context.rjust(w_ctx), context_color(r.context))
-             + paint(" ctx", DIM)),
-            # Undimmed: how long this pane has been in this state is the
-            # number you actually triage on.
+             + paint(" ctx", MUTED)),
+            # Left at full brightness: how long this pane has been in this
+            # state is the number you actually triage on.
             r.duration.rjust(w_dur),
-            paint(f"blk {r.block.ljust(w_block)}", DIM),
-            paint(f"up {r.age.rjust(w_age)}", DIM),
-        )
-        out.append("  ".join(columns) + "   " + paint(r.message, DIM))
+            paint(f"blk {r.block.ljust(w_block)}", MUTED),
+        ]
+        if show_weekly:
+            columns.append(
+                paint("wk ", MUTED)
+                + paint(r.weekly.rjust(w_weekly), weekly_color(r.weekly))
+            )
+        if show_total:
+            columns.append(paint(f"used {r.total.rjust(w_total)}", MUTED))
+        columns.append(paint(f"up {r.age.rjust(w_age)}", MUTED))
+        out.append("  ".join(columns) + "   " + paint(r.message, MUTED))
     return out
 
 
