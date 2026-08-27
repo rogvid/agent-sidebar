@@ -247,12 +247,6 @@ WEEKLY_COLOR_CASES = (
     ("nothing reported", "-", "MUTED"),
 )
 
-TOTAL_CASES = (
-    ("megatokens", CLAUDE_IDLE, "7.6M"),
-    ("kilotokens", CLAUDE_WEEKLY, "36.7k"),
-    ("opencode has none", OPENCODE_IDLE, None),
-)
-
 # Fixed clock so the `· done H:MM` arithmetic is deterministic: 2026-08-27
 # at 23:34 local time, the moment these captures were taken.
 NOW = time.mktime((2026, 8, 27, 23, 34, 0, 0, 0, -1))
@@ -306,7 +300,7 @@ def row(**overrides):
     """A Row with every field filled, for exercising the renderer."""
     fields = dict(
         state="done", target="s:1.0", agent="claude", context="10.0k",
-        duration="5m", block="1h", weekly="-", total="1.0M", age="2h",
+        duration="5m", block="1h", weekly="-", age="2h",
         message="hello", flag=" ",
     )
     return AGENT_SCAN.Row(**(fields | overrides))
@@ -388,13 +382,6 @@ def main() -> int:
         print(f"{'ok  ' if ok else 'FAIL'}  wkcolor  {name:36} "
               f"want={want:8} got={got!r}")
 
-    for name, sample, want in TOTAL_CASES:
-        got = mod.parse_total(mod.visible_lines(sample))
-        ok = got == want
-        failures += not ok
-        print(f"{'ok  ' if ok else 'FAIL'}  total    {name:36} "
-              f"want={str(want):8} got={got}")
-
     for name, weekly, want in COLLAPSE_CASES:
         line = mod.render([row(weekly=weekly)], color=False)[0]
         ok = ("wk" in line) == want
@@ -405,7 +392,7 @@ def main() -> int:
     total = (len(STATE_CASES) + len(CONTEXT_CASES) + len(AGE_CASES)
              + len(BLOCK_CASES) + len(COLOR_CASES) + len(DURATION_CASES)
              + len(MESSAGE_CASES) + len(WEEKLY_CASES)
-             + len(WEEKLY_COLOR_CASES) + len(TOTAL_CASES)
+             + len(WEEKLY_COLOR_CASES)
              + len(COLLAPSE_CASES))
     print(f"\n{total - failures}/{total} passed")
     return 1 if failures else 0

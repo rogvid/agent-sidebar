@@ -175,8 +175,6 @@ CHROME_RE = re.compile(
 # claude's transient limit notices, drawn right-aligned just above the input
 # box. Both are account-wide, like the block clock.
 WEEKLY_RE = re.compile(r"used\s+(\d+)%\s+of your weekly limit", re.IGNORECASE)
-# From the statusline: `Total: 7.6M` - everything this session has spent.
-TOTAL_RE = re.compile(r"Total:\s*([\d.]+[kKmM]?)")
 # Weekly headroom. Past the second one you are budgeting, not working.
 WEEKLY_WARN, WEEKLY_HIGH = 60, 85
 
@@ -527,14 +525,6 @@ def weekly_color(text: str) -> str:
     return YELLOW if percent >= WEEKLY_WARN else GREEN
 
 
-def parse_total(lines: list[str]) -> str | None:
-    for line in reversed(lines[-FOOTER_LINES:]):
-        m = TOTAL_RE.search(line)
-        if m:
-            return m.group(1)
-    return None
-
-
 def parse_done(lines: list[str], now: float) -> float | None:
     """Seconds since the last finished turn, from its `· done H:MM` stamp.
 
@@ -630,7 +620,6 @@ class Row:
     duration: str
     block: str
     weekly: str
-    total: str
     age: str
     message: str
     flag: str
@@ -664,7 +653,6 @@ def collect_rows() -> list[Row]:
             duration=state_duration(state, lines, now),
             block=parse_block(lines) or "-",
             weekly=parse_weekly(lines) or "-",
-            total=parse_total(lines) or "-",
             age=parse_age(lines) or format_elapsed(now - agent.started_at),
             message=pick_message(state, lines),
             flag=SHARED_TREE if trees[pane.cwd] > 1 else " ",
@@ -688,7 +676,6 @@ def render(rows: list[Row], color: bool) -> list[str]:
     w_dur = width("duration")
     w_block = width("block")
     w_weekly = width("weekly")
-    w_total = width("total")
     w_age = width("age")
 
     # A column nobody can fill is a column nobody should read. The weekly
@@ -697,7 +684,7 @@ def render(rows: list[Row], color: bool) -> list[str]:
     def informative(field: str) -> bool:
         return any(getattr(r, field) != "-" for r in rows)
 
-    show_weekly, show_total = informative("weekly"), informative("total")
+    show_weekly = informative("weekly")
 
     out: list[str] = []
     for r in rows:
@@ -722,8 +709,6 @@ def render(rows: list[Row], color: bool) -> list[str]:
                 paint("wk ", MUTED)
                 + paint(r.weekly.rjust(w_weekly), weekly_color(r.weekly))
             )
-        if show_total:
-            columns.append(paint(f"used {r.total.rjust(w_total)}", MUTED))
         columns.append(paint(f"up {r.age.rjust(w_age)}", MUTED))
         out.append("  ".join(columns) + "   " + paint(r.message, MUTED))
     return out
