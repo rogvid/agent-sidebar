@@ -1,6 +1,6 @@
 [metadata]
 name = "agents"
-description = "Monitor active agentic coding sessions (Claude, Codex, Pi) in tmux"
+description = "Monitor active agentic coding sessions (Claude, Codex, opencode, Pi) in tmux"
 
 [source]
 command = "agent-scan"
@@ -9,11 +9,14 @@ output = "{strip_ansi|split: :-1}"
 watch = 1.0
 
 [preview]
-command = "tmux capture-pane -t '{strip_ansi|split: :-1}' -p -T 2>/dev/null"
+# -e keeps the pane's own SGR sequences, so the preview looks like the pane
+# instead of a grey transcript of it. It pairs with ansi = true below, which
+# is what tells television to render them rather than print them.
+command = "tmux capture-pane -t '{strip_ansi|split: :-1}' -p -e -T 2>/dev/null"
 ansi = true
 
 [ui]
-direction = "portrait"
+layout = "portrait"
 
 [ui.preview_panel]
 size = 70
