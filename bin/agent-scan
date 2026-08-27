@@ -36,7 +36,7 @@ from dataclasses import dataclass
 
 import psutil
 
-AGENT_NAMES = frozenset({"claude", "codex", "pi"})
+AGENT_NAMES = frozenset({"claude", "codex", "opencode", "pi"})
 
 RESET = "\033[0m"
 BLUE, YELLOW, GREEN, CYAN, DIM = (
@@ -52,34 +52,48 @@ STATE_ORDER = {"waiting": 0, "running": 1, "idle": 2}
 TAIL_LINES = 16
 # The statusline is inside the footer block itself.
 FOOTER_LINES = 8
+# Approval dialogs are bottom-anchored: claude's option list sits within
+# ~5 lines of the bottom, opencode's button row within 2. A tight window
+# keeps quoted dialogs further up the transcript out of scope.
+DIALOG_LINES = 8
 
-# The bare spinner line - `✶ Topsy-turvying…`, a glyph and one gerund - is
-# on screen ~0.2s after a turn starts. Its parenthetical (`… (13s · ↓ 129
-# tokens)`) takes another ~1.5s and the `esc to interrupt` hint longer
-# still, so keying on the parenthetical alone made `running` show up late.
-# Requiring a single word ending in the ellipsis keeps transcript lines that
-# claude truncated with `…` from matching.
-SPINNER_RE = re.compile(r"^[^\w\s]\s+[A-Za-z][A-Za-z'-]*…")
-# `(12s · esc to interrupt)` on that same line, or an agent whose footer is
-# just `Esc to interrupt`. Anchored to a line start or a `(`/`·` separator so
-# transcript prose or code quoting the phrase cannot trigger it.
+# claude's bare spinner line - `✶ Topsy-turvying…`, a glyph and one gerund -
+# is on screen ~0.2s after a turn starts, while its parenthetical (`… (13s ·
+# ↓ 129 tokens)`) takes another ~1.5s. It is drawn at column 0; a transcript
+# quoting one is always indented, which is what the leading-space limit and
+# the single-word-before-the-ellipsis shape rule out.
+SPINNER_RE = re.compile(r"^ ?[^\w\s]\s+[A-Za-z][A-Za-z'-]*…")
+# opencode's running footer: `   ■■■⬝⬝⬝⬝⬝  esc interrupt   12.1K (9%) …` -
+# note `esc interrupt`, no `to`, and the line continues past the hint. Also
+# matches a footer that opens with the hint on its own.
 INTERRUPT_RE = re.compile(
-    r"(?:^\s*|[(·]\s*)(?:esc|ctrl\+c) to interrupt",
-    re.IGNORECASE | re.MULTILINE,
+    r"^\s{0,6}(?:[■⬝▪▫]{2,}\s+)?(?:esc|ctrl\+c)\s+(?:to\s+)?interrupt\b",
+    re.IGNORECASE,
 )
-# The selected line of an approval menu: `❯ 1. Yes`, boxed or not.
+# claude's approval menu: the selected line `❯ 1. Yes`, boxed or not, plus a
+# sibling option line `  2. No` or the dialog's own prose as corroboration -
+# a lone `❯ 1. …` is also what a user typing "1. do this" looks like.
 CHOICE_RE = re.compile(r"^\s*[│┃|]?\s*❯\s*\d+\.\s")
-# Any other option line of that menu: `  2. No`.
 OPTION_RE = re.compile(r"^\s*[│┃|]?\s*\d+\.\s")
-# Prose and footers that only appear while an agent blocks on the user.
 ASK_RE = re.compile(
     r"Do you want|Would you like|Enter to confirm|Esc to cancel",
     re.IGNORECASE,
 )
+# opencode's approval dialog: a `△ Permission required` header and a button
+# row `┃   Allow once   Allow always   Reject`.
+BUTTONS_RE = re.compile(r"Allow once\s{2,}Allow always\s{2,}Reject")
+PERMISSION_RE = re.compile(r"^\s*[│┃|]?\s*[^\w\s]\s*Permission required")
 # Plain shell-style confirmations, for agents that do not draw a menu.
 YESNO_RE = re.compile(r"\[y/n\]|\(y/n\)\s*[?:]?\s*$", re.IGNORECASE | re.MULTILINE)
-# From the statusline: `Model: Opus 5 | Ctx: 488.7k` or `58% ctx`.
-CTX_RE = re.compile(r"Ctx:\s*([\d.]+[kKmM]?)|(\d+)%\s*ctx")
+# The input bar under the prompt box: claude's permission-mode hint and
+# statusline, opencode's hint bar. Present while idle or running, hidden
+# while a dialog owns the bottom of the screen.
+INPUT_BAR_RE = re.compile(r"⏵|⏸|Ctx:|ctrl\+p commands|tab agents")
+# From the statusline: claude's `Ctx: 488.7k` or `58% ctx`, opencode's
+# `12.0K (9%)`.
+CTX_RE = re.compile(
+    r"Ctx:\s*([\d.]+[kKmM]?)|(\d+)%\s*ctx|([\d.]+[KkMm])\s*\(\d+%\)"
+)
 # From the statusline: `Session: 24hr 13m`, `Session: 4m`, `Session: <1m`.
 AGE_RE = re.compile(r"Session:\s*(<?\d+\s*(?:hr|h|m|s))(?:\s*(\d+m))?")
 
@@ -191,25 +205,41 @@ def visible_lines(content: str) -> list[str]:
     return lines
 
 
+def waiting_dialog(dialog: list[str]) -> bool:
+    """True if an approval dialog owns the bottom of the pane.
+
+    Dialogs are bottom-anchored and hide the agent's input bar, so a marker
+    with no input bar below it is a live dialog, while one with the prompt
+    box and statusline underneath is a transcript quoting a dialog - which
+    the agent sessions in this repo do all the time.
+    """
+    blob = "\n".join(dialog)
+    corroborated = bool(ASK_RE.search(blob)) or any(
+        OPTION_RE.match(line) for line in dialog
+    )
+    last_marker = -1
+    for i, line in enumerate(dialog):
+        if ((CHOICE_RE.match(line) and corroborated)
+                or BUTTONS_RE.search(line)
+                or PERMISSION_RE.match(line)
+                or YESNO_RE.search(line)):
+            last_marker = i
+    if last_marker < 0:
+        return False
+    return not any(INPUT_BAR_RE.search(line)
+                   for line in dialog[last_marker + 1:])
+
+
 def classify(lines: list[str]) -> str:
-    tail = lines[-TAIL_LINES:]
-    blob = "\n".join(tail)
-
     # Blocking on the user wins over everything else: it is the state that
-    # needs a human, and an approval dialog hides the spinner anyway.
-    # A bare `❯ 1. ...` is not enough: that is also what a user typing
-    # "1. do this" into the input box looks like. Require a sibling option
-    # line or the dialog's own prose/footer alongside it.
-    selected = any(CHOICE_RE.match(line) for line in tail)
-    siblings = any(OPTION_RE.match(line) for line in tail)
-    if selected and (siblings or ASK_RE.search(blob)):
-        return "waiting"
-    if YESNO_RE.search(blob):
+    # needs a human, and a dialog hides the spinner anyway.
+    if waiting_dialog(lines[-DIALOG_LINES:]):
         return "waiting"
 
-    if any(SPINNER_RE.match(line.strip()) for line in tail):
+    tail = lines[-TAIL_LINES:]
+    if any(SPINNER_RE.match(line) for line in tail):
         return "running"
-    if INTERRUPT_RE.search(blob):
+    if any(INTERRUPT_RE.match(line) for line in tail):
         return "running"
     return "idle"
 
@@ -218,7 +248,11 @@ def parse_context(lines: list[str]) -> str:
     for line in reversed(lines[-FOOTER_LINES:]):
         m = CTX_RE.search(line)
         if m:
-            return f"{m.group(1)}" if m.group(1) else f"{m.group(2)}%"
+            if m.group(1):
+                return m.group(1)
+            if m.group(2):
+                return f"{m.group(2)}%"
+            return m.group(3)
     return "-"
 
 

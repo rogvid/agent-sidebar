@@ -1,0 +1,181 @@
+#!/usr/bin/env -S uv run --script
+# vim: set ft=python:
+# -*- mode: python -*-
+# language: python
+# /// script
+# requires-python = ">=3.13"
+# dependencies = [
+#   "psutil==7.2.2",
+# ]
+# ///
+"""Checks for agent-scan's pane-content state classifier.
+
+Every sample below is a real `tmux capture-pane` tail, trimmed to the live
+UI region: claude 2.1.247 and opencode 1.18.23 in each of the three states.
+They are the regression net for the patterns in agent-scan, which are the
+only thing standing between a status row and a plausible lie.
+
+The last group is the adversarial one. An agent pane whose transcript
+quotes another agent's dialog or spinner - which happens constantly while
+working on this repo - must still read as idle.
+
+Run: scripts/tests/test-agent-scan     (or `mise run test`)
+"""
+
+from __future__ import annotations
+
+import importlib.machinery
+import importlib.util
+import sys
+from pathlib import Path
+
+SCRIPT = Path(__file__).resolve().parents[1] / ".local" / "bin" / "agent-scan"
+
+
+def load_agent_scan():
+    spec = importlib.util.spec_from_loader(
+        "agent_scan",
+        importlib.machinery.SourceFileLoader("agent_scan", str(SCRIPT)),
+    )
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["agent_scan"] = module
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+CLAUDE_IDLE = """● Done. The command slept for 12 seconds and then printed "done".
+✻ Worked for 15s · done 7:58 PM
+────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────
+  ⎇ main | (+0,-0)                       Model: Opus 5 | Ctx: 145.3k
+  Total: 7.6M                          Session: 36hr 3m | Block: 59m
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"""
+
+# The spinner is drawn at column 0 and, for the first ~1.5s of a turn, with
+# no elapsed-time parenthetical at all.
+CLAUDE_RUNNING_BARE = """● Reading the file now
+✶ Topsy-turvying…
+────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────
+  ⎇ main | (+7,-14)                      Model: Opus 5 | Ctx: 186.8k
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"""
+
+CLAUDE_RUNNING_TIMED = """  ⎿  Read 1 file
+✻ Concocting… (2m 55s · ↓ 15.1k tokens · thought for 2s)
+  ⎿  Tip: Use /btw to ask a quick side question
+────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────
+  ⎇ main | (+7,-14)                      Model: Opus 5 | Ctx: 186.8k
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"""
+
+CLAUDE_WAITING_EDIT = """ Edit file
+ file.txt
+ 1 -hello
+ 1 +goodbye
+ Do you want to make this edit to file.txt?
+ ❯ 1. Yes
+   2. Yes, and switch to accept edits for this session (shift+tab)
+   3. No
+ Esc to cancel · Tab to amend"""
+
+CLAUDE_WAITING_TRUST = """ Claude Code'll be able to read, edit, and execute files here.
+ Security guide
+ ❯ 1. Yes, I trust this folder
+   2. No, exit
+ Enter to confirm · Esc to cancel"""
+
+# opencode's footer keeps going past the interrupt hint, and says
+# `esc interrupt` rather than claude's `esc to interrupt`.
+OPENCODE_RUNNING = """  ┃  Build · GLM-4.5-Flash Z.AI
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   ■⬝⬝⬝⬝⬝⬝⬝  esc interrupt          12.1K (9%)  ctrl+p commands  • OpenCode 1.18.23"""
+
+OPENCODE_IDLE = """  ┃  Build · GLM-4.5-Flash Z.AI
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   ~/work/flowform 12.4K (9%) ctrl+p commands • OpenCode 1.18.23"""
+
+OPENCODE_WAITING = """  ┃  △ Permission required
+  ┃    → Edit note.txt
+  ┃  1 - hello world
+  ┃
+  ┃   Allow once   Allow always   Reject
+  ┃"""
+
+# A pane displaying someone else's dialog, with its own input bar below it.
+QUOTED_CLAUDE_DIALOG = CLAUDE_WAITING_EDIT + "\n" + CLAUDE_IDLE
+QUOTED_OPENCODE_DIALOG = OPENCODE_WAITING + "\n" + CLAUDE_IDLE
+# Tool output quoting a spinner: indented, unlike the real thing.
+QUOTED_SPINNER = """  ⎿  --- t+ 0.12s  state=running
+       ✢ Sublimating… (1s · thinking)
+────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────
+  ⎇ main | (+0,-0)                       Model: Opus 5 | Ctx: 145.3k
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"""
+# What the old pattern set got wrong: the mode hint contains "permissions".
+TYPED_NUMBERED_LINE = CLAUDE_IDLE.replace("❯", "❯ 1. do this thing", 1)
+
+STATE_CASES = (
+    ("claude idle", CLAUDE_IDLE, "idle"),
+    ("claude running (bare spinner)", CLAUDE_RUNNING_BARE, "running"),
+    ("claude running (timed spinner)", CLAUDE_RUNNING_TIMED, "running"),
+    ("claude waiting (edit dialog)", CLAUDE_WAITING_EDIT, "waiting"),
+    ("claude waiting (trust dialog)", CLAUDE_WAITING_TRUST, "waiting"),
+    ("opencode idle", OPENCODE_IDLE, "idle"),
+    ("opencode running", OPENCODE_RUNNING, "running"),
+    ("opencode waiting", OPENCODE_WAITING, "waiting"),
+    ("idle pane quoting claude dialog", QUOTED_CLAUDE_DIALOG, "idle"),
+    ("idle pane quoting opencode dialog", QUOTED_OPENCODE_DIALOG, "idle"),
+    ("idle pane quoting a spinner", QUOTED_SPINNER, "idle"),
+    ("user typed '1. do this'", TYPED_NUMBERED_LINE, "idle"),
+)
+
+CONTEXT_CASES = (
+    ("claude statusline", CLAUDE_IDLE, "145.3k"),
+    ("opencode footer", OPENCODE_IDLE, "12.4K"),
+    ("no statusline visible", OPENCODE_WAITING, "-"),
+)
+
+AGE_CASES = (
+    ("claude hours", CLAUDE_IDLE, "36h3m"),
+    ("opencode has none", OPENCODE_IDLE, None),
+)
+
+
+def main() -> int:
+    mod = load_agent_scan()
+    failures = 0
+
+    for name, sample, want in STATE_CASES:
+        got = mod.classify(mod.visible_lines(sample))
+        ok = got == want
+        failures += not ok
+        print(f"{'ok  ' if ok else 'FAIL'}  state    {name:36} "
+              f"want={want:8} got={got}")
+
+    for name, sample, want in CONTEXT_CASES:
+        got = mod.parse_context(mod.visible_lines(sample))
+        ok = got == want
+        failures += not ok
+        print(f"{'ok  ' if ok else 'FAIL'}  context  {name:36} "
+              f"want={want:8} got={got}")
+
+    for name, sample, want in AGE_CASES:
+        got = mod.parse_age(mod.visible_lines(sample))
+        ok = got == want
+        failures += not ok
+        print(f"{'ok  ' if ok else 'FAIL'}  age      {name:36} "
+              f"want={str(want):8} got={got}")
+
+    total = len(STATE_CASES) + len(CONTEXT_CASES) + len(AGE_CASES)
+    print(f"\n{total - failures}/{total} passed")
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
