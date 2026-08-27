@@ -13,17 +13,26 @@
 One row per pane that has an agent in its process tree, so a session with
 several agents in several panes lists all of them.
 
-State comes from what the pane is currently rendering (running spinner,
-approval dialog, or neither). Reading the screen means the state can never
-go stale the way an event-driven cache does: whatever the pane shows is
-what the row says.
+State comes from what the pane is currently rendering. Reading the screen
+means the state can never go stale the way an event-driven cache does:
+whatever the pane shows is what the row says. The states are named for what
+it costs you to ignore the row, not for the widget that is on screen:
+
+  blocked      stopped mid-task on a dialog; the task stays frozen
+  interrupted  you stopped it and it is asking what to do instead
+  running      working; needs nothing
+  done         turn finished; there is output to read, nothing is frozen
 
 Usage: agent-scan [scan] [--no-color]
 
-Output columns: state, session:window.pane, agent, context, how long the
-pane has been in its current state, the 5h usage block, session age, pane
-id. The pane id is always the last field so consumers can pick it up with a
-split on the last whitespace-separated token.
+Output columns: session:window.pane, a warning flag, state, agent, context,
+how long the pane has been in its current state, the 5h usage block,
+session age, and the last thing the pane said. The target is always the
+second whitespace-separated field, which is how the television channel
+picks it up, so session names containing spaces are not supported there.
+
+The warning flag marks a pane sharing a working directory with another
+agent pane: two agents editing one tree overwrite each other silently.
 """
 
 from __future__ import annotations
@@ -33,6 +42,7 @@ import re
 import subprocess
 import sys
 import time
+from collections import Counter
 from dataclasses import dataclass
 
 import psutil
@@ -40,11 +50,19 @@ import psutil
 AGENT_NAMES = frozenset({"claude", "codex", "opencode", "pi"})
 
 RESET = "\033[0m"
-BLUE, YELLOW, GREEN, RED, CYAN, DIM = (
-    "\033[34m", "\033[33m", "\033[32m", "\033[31m", "\033[36m", "\033[2m",
+BLUE, YELLOW, GREEN, RED, MAGENTA, CYAN, DIM = (
+    "\033[34m", "\033[33m", "\033[32m", "\033[31m", "\033[35m",
+    "\033[36m", "\033[2m",
 )
-STATE_COLOR = {"running": BLUE, "waiting": YELLOW, "idle": GREEN}
-STATE_ORDER = {"waiting": 0, "running": 1, "idle": 2}
+STATE_COLOR = {
+    "blocked": YELLOW,
+    "interrupted": MAGENTA,
+    "running": BLUE,
+    "done": GREEN,
+}
+# Most-needed first. `running` outranks `done` so active work stays near the
+# top; neither wants anything from you, but one of them is still moving.
+STATE_ORDER = {"blocked": 0, "interrupted": 1, "running": 2, "done": 3}
 
 # Context rot: the further past these a session is, the less its earlier
 # turns are really informing the current one. Thresholds are absolute
@@ -122,6 +140,37 @@ DONE_RE = re.compile(
 )
 # The spinner's elapsed parenthetical: `… (2m 55s · ↓ 15.1k tokens)`.
 ELAPSED_RE = re.compile(r"…\s*\((?:(\d+)m\s*)?(\d+)s\b")
+# What claude leaves behind when you press esc mid-turn. It stays as the
+# last transcript line until you answer, which is what makes it a state
+# rather than a scrap of history.
+INTERRUPTED_RE = re.compile(
+    r"^\s*(?:⎿\s*)?Interrupted\b.*(?:What should|do instead)", re.IGNORECASE
+)
+# The input box's own rules. Long enough not to catch `─ Worked for 17m ──`,
+# which claude draws as a transcript separator.
+BORDER_RE = re.compile(r"^\s*[─═]{10,}")
+# opencode names the action it wants approved on its own line: `→ Edit x`.
+ARROW_RE = re.compile(r"^\s*[│┃|]?\s*→\s*(\S.*)")
+# The line closing a finished turn, with or without the `· done` stamp that
+# only claude >= 2.1.246 appends: `✻ Cooked for 2m 7s`. DONE_RE cannot
+# stand in for this, because the sessions that lack the stamp are exactly
+# the ones whose summary line would otherwise be read as their message.
+SUMMARY_RE = re.compile(
+    rf"^ ?[^\w\s]\s+{WORD}(?:{WORD}|['-])*\s+for\s+\d"
+)
+# Lines that are furniture rather than something the agent said. Anything
+# matching is skipped when walking back for the pane's last message. The
+# second row is opencode's: its status bar, its splash, and its block-art
+# wordmark, none of which sit inside a box we could cut away.
+CHROME_RE = re.compile(
+    r"new task\?|⎿\s+Tip:|Update installed|tmux detected|"
+    r"^\s*[❯>]\s*$|^\s*/rc\s*$|^\s*⧉|Total:|Session:|Model:|"
+    r"⊙|/status\b|Ask anything|^\s*[│┃|]?\s*[█▀▄]{3,}|"
+    r"^\s*[│┃|]\s*Build\s+·"
+)
+# How much of a message to carry into the row. Long enough to be a sentence,
+# short enough that a runaway line cannot bloat the output.
+MESSAGE_MAX = 160
 
 
 # --- tmux ---
@@ -133,6 +182,7 @@ class Pane:
     window: str
     index: str
     pid: int
+    cwd: str
 
     @property
     def target(self) -> str:
@@ -154,18 +204,18 @@ def list_panes() -> list[Pane]:
     out = tmux(
         "list-panes", "-a", "-F",
         "#{pane_id}\t#{session_name}\t#{window_index}\t#{pane_index}"
-        "\t#{pane_pid}",
+        "\t#{pane_pid}\t#{pane_current_path}",
     )
     if not out:
         return []
     panes: list[Pane] = []
     for line in out.splitlines():
         parts = line.split("\t")
-        if len(parts) != 5:
+        if len(parts) != 6:
             continue
-        pane_id, session, window, index, pid = parts
+        pane_id, session, window, index, pid, cwd = parts
         try:
-            panes.append(Pane(pane_id, session, window, index, int(pid)))
+            panes.append(Pane(pane_id, session, window, index, int(pid), cwd))
         except ValueError:
             continue
     return panes
@@ -256,18 +306,141 @@ def waiting_dialog(dialog: list[str]) -> bool:
                    for line in dialog[last_marker + 1:])
 
 
+def transcript_region(lines: list[str]) -> list[str]:
+    """Everything above the agent's input box.
+
+    claude draws the box as two full-width rules; the transcript ends at the
+    first of them. Agents that draw no box (opencode) fall through to the
+    whole pane, and the chrome filter below sorts out their footer.
+    """
+    borders = [i for i, line in enumerate(lines) if BORDER_RE.match(line)]
+    if len(borders) >= 2:
+        return lines[:borders[-2]]
+    if borders:
+        return lines[:borders[-1]]
+    return lines
+
+
+def is_chrome(line: str) -> bool:
+    """True for furniture: borders, hints, statuslines, turn summaries."""
+    if not line.strip():
+        return True
+    return bool(
+        BORDER_RE.match(line)
+        or CHROME_RE.search(line)
+        or INPUT_BAR_RE.search(line)
+        or SUMMARY_RE.match(line)
+        or SPINNER_RE.match(line)
+        or re.match(r"^\s*[╹┃│]?\s*[▀▄─═]{4,}", line)
+    )
+
+
+def clean(line: str) -> str:
+    """Strip an agent's line markers and squeeze the whitespace out."""
+    text = re.sub(r"^\s*(?:[●○◉]|⎿|❯|>|│|┃|┃?\s*→)\s*", "", line)
+    text = " ".join(text.split())
+    return text[:MESSAGE_MAX]
+
+
+def last_paragraph(region: list[str]) -> str:
+    """The opening line of the last thing the agent actually said.
+
+    Walking back to the *start* of the block rather than taking the final
+    line matters: a wrapped answer's last line is a sentence fragment, and
+    a fragment in a status row is worse than nothing.
+    """
+    end = len(region)
+    while end > 0 and (is_chrome(region[end - 1])
+                       or INTERRUPTED_RE.match(region[end - 1])):
+        end -= 1
+    if end == 0:
+        return "-"
+    start = end - 1
+    while start > 0 and not is_chrome(region[start - 1]):
+        start -= 1
+    return clean(region[start]) or "-"
+
+
+def is_interrupted(region: list[str]) -> bool:
+    """True when the interruption is the last thing on the transcript."""
+    for line in reversed(region):
+        if is_chrome(line):
+            continue
+        return bool(INTERRUPTED_RE.match(line))
+    return False
+
+
+def running_message(region: list[str]) -> str:
+    """What the agent is doing: its current step, else the spinner's verb."""
+    for line in reversed(region):
+        if re.match(r"^\s{0,2}[●○◉]\s+\S", line):
+            return clean(line)
+    for line in reversed(region):
+        m = SPINNER_RE.match(line)
+        if m:
+            verb = re.sub(r"^\s*[^\w\s]\s+", "", m.group(0))
+            return clean(re.sub(r"\s*\(.*", "", verb))
+    return "-"
+
+
+def dialog_message(lines: list[str]) -> str:
+    """What the dialog is asking for."""
+    dialog = lines[-DIALOG_LINES:]
+    for line in dialog:
+        if ASK_RE.search(line):
+            return clean(line)
+    for line in dialog:
+        m = ARROW_RE.match(line)
+        if m:
+            return clean(m.group(1))
+    for line in dialog:
+        if PERMISSION_RE.match(line) or YESNO_RE.search(line):
+            return clean(line)
+    return "-"
+
+
+def input_draft(lines: list[str]) -> str:
+    """Unsent text sitting in the input box, if any."""
+    borders = [i for i, line in enumerate(lines) if BORDER_RE.match(line)]
+    if len(borders) < 2:
+        return ""
+    box = lines[borders[-2] + 1:borders[-1]]
+    return clean(" ".join(line.strip() for line in box)).strip()
+
+
+def pick_message(state: str, lines: list[str]) -> str:
+    if state == "blocked":
+        return dialog_message(lines)
+    region = transcript_region(lines)
+    if state == "running":
+        return running_message(region)
+    if state == "interrupted":
+        # An interrupted turn was cut off mid-word, so its last line is
+        # usually a fragment. claude puts the prompt back in the input box
+        # when it stops, and that prompt is the thing you have to decide
+        # about, so prefer it.
+        draft = input_draft(lines)
+        if draft:
+            return f"❯ {draft}"
+    return last_paragraph(region)
+
+
 def classify(lines: list[str]) -> str:
     # Blocking on the user wins over everything else: it is the state that
     # needs a human, and a dialog hides the spinner anyway.
     if waiting_dialog(lines[-DIALOG_LINES:]):
-        return "waiting"
+        return "blocked"
 
     tail = lines[-TAIL_LINES:]
     if any(SPINNER_RE.match(line) for line in tail):
         return "running"
     if any(INTERRUPT_RE.match(line) for line in tail):
         return "running"
-    return "idle"
+    # Checked after the spinner: the marker stays on the transcript, so a
+    # pane that was interrupted and then sent on its way is running again.
+    if is_interrupted(transcript_region(lines)):
+        return "interrupted"
+    return "done"
 
 
 SUFFIX_SCALE = {"k": 1_000, "m": 1_000_000}
@@ -387,7 +560,7 @@ def state_duration(state: str, lines: list[str], now: float) -> str:
     """
     if state == "running":
         return parse_elapsed(lines) or "-"
-    if state == "idle":
+    if state == "done":
         seconds = parse_done(lines, now)
         return "-" if seconds is None else format_elapsed(seconds, floor="<1m")
     return "-"
@@ -407,6 +580,9 @@ def format_elapsed(seconds: float, floor: str | None = None) -> str:
 
 # --- scan ---
 
+SHARED_TREE = "▲"
+
+
 @dataclass(frozen=True)
 class Row:
     state: str
@@ -416,7 +592,8 @@ class Row:
     duration: str
     block: str
     age: str
-    pane_id: str
+    message: str
+    flag: str
 
 
 def collect_rows() -> list[Row]:
@@ -426,11 +603,17 @@ def collect_rows() -> list[Row]:
     info, children = process_snapshot()
     now = time.time()
 
+    agent_panes = [
+        (pane, agent)
+        for pane in panes
+        if (agent := find_agent(pane.pid, info, children)) is not None
+    ]
+    # Two agents in one working tree overwrite each other's edits with no
+    # conflict and no warning, so it is worth saying out loud.
+    trees = Counter(pane.cwd for pane, _ in agent_panes)
+
     rows: list[Row] = []
-    for pane in panes:
-        agent = find_agent(pane.pid, info, children)
-        if agent is None:
-            continue
+    for pane, agent in agent_panes:
         lines = visible_lines(capture_pane(pane.pane_id))
         state = classify(lines)
         rows.append(Row(
@@ -441,7 +624,8 @@ def collect_rows() -> list[Row]:
             duration=state_duration(state, lines, now),
             block=parse_block(lines) or "-",
             age=parse_age(lines) or format_elapsed(now - agent.started_at),
-            pane_id=pane.pane_id,
+            message=pick_message(state, lines),
+            flag=SHARED_TREE if trees[pane.cwd] > 1 else " ",
         ))
 
     rows.sort(key=lambda r: (STATE_ORDER.get(r.state, 9), r.target))
@@ -466,10 +650,13 @@ def render(rows: list[Row], color: bool) -> list[str]:
     out: list[str] = []
     for r in rows:
         state_color = STATE_COLOR.get(r.state, DIM)
-        out.append(" ".join((
-            paint("●", state_color),
+        # The target sits at field 1, right after the dot and separated from
+        # it by exactly one space: that is the contract the television
+        # channel splits on to find the pane to attach to or kill.
+        columns = (
+            paint("●", state_color) + " " + r.target.ljust(w_target),
+            paint(r.flag, RED),
             paint(r.state.ljust(w_state), state_color),
-            r.target.ljust(w_target),
             paint(r.agent.ljust(w_agent), CYAN),
             (paint(r.context.rjust(w_ctx), context_color(r.context))
              + paint(" ctx", DIM)),
@@ -478,8 +665,8 @@ def render(rows: list[Row], color: bool) -> list[str]:
             r.duration.rjust(w_dur),
             paint(f"blk {r.block.ljust(w_block)}", DIM),
             paint(f"up {r.age.rjust(w_age)}", DIM),
-            paint(r.pane_id, DIM),
-        )))
+        )
+        out.append("  ".join(columns) + "   " + paint(r.message, DIM))
     return out
 
 
