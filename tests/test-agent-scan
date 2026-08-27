@@ -27,6 +27,7 @@ from __future__ import annotations
 import importlib.machinery
 import importlib.util
 import sys
+import time
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parents[1] / ".local" / "bin" / "agent-scan"
@@ -73,6 +74,32 @@ CLAUDE_RUNNING_TIMED = """  ⎿  Read 1 file
   ⎇ main | (+7,-14)                      Model: Opus 5 | Ctx: 186.8k
   ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"""
 
+# claude's spinner vocabulary includes accented verbs. An ASCII-only verb
+# class reads these as idle, which is the worst kind of wrong: a working
+# session that looks like it is waiting for you.
+CLAUDE_RUNNING_ACCENTED = """● Reading the file now
+* Sautéing… (7m 31s · ↓ 29.6k tokens · thought for 7s)
+────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────
+  ⎇ main | (+7,-14)                      Model: Opus 5 | Ctx: 186.8k
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"""
+
+# A short session is padded with blank lines above the input box, which
+# pushes the `done` stamp out of the tail window the other patterns use.
+CLAUDE_IDLE_PADDED = """● OK
+✻ Baked for 2s · done 11:16 PM
+
+
+
+
+────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────
+  ⎇ main | (+0,-0)                        Model: Opus 5 | Ctx: 36.3k
+  Total: 36.3k                         Session: 3m | Block: 4hr 29m
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"""
+
 CLAUDE_WAITING_EDIT = """ Edit file
  file.txt
  1 -hello
@@ -117,6 +144,14 @@ QUOTED_SPINNER = """  ⎿  --- t+ 0.12s  state=running
 ────────────────────────────────────────────────────────────
   ⎇ main | (+0,-0)                       Model: Opus 5 | Ctx: 145.3k
   ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"""
+# Tool output quoting a finished turn: indented, unlike the real thing.
+QUOTED_DONE = """  ⎿  === %26
+       ✻ Churned for 3m 50s · done 8:02 PM
+────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────
+  ⎇ main | (+0,-0)                       Model: Opus 5 | Ctx: 145.3k
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"""
 # What the old pattern set got wrong: the mode hint contains "permissions".
 TYPED_NUMBERED_LINE = CLAUDE_IDLE.replace("❯", "❯ 1. do this thing", 1)
 
@@ -124,6 +159,7 @@ STATE_CASES = (
     ("claude idle", CLAUDE_IDLE, "idle"),
     ("claude running (bare spinner)", CLAUDE_RUNNING_BARE, "running"),
     ("claude running (timed spinner)", CLAUDE_RUNNING_TIMED, "running"),
+    ("claude running (accented verb)", CLAUDE_RUNNING_ACCENTED, "running"),
     ("claude waiting (edit dialog)", CLAUDE_WAITING_EDIT, "waiting"),
     ("claude waiting (trust dialog)", CLAUDE_WAITING_TRUST, "waiting"),
     ("opencode idle", OPENCODE_IDLE, "idle"),
@@ -144,6 +180,33 @@ CONTEXT_CASES = (
 AGE_CASES = (
     ("claude hours", CLAUDE_IDLE, "36h3m"),
     ("opencode has none", OPENCODE_IDLE, None),
+)
+
+BLOCK_CASES = (
+    ("claude minutes", CLAUDE_IDLE, "59m"),
+    ("claude hours", CLAUDE_IDLE_PADDED, "4h29m"),
+    ("opencode has none", OPENCODE_IDLE, None),
+)
+
+# Fixed clock so the `· done H:MM` arithmetic is deterministic: 2026-08-27
+# at 23:34 local time, the moment these captures were taken.
+NOW = time.mktime((2026, 8, 27, 23, 34, 0, 0, 0, -1))
+
+DURATION_CASES = (
+    # 7:58 PM against a 23:34 clock: 3h36m earlier the same day.
+    ("idle since a done stamp", "idle", CLAUDE_IDLE, "3h36m"),
+    # Reached only by searching past the tail window.
+    ("idle, stamp above the padding", "idle", CLAUDE_IDLE_PADDED, "18m"),
+    # 2.1.245 and older never render the stamp, so there is nothing to read.
+    ("idle with no stamp", "idle", OPENCODE_IDLE, "-"),
+    ("running shows turn elapsed", "running", CLAUDE_RUNNING_TIMED, "2m55s"),
+    ("running, accented verb", "running", CLAUDE_RUNNING_ACCENTED, "7m31s"),
+    ("running before the timer", "running", CLAUDE_RUNNING_BARE, "-"),
+    # Nothing on screen records when a dialog appeared.
+    ("waiting is unknowable", "waiting", CLAUDE_WAITING_EDIT, "-"),
+    # A pane quoting this repo's own captures must not read the quoted
+    # stamp as its own last turn.
+    ("idle pane quoting a done stamp", "idle", QUOTED_DONE, "-"),
 )
 
 
@@ -172,7 +235,22 @@ def main() -> int:
         print(f"{'ok  ' if ok else 'FAIL'}  age      {name:36} "
               f"want={str(want):8} got={got}")
 
-    total = len(STATE_CASES) + len(CONTEXT_CASES) + len(AGE_CASES)
+    for name, sample, want in BLOCK_CASES:
+        got = mod.parse_block(mod.visible_lines(sample))
+        ok = got == want
+        failures += not ok
+        print(f"{'ok  ' if ok else 'FAIL'}  block    {name:36} "
+              f"want={str(want):8} got={got}")
+
+    for name, state, sample, want in DURATION_CASES:
+        got = mod.state_duration(state, mod.visible_lines(sample), NOW)
+        ok = got == want
+        failures += not ok
+        print(f"{'ok  ' if ok else 'FAIL'}  duration {name:36} "
+              f"want={want:8} got={got}")
+
+    total = (len(STATE_CASES) + len(CONTEXT_CASES) + len(AGE_CASES)
+             + len(BLOCK_CASES) + len(DURATION_CASES))
     print(f"\n{total - failures}/{total} passed")
     return 1 if failures else 0
 

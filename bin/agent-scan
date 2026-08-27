@@ -20,9 +20,10 @@ what the row says.
 
 Usage: agent-scan [scan] [--no-color]
 
-Output columns: state, session:window.pane, agent, context, session age,
-pane id. The pane id is always the last field so consumers can pick it up
-with a split on the last whitespace-separated token.
+Output columns: state, session:window.pane, agent, context, how long the
+pane has been in its current state, the 5h usage block, session age, pane
+id. The pane id is always the last field so consumers can pick it up with a
+split on the last whitespace-separated token.
 """
 
 from __future__ import annotations
@@ -61,8 +62,11 @@ DIALOG_LINES = 8
 # is on screen ~0.2s after a turn starts, while its parenthetical (`… (13s ·
 # ↓ 129 tokens)`) takes another ~1.5s. It is drawn at column 0; a transcript
 # quoting one is always indented, which is what the leading-space limit and
-# the single-word-before-the-ellipsis shape rule out.
-SPINNER_RE = re.compile(r"^ ?[^\w\s]\s+[A-Za-z][A-Za-z'-]*…")
+# the single-word-before-the-ellipsis shape rule out. The verb has to be
+# matched as a unicode word - claude's vocabulary includes `Sautéing…` and
+# `Flambéing…`, which an ASCII-only class silently reads as idle.
+WORD = r"[^\W\d_]"
+SPINNER_RE = re.compile(rf"^ ?[^\w\s]\s+{WORD}(?:{WORD}|['-])*…")
 # opencode's running footer: `   ■■■⬝⬝⬝⬝⬝  esc interrupt   12.1K (9%) …` -
 # note `esc interrupt`, no `to`, and the line continues past the hint. Also
 # matches a footer that opens with the hint on its own.
@@ -96,6 +100,22 @@ CTX_RE = re.compile(
 )
 # From the statusline: `Session: 24hr 13m`, `Session: 4m`, `Session: <1m`.
 AGE_RE = re.compile(r"Session:\s*(<?\d+\s*(?:hr|h|m|s))(?:\s*(\d+m))?")
+# Also from the statusline: `Block: 4hr 22m`. This is the 5h usage window,
+# which is an account-wide clock - every session on the same account shows
+# the same value - so it says how much runway is left, not anything about
+# this pane.
+BLOCK_RE = re.compile(r"Block:\s*(<?\d+\s*(?:hr|h|m|s))(?:\s*(\d+m))?")
+# claude closes a finished turn with `✻ Cooked for 2m 7s · done 11:16 PM`.
+# Same shape as the spinner - glyph at column 0, one gerund - so a quoted
+# transcript line, which is always indented, does not match. Sessions on
+# claude < 2.1.246 do not render the `· done` suffix at all; there the
+# duration is simply unknown.
+DONE_RE = re.compile(
+    rf"^ ?[^\w\s]\s+{WORD}(?:{WORD}|['-])*\s+for\b[^·]*·\s*done\s+"
+    r"(\d{1,2}):(\d{2})(?:\s*([AaPp])\.?[Mm]\.?)?"
+)
+# The spinner's elapsed parenthetical: `… (2m 55s · ↓ 15.1k tokens)`.
+ELAPSED_RE = re.compile(r"…\s*\((?:(\d+)m\s*)?(\d+)s\b")
 
 
 # --- tmux ---
@@ -256,16 +276,94 @@ def parse_context(lines: list[str]) -> str:
     return "-"
 
 
-def parse_age(lines: list[str]) -> str | None:
+def _statusline_duration(lines: list[str], pattern: re.Pattern[str]) -> str | None:
+    """`Session: 24hr 13m` / `Block: 4hr 22m` -> `24h13m` / `4h22m`."""
     for line in reversed(lines[-FOOTER_LINES:]):
-        m = AGE_RE.search(line)
+        m = pattern.search(line)
         if m:
             head = m.group(1).replace(" ", "").replace("hr", "h")
             return f"{head}{m.group(2)}" if m.group(2) else head
     return None
 
 
-def format_elapsed(seconds: float) -> str:
+def parse_age(lines: list[str]) -> str | None:
+    return _statusline_duration(lines, AGE_RE)
+
+
+def parse_block(lines: list[str]) -> str | None:
+    return _statusline_duration(lines, BLOCK_RE)
+
+
+def parse_done(lines: list[str], now: float) -> float | None:
+    """Seconds since the last finished turn, from its `· done H:MM` stamp.
+
+    The stamp is wall-clock with no date, so it is read as the most recent
+    past occurrence of that time. A 12h clock plus AM/PM and a 24h clock are
+    both unambiguous within a day; anything older than that is reported as
+    None rather than as a number that would be off by a multiple of 24h.
+    """
+    # Not limited to the tail: a short transcript is padded with blank lines
+    # above the input box, which pushes the stamp well clear of it. The
+    # anchored shape above is the guard instead of the position.
+    stamp = None
+    for line in lines:
+        m = DONE_RE.match(line)
+        if m:
+            stamp = m
+    if stamp is None:
+        return None
+
+    hour, minute = int(stamp.group(1)), int(stamp.group(2))
+    half = stamp.group(3)
+    if half:
+        hour = hour % 12 + (12 if half.lower() == "p" else 0)
+    if hour > 23 or minute > 59:
+        return None
+
+    local = time.localtime(now)
+    done = time.mktime((
+        local.tm_year, local.tm_mon, local.tm_mday, hour, minute, 0,
+        0, 0, -1,
+    ))
+    # A stamp later than the current clock happened yesterday. The 90s of
+    # slack absorbs the stamp's own minute-level truncation.
+    if done > now + 90:
+        done -= 24 * 3600
+    elapsed = now - done
+    return elapsed if 0 <= elapsed < 24 * 3600 else None
+
+
+def parse_elapsed(lines: list[str]) -> str | None:
+    """How long the running turn has been going, from the spinner."""
+    for line in reversed(lines[-TAIL_LINES:]):
+        if not SPINNER_RE.match(line):
+            continue
+        m = ELAPSED_RE.search(line)
+        if m:
+            minutes = int(m.group(1) or 0)
+            return f"{minutes}m{m.group(2)}s" if minutes else f"{m.group(2)}s"
+        # A spinner with no parenthetical yet: the turn is ~a second old.
+        return None
+    return None
+
+
+def state_duration(state: str, lines: list[str], now: float) -> str:
+    """How long this pane has been in the state the row reports.
+
+    Deliberately not a single clock: for a running pane the honest number is
+    the turn's own elapsed time, for an idle one it is the time since the
+    last turn finished, and for a pane blocked on a dialog nothing on screen
+    records when the dialog appeared.
+    """
+    if state == "running":
+        return parse_elapsed(lines) or "-"
+    if state == "idle":
+        seconds = parse_done(lines, now)
+        return "-" if seconds is None else format_elapsed(seconds, floor="<1m")
+    return "-"
+
+
+def format_elapsed(seconds: float, floor: str | None = None) -> str:
     total = max(int(seconds), 0)
     hours, rem = divmod(total, 3600)
     minutes, secs = divmod(rem, 60)
@@ -273,7 +371,8 @@ def format_elapsed(seconds: float) -> str:
         return f"{hours}h{minutes}m"
     if minutes:
         return f"{minutes}m"
-    return f"{secs}s"
+    # `done` stamps carry whole minutes only, so seconds there are noise.
+    return floor if floor else f"{secs}s"
 
 
 # --- scan ---
@@ -284,6 +383,8 @@ class Row:
     target: str
     agent: str
     context: str
+    duration: str
+    block: str
     age: str
     pane_id: str
 
@@ -301,11 +402,14 @@ def collect_rows() -> list[Row]:
         if agent is None:
             continue
         lines = visible_lines(capture_pane(pane.pane_id))
+        state = classify(lines)
         rows.append(Row(
-            state=classify(lines),
+            state=state,
             target=pane.target,
             agent=agent.name,
             context=parse_context(lines),
+            duration=state_duration(state, lines, now),
+            block=parse_block(lines) or "-",
             age=parse_age(lines) or format_elapsed(now - agent.started_at),
             pane_id=pane.pane_id,
         ))
@@ -318,11 +422,16 @@ def render(rows: list[Row], color: bool) -> list[str]:
     def paint(text: str, code: str) -> str:
         return f"{code}{text}{RESET}" if color else text
 
-    w_state = max(len(r.state) for r in rows)
-    w_target = max(len(r.target) for r in rows)
-    w_agent = max(len(r.agent) for r in rows)
-    w_ctx = max(len(r.context) for r in rows)
-    w_age = max(len(r.age) for r in rows)
+    def width(field: str) -> int:
+        return max(len(getattr(r, field)) for r in rows)
+
+    w_state = width("state")
+    w_target = width("target")
+    w_agent = width("agent")
+    w_ctx = width("context")
+    w_dur = width("duration")
+    w_block = width("block")
+    w_age = width("age")
 
     out: list[str] = []
     for r in rows:
@@ -333,7 +442,11 @@ def render(rows: list[Row], color: bool) -> list[str]:
             r.target.ljust(w_target),
             paint(r.agent.ljust(w_agent), CYAN),
             paint(f"{r.context.rjust(w_ctx)} ctx", DIM),
-            paint(r.age.rjust(w_age), DIM),
+            # Undimmed: how long this pane has been in this state is the
+            # number you actually triage on.
+            r.duration.rjust(w_dur),
+            paint(f"blk {r.block.ljust(w_block)}", DIM),
+            paint(f"up {r.age.rjust(w_age)}", DIM),
             paint(r.pane_id, DIM),
         )))
     return out
