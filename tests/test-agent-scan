@@ -11,8 +11,8 @@
 """Checks for agent-scan's pane-content state classifier.
 
 Every sample below is a real `tmux capture-pane` tail, trimmed to the live
-UI region: claude 2.1.247/2.1.248 and opencode 1.18.23 across the four
-states.
+UI region: claude 2.1.247/2.1.248/2.1.250 and opencode 1.18.23 across the
+five states.
 They are the regression net for the patterns in agent-scan, which are the
 only thing standing between a status row and a plausible lie.
 
@@ -130,6 +130,44 @@ CLAUDE_WEEKLY = """● Counted from 1 to 200.
   Total: 36.7k                            Session: <1m | Block: 2m
   ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"""
 
+# A pane parked on a delegate. The waiting line replaces the turn summary,
+# and the tray under the statusline names what each delegate is doing.
+CLAUDE_DELEGATED = """● Reviewer resumed from where the limit cut it off.
+✻ Waiting for 1 background agent to finish
+────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────
+  ⎇ main | (+441,-17)                     Model: Opus 5 | Ctx: 75.5k
+  Total: 263.2M                     Session: 17hr 7m | Block: 2hr 57m
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents
+
+  ● main
+  ◯ general-purpose  Re-seeding demo.db    5m 6s · ↓ 141.7k tokens
+  ⧉  venjing"""
+
+# A second delegate pushes the statusline nine lines up from the bottom,
+# which is outside the footer window unless the tray comes off first.
+CLAUDE_DELEGATED_PAIR = CLAUDE_DELEGATED.replace(
+    "✻ Waiting for 1 background agent to finish",
+    "✻ Waiting for 2 background agents and 1 dynamic workflow to finish",
+).replace(
+    "  ⧉  venjing",
+    "  ◯ Explore  Sweeping for capture paths    12m 3s · ↓ 41.0k tokens\n"
+    "  ⧉  venjing",
+)
+
+# The waiting line stays on the transcript after the delegates report, so
+# the turn that resumed and finished afterwards has to win.
+CLAUDE_DELEGATED_RESUMED = """● Reviewer resumed from where the limit cut it off.
+✻ Waiting for 1 background agent to finish
+● The sweep came back clean.
+✻ Cooked for 2m 7s · done 11:16 PM
+────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────
+  ⎇ main | (+441,-17)                     Model: Opus 5 | Ctx: 75.5k
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"""
+
 CLAUDE_WAITING_EDIT = """ Edit file
  file.txt
  1 -hello
@@ -191,6 +229,9 @@ STATE_CASES = (
     ("claude running (timed spinner)", CLAUDE_RUNNING_TIMED, "running"),
     ("claude running (accented verb)", CLAUDE_RUNNING_ACCENTED, "running"),
     ("claude interrupted", CLAUDE_INTERRUPTED, "interrupted"),
+    ("claude delegated", CLAUDE_DELEGATED, "delegated"),
+    ("claude delegated (two delegates)", CLAUDE_DELEGATED_PAIR, "delegated"),
+    ("delegates reported back", CLAUDE_DELEGATED_RESUMED, "done"),
     ("claude blocked (edit dialog)", CLAUDE_WAITING_EDIT, "blocked"),
     ("claude blocked (trust dialog)", CLAUDE_WAITING_TRUST, "blocked"),
     ("opencode done", OPENCODE_IDLE, "done"),
@@ -204,18 +245,21 @@ STATE_CASES = (
 
 CONTEXT_CASES = (
     ("claude statusline", CLAUDE_IDLE, "145.3k"),
+    ("statusline under an agent tray", CLAUDE_DELEGATED_PAIR, "75.5k"),
     ("opencode footer", OPENCODE_IDLE, "12.4K"),
     ("no statusline visible", OPENCODE_WAITING, "-"),
 )
 
 AGE_CASES = (
     ("claude hours", CLAUDE_IDLE, "36h3m"),
+    ("under an agent tray", CLAUDE_DELEGATED_PAIR, "17h7m"),
     ("opencode has none", OPENCODE_IDLE, None),
 )
 
 BLOCK_CASES = (
     ("claude minutes", CLAUDE_IDLE, "59m"),
     ("claude hours", CLAUDE_IDLE_PADDED, "4h29m"),
+    ("under an agent tray", CLAUDE_DELEGATED_PAIR, "2h57m"),
     ("opencode has none", OPENCODE_IDLE, None),
 )
 
@@ -261,6 +305,10 @@ DURATION_CASES = (
     ("running shows turn elapsed", "running", CLAUDE_RUNNING_TIMED, "2m55s"),
     ("running, accented verb", "running", CLAUDE_RUNNING_ACCENTED, "7m31s"),
     ("running before the timer", "running", CLAUDE_RUNNING_BARE, "-"),
+    # The wait is as old as the delegate that has been out longest.
+    ("delegated, one delegate", "delegated", CLAUDE_DELEGATED, "5m"),
+    ("delegated, the oldest of two", "delegated", CLAUDE_DELEGATED_PAIR,
+     "12m"),
     # Nothing on screen records when a dialog appeared.
     ("blocked is unknowable", "blocked", CLAUDE_WAITING_EDIT, "-"),
     # A pane quoting this repo's own captures must not read the quoted
@@ -282,6 +330,10 @@ MESSAGE_CASES = (
      "Do you want to make this edit to file.txt?"),
     ("blocked shows opencode's action", "blocked", OPENCODE_WAITING,
      "Edit note.txt"),
+    ("delegated shows what the delegate is doing", "delegated",
+     CLAUDE_DELEGATED, "Re-seeding demo.db"),
+    ("delegated names each of them", "delegated", CLAUDE_DELEGATED_PAIR,
+     "Re-seeding demo.db · Sweeping for capture paths"),
     # The turn was cut off mid-word, so the restored prompt is the only
     # thing worth showing.
     ("interrupted shows the restored prompt", "interrupted",

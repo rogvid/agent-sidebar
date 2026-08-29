@@ -21,6 +21,7 @@ it costs you to ignore the row, not for the widget that is on screen:
   blocked      stopped mid-task on a dialog; the task stays frozen
   interrupted  you stopped it and it is asking what to do instead
   running      working; needs nothing
+  delegated    parked until the agents it spawned report back; needs nothing
   done         turn finished; there is output to read, nothing is frozen
 
 Usage: agent-scan [scan] [--no-color]
@@ -62,11 +63,15 @@ STATE_COLOR = {
     "blocked": YELLOW,
     "interrupted": MAGENTA,
     "running": BLUE,
+    "delegated": CYAN,
     "done": GREEN,
 }
-# Most-needed first. `running` outranks `done` so active work stays near the
-# top; neither wants anything from you, but one of them is still moving.
-STATE_ORDER = {"blocked": 0, "interrupted": 1, "running": 2, "done": 3}
+# Most-needed first. `running` and `delegated` outrank `done` so work that
+# is still moving stays near the top; none of the three wants anything from
+# you, but only `done` has stopped.
+STATE_ORDER = {
+    "blocked": 0, "interrupted": 1, "running": 2, "delegated": 3, "done": 4,
+}
 
 # Context rot: the further past these a session is, the less its earlier
 # turns are really informing the current one. Thresholds are absolute
@@ -150,6 +155,22 @@ ELAPSED_RE = re.compile(r"…\s*\((?:(\d+)m\s*)?(\d+)s\b")
 INTERRUPTED_RE = re.compile(
     r"^\s*(?:⎿\s*)?Interrupted\b.*(?:What should|do instead)", re.IGNORECASE
 )
+# What claude prints in place of the turn summary when the turn ends with
+# work still out with someone else: `✻ Waiting for 1 background agent to
+# finish`, or `✻ Waiting for 2 background agents and 1 dynamic workflow to
+# finish`. The session is parked until they report, then picks the task up
+# again on its own. Same column-0 glyph shape as the spinner and the
+# summary line, so an indented quote of one does not match.
+DELEGATED_RE = re.compile(
+    r"^ ?[^\w\s]\s+Waiting for\b[^·]*\b(?:agents?|workflows?)\s+to finish\b"
+)
+# The tray claude draws under its statusline while delegates are in flight:
+# `● main` for the session itself, then one row per delegate - `◯
+# general-purpose  Re-seeding demo.db  5m 6s · ↓ 141.7k tokens`, its columns
+# separated by runs of padding. It is the only place the pane records how
+# long the wait has been going.
+TRAY_RE = re.compile(r"^\s*[●◯○◌]\s+(\S.*)")
+TRAY_ELAPSED_RE = re.compile(r"(?:(\d+)h)?\s*(?:(\d+)m)?\s*(?:(\d+)s)?")
 # The input box's own rules. Long enough not to catch `─ Worked for 17m ──`,
 # which claude draws as a transcript separator.
 BORDER_RE = re.compile(r"^\s*[─═]{10,}")
@@ -291,6 +312,46 @@ def visible_lines(content: str) -> list[str]:
     return lines
 
 
+def split_tray(lines: list[str]) -> tuple[list[str], list[str]]:
+    """The pane without its agent tray, and the tray's rows.
+
+    The tray hangs *below* the statusline, which puts it between the footer
+    parsers and the lines they count up from: two delegates are enough to
+    push `Ctx:` out of the window. Everything under the last input-bar line
+    that has a tray row's shape comes off here. Anything unexpected down
+    there leaves the pane alone, because a wrong guess costs the statusline.
+    """
+    bar = -1
+    for i, line in enumerate(lines):
+        if INPUT_BAR_RE.search(line):
+            bar = i
+    if bar < 0:
+        return lines, []
+    tray: list[str] = []
+    for line in lines[bar + 1:]:
+        if not line.strip() or CHROME_RE.search(line):
+            continue
+        m = TRAY_RE.match(line)
+        if m is None:
+            return lines, []
+        tray.append(m.group(1))
+    return (lines[:bar + 1], tray) if tray else (lines, [])
+
+
+def tray_delegates(tray: list[str]) -> list[tuple[str, str]]:
+    """(what each delegate is doing, its stats) for every row that says.
+
+    The session's own row - `● main` - says neither, so it drops out
+    without having to be recognised by name.
+    """
+    rows: list[tuple[str, str]] = []
+    for line in tray:
+        parts = re.split(r"\s{2,}", line.strip())
+        if len(parts) >= 2:
+            rows.append((parts[1], parts[2] if len(parts) > 2 else ""))
+    return rows
+
+
 def waiting_dialog(dialog: list[str]) -> bool:
     """True if an approval dialog owns the bottom of the pane.
 
@@ -340,6 +401,7 @@ def is_chrome(line: str) -> bool:
         or CHROME_RE.search(line)
         or INPUT_BAR_RE.search(line)
         or SUMMARY_RE.match(line)
+        or DELEGATED_RE.match(line)
         or SPINNER_RE.match(line)
         or re.match(r"^\s*[╹┃│]?\s*[▀▄─═]{4,}", line)
     )
@@ -369,6 +431,21 @@ def last_paragraph(region: list[str]) -> str:
     while start > 0 and not is_chrome(region[start - 1]):
         start -= 1
     return clean(region[start]) or "-"
+
+
+def is_delegated(region: list[str]) -> bool:
+    """True when the last turn ended parked on delegates, not finished.
+
+    The waiting line stays on the transcript after they report, so a later
+    turn boundary - a summary line of the session's own - means the wait is
+    over and the row is plain `done`.
+    """
+    for line in reversed(region):
+        if DELEGATED_RE.match(line):
+            return True
+        if SUMMARY_RE.match(line):
+            return False
+    return False
 
 
 def is_interrupted(region: list[str]) -> bool:
@@ -409,6 +486,14 @@ def dialog_message(lines: list[str]) -> str:
     return "-"
 
 
+def delegated_message(tray: list[str], region: list[str]) -> str:
+    """What the delegates are doing, else the session's parting words."""
+    doing = [activity for activity, _ in tray_delegates(tray) if activity]
+    if doing:
+        return clean(" · ".join(doing))
+    return last_paragraph(region)
+
+
 def input_draft(lines: list[str]) -> str:
     """Unsent text sitting in the input box, if any."""
     borders = [i for i, line in enumerate(lines) if BORDER_RE.match(line)]
@@ -419,36 +504,44 @@ def input_draft(lines: list[str]) -> str:
 
 
 def pick_message(state: str, lines: list[str]) -> str:
+    body, tray = split_tray(lines)
     if state == "blocked":
-        return dialog_message(lines)
-    region = transcript_region(lines)
+        return dialog_message(body)
+    region = transcript_region(body)
     if state == "running":
         return running_message(region)
+    if state == "delegated":
+        return delegated_message(tray, region)
     if state == "interrupted":
         # An interrupted turn was cut off mid-word, so its last line is
         # usually a fragment. claude puts the prompt back in the input box
         # when it stops, and that prompt is the thing you have to decide
         # about, so prefer it.
-        draft = input_draft(lines)
+        draft = input_draft(body)
         if draft:
             return f"❯ {draft}"
     return last_paragraph(region)
 
 
 def classify(lines: list[str]) -> str:
+    body, _ = split_tray(lines)
     # Blocking on the user wins over everything else: it is the state that
     # needs a human, and a dialog hides the spinner anyway.
-    if waiting_dialog(lines[-DIALOG_LINES:]):
+    if waiting_dialog(body[-DIALOG_LINES:]):
         return "blocked"
 
-    tail = lines[-TAIL_LINES:]
+    tail = body[-TAIL_LINES:]
     if any(SPINNER_RE.match(line) for line in tail):
         return "running"
     if any(INTERRUPT_RE.match(line) for line in tail):
         return "running"
-    # Checked after the spinner: the marker stays on the transcript, so a
-    # pane that was interrupted and then sent on its way is running again.
-    if is_interrupted(transcript_region(lines)):
+    region = transcript_region(body)
+    # Both of these are checked after the spinner: their markers stay on
+    # the transcript, so a pane that was parked or interrupted and has
+    # since been sent on its way is running again.
+    if is_delegated(region):
+        return "delegated"
+    if is_interrupted(region):
         return "interrupted"
     return "done"
 
@@ -478,7 +571,8 @@ def context_color(text: str) -> str:
 
 
 def parse_context(lines: list[str]) -> str:
-    for line in reversed(lines[-FOOTER_LINES:]):
+    body, _ = split_tray(lines)
+    for line in reversed(body[-FOOTER_LINES:]):
         m = CTX_RE.search(line)
         if m:
             if m.group(1):
@@ -491,7 +585,8 @@ def parse_context(lines: list[str]) -> str:
 
 def _statusline_duration(lines: list[str], pattern: re.Pattern[str]) -> str | None:
     """`Session: 24hr 13m` / `Block: 4hr 22m` -> `24h13m` / `4h22m`."""
-    for line in reversed(lines[-FOOTER_LINES:]):
+    body, _ = split_tray(lines)
+    for line in reversed(body[-FOOTER_LINES:]):
         m = pattern.search(line)
         if m:
             head = m.group(1).replace(" ", "").replace("hr", "h")
@@ -508,7 +603,8 @@ def parse_block(lines: list[str]) -> str | None:
 
 
 def parse_weekly(lines: list[str]) -> str | None:
-    for line in reversed(lines[-TAIL_LINES:]):
+    body, _ = split_tray(lines)
+    for line in reversed(body[-TAIL_LINES:]):
         m = WEEKLY_RE.search(line)
         if m:
             return f"{m.group(1)}%"
@@ -578,18 +674,36 @@ def parse_elapsed(lines: list[str]) -> str | None:
     return None
 
 
+def tray_elapsed(tray: list[str]) -> str:
+    """How long the wait has run: the oldest delegate still out there."""
+    longest = None
+    for _, stats in tray_delegates(tray):
+        m = TRAY_ELAPSED_RE.match(stats)
+        if m is None or not any(m.groups()):
+            continue
+        hours, minutes, secs = (int(g or 0) for g in m.groups())
+        seconds = hours * 3600 + minutes * 60 + secs
+        if longest is None or seconds > longest:
+            longest = seconds
+    return "-" if longest is None else format_elapsed(longest)
+
+
 def state_duration(state: str, lines: list[str], now: float) -> str:
     """How long this pane has been in the state the row reports.
 
     Deliberately not a single clock: for a running pane the honest number is
     the turn's own elapsed time, for an idle one it is the time since the
-    last turn finished, and for a pane blocked on a dialog nothing on screen
-    records when the dialog appeared.
+    last turn finished, for a delegated one it is the oldest delegate's, and
+    for a pane blocked on a dialog nothing on screen records when the dialog
+    appeared.
     """
+    body, tray = split_tray(lines)
     if state == "running":
-        return parse_elapsed(lines) or "-"
+        return parse_elapsed(body) or "-"
+    if state == "delegated":
+        return tray_elapsed(tray)
     if state == "done":
-        seconds = parse_done(lines, now)
+        seconds = parse_done(body, now)
         return "-" if seconds is None else format_elapsed(seconds, floor="<1m")
     return "-"
 
