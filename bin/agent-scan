@@ -99,12 +99,24 @@ DIALOG_LINES = 8
 # claude's bare spinner line - `✶ Topsy-turvying…`, a glyph and one gerund -
 # is on screen ~0.2s after a turn starts, while its parenthetical (`… (13s ·
 # ↓ 129 tokens)`) takes another ~1.5s. It is drawn at column 0; a transcript
-# quoting one is always indented, which is what the leading-space limit and
-# the single-word-before-the-ellipsis shape rule out. The verb has to be
-# matched as a unicode word - claude's vocabulary includes `Sautéing…` and
-# `Flambéing…`, which an ASCII-only class silently reads as idle.
+# quoting one is always indented, which is what the leading-space limit
+# rules out. The verb has to be matched as a unicode word - claude's
+# vocabulary includes `Sautéing…` and `Flambéing…`, which an ASCII-only
+# class silently reads as idle.
 WORD = r"[^\W\d_]"
-SPINNER_RE = re.compile(rf"^ ?[^\w\s]\s+{WORD}(?:{WORD}|['-])*…")
+# The frames the spinner cycles through, both terminal variants of the set:
+# `· ✢ ✳ ✶ ✻ ✽` and the `*` the non-ghostty set substitutes. Anchoring on
+# the real frames rather than on "some glyph" is what makes it safe to
+# accept a message longer than one word, because the shape that would
+# otherwise be swallowed is the transcript's own bullet - `● Running 1
+# shell command…` - which stays on screen long after the turn ends.
+SPINNER_GLYPH = r"[·✢✳✶✻✽*]"
+# One gerund is the usual message, but claude also drives this line itself
+# while it compacts (`Compacting conversation…`) or runs a compaction hook
+# (`Running PostCompact hooks…`), and a pane doing that is not idle.
+SPINNER_RE = re.compile(
+    rf"^ ?{SPINNER_GLYPH}\s+{WORD}(?:{WORD}|['-])*(?:\s[\w'-]+){{0,3}}…"
+)
 # opencode's running footer: `   ■■■⬝⬝⬝⬝⬝  esc interrupt   12.1K (9%) …` -
 # note `esc interrupt`, no `to`, and the line continues past the hint. Also
 # matches a footer that opens with the hint on its own.
@@ -462,17 +474,31 @@ def is_interrupted(region: list[str]) -> bool:
     return False
 
 
-def running_message(region: list[str]) -> str:
-    """What the agent is doing: its current step, else the spinner's verb."""
-    for line in reversed(region):
-        if re.match(r"^\s{0,2}[●○◉]\s+\S", line):
-            return clean(line)
+def spinner_message(region: list[str]) -> str | None:
+    """The spinner's own text, without its glyph or elapsed parenthetical."""
     for line in reversed(region):
         m = SPINNER_RE.match(line)
         if m:
-            verb = re.sub(r"^\s*[^\w\s]\s+", "", m.group(0))
+            verb = re.sub(rf"^\s*{SPINNER_GLYPH}\s+", "", m.group(0))
             return clean(re.sub(r"\s*\(.*", "", verb))
-    return "-"
+    return None
+
+
+def running_message(region: list[str]) -> str:
+    """What the agent is doing: its current step, else the spinner's text.
+
+    A spinner message of more than one word is not a verb out of claude's
+    vocabulary but claude naming a phase of its own - `Compacting
+    conversation…` - and that outranks the step bullet above it, because
+    whatever that step was, it is over.
+    """
+    spinner = spinner_message(region)
+    if spinner and " " in spinner:
+        return spinner
+    for line in reversed(region):
+        if re.match(r"^\s{0,2}[●○◉]\s+\S", line):
+            return clean(line)
+    return spinner or "-"
 
 
 def dialog_message(lines: list[str]) -> str:

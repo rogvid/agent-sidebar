@@ -87,6 +87,35 @@ CLAUDE_RUNNING_ACCENTED = """● Reading the file now
   ⎇ main | (+7,-14)                      Model: Opus 5 | Ctx: 186.8k
   ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"""
 
+# Mid-compaction, from dotagents:1.0. claude drives the spinner line itself
+# here, putting a phrase of its own where the vocabulary verb usually goes:
+# the shape that used to read as idle while the session was busy.
+CLAUDE_COMPACTING = """● Reading the review notes
+* Compacting conversation… (1m 9s)
+────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────
+  ⎇ main | (+0,-0)                     Model: Opus 5 | Ctx: 314.3k
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"""
+
+# The rest of that family: the three compaction hook phases, which claude
+# puts on the same line.
+CLAUDE_COMPACT_HOOKS = CLAUDE_COMPACTING.replace(
+    "* Compacting conversation… (1m 9s)", "✻ Running PostCompact hooks…")
+
+# What the widened message must not swallow. The bullet ends in an ellipsis
+# exactly like a spinner message, but it is transcript: it stays on screen
+# for as long as the pane does, and a pane is not running because of it.
+# Only the spinner's own glyphs separate the two.
+CLAUDE_IDLE_ELLIPSIS_BULLET = """● Running 1 shell command…
+  ⎿  4 rows
+✻ Worked for 12s · done 11:16 PM
+────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────
+  ⎇ main | (+0,-0)                        Model: Opus 5 | Ctx: 36.3k
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"""
+
 # A short session is padded with blank lines above the input box, which
 # pushes the `done` stamp out of the tail window the other patterns use.
 CLAUDE_IDLE_PADDED = """● OK
@@ -228,6 +257,10 @@ STATE_CASES = (
     ("claude running (bare spinner)", CLAUDE_RUNNING_BARE, "running"),
     ("claude running (timed spinner)", CLAUDE_RUNNING_TIMED, "running"),
     ("claude running (accented verb)", CLAUDE_RUNNING_ACCENTED, "running"),
+    ("claude running (compacting)", CLAUDE_COMPACTING, "running"),
+    ("claude running (compaction hooks)", CLAUDE_COMPACT_HOOKS, "running"),
+    ("done pane whose last bullet ends in …",
+     CLAUDE_IDLE_ELLIPSIS_BULLET, "done"),
     ("claude interrupted", CLAUDE_INTERRUPTED, "interrupted"),
     ("claude delegated", CLAUDE_DELEGATED, "delegated"),
     ("claude delegated (two delegates)", CLAUDE_DELEGATED_PAIR, "delegated"),
@@ -305,6 +338,8 @@ DURATION_CASES = (
     ("running shows turn elapsed", "running", CLAUDE_RUNNING_TIMED, "2m55s"),
     ("running, accented verb", "running", CLAUDE_RUNNING_ACCENTED, "7m31s"),
     ("running before the timer", "running", CLAUDE_RUNNING_BARE, "-"),
+    ("compacting is timed like any turn", "running", CLAUDE_COMPACTING,
+     "1m9s"),
     # The wait is as old as the delegate that has been out longest.
     ("delegated, one delegate", "delegated", CLAUDE_DELEGATED, "5m"),
     ("delegated, the oldest of two", "delegated", CLAUDE_DELEGATED_PAIR,
@@ -326,6 +361,11 @@ MESSAGE_CASES = (
      "Reading the file now"),
     ("running falls back to the verb", "running", CLAUDE_RUNNING_TIMED,
      "Concocting…"),
+    # The step bullet above it is finished; the phase claude names is not.
+    ("compacting outranks the step bullet", "running", CLAUDE_COMPACTING,
+     "Compacting conversation…"),
+    ("an ellipsis bullet is still just a bullet", "done",
+     CLAUDE_IDLE_ELLIPSIS_BULLET, "Running 1 shell command…"),
     ("blocked shows the question", "blocked", CLAUDE_WAITING_EDIT,
      "Do you want to make this edit to file.txt?"),
     ("blocked shows opencode's action", "blocked", OPENCODE_WAITING,
