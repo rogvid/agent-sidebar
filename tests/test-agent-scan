@@ -348,11 +348,37 @@ MESSAGE_CASES = (
 )
 
 
+# The order rows come out in is the whole point of the list, so it is worth
+# pinning. Each case is (target, state, seconds in that state).
+SORT_CASES = (
+    ("state comes before the clock", (
+        ("s:1.4", "delegated", 30.0),
+        ("s:1.3", "running", 30.0),
+        ("s:1.2", "done", 4000.0),
+        ("s:1.1", "interrupted", None),
+        ("s:1.0", "blocked", None),
+    ), ("s:1.0", "s:1.1", "s:1.2", "s:1.3", "s:1.4")),
+    # What the list is for: the session that just handed back its turn is
+    # the one still holding a thought you were having.
+    ("freshest first, unknown last", (
+        ("s:1.0", "done", 4000.0),
+        ("s:1.1", "done", None),
+        ("s:1.2", "done", 40.0),
+        ("s:1.3", "done", 600.0),
+    ), ("s:1.2", "s:1.3", "s:1.0", "s:1.1")),
+    # Two panes with nothing to sort on stay in a stable, nameable order.
+    ("nothing to go on falls back to the name", (
+        ("b:1.0", "blocked", None),
+        ("a:1.0", "blocked", None),
+    ), ("a:1.0", "b:1.0")),
+)
+
+
 def row(**overrides):
     """A Row with every field filled, for exercising the renderer."""
     fields = dict(
         state="done", target="s:1.0", agent="claude", context="10.0k",
-        duration="5m", block="1h", weekly="-", age="2h",
+        duration="5m", since=300.0, block="1h", weekly="-", age="2h",
         message="hello", flag=" ",
     )
     return AGENT_SCAN.Row(**(fields | overrides))
@@ -414,7 +440,8 @@ def main() -> int:
               f"{'ok' if ok else f'want={want!r} got={got!r}'}")
 
     for name, state, sample, want in DURATION_CASES:
-        got = mod.state_duration(state, mod.visible_lines(sample), NOW)
+        seconds = mod.state_seconds(state, mod.visible_lines(sample), NOW)
+        got = mod.state_duration(state, seconds)
         ok = got == want
         failures += not ok
         print(f"{'ok  ' if ok else 'FAIL'}  duration {name:36} "
@@ -434,6 +461,14 @@ def main() -> int:
         print(f"{'ok  ' if ok else 'FAIL'}  wkcolor  {name:36} "
               f"want={want:8} got={got!r}")
 
+    for name, cases, want in SORT_CASES:
+        rows = [row(target=t, state=st, since=sec) for t, st, sec in cases]
+        got = tuple(r.target for r in sorted(rows, key=mod.sort_key))
+        ok = got == want
+        failures += not ok
+        print(f"{'ok  ' if ok else 'FAIL'}  sort     {name:36} "
+              f"{'ok' if ok else f'want={want} got={got}'}")
+
     for name, weekly, want in COLLAPSE_CASES:
         line = mod.render([row(weekly=weekly)], color=False)[0]
         ok = ("wk" in line) == want
@@ -444,7 +479,7 @@ def main() -> int:
     total = (len(STATE_CASES) + len(CONTEXT_CASES) + len(AGE_CASES)
              + len(BLOCK_CASES) + len(COLOR_CASES) + len(DURATION_CASES)
              + len(MESSAGE_CASES) + len(WEEKLY_CASES)
-             + len(WEEKLY_COLOR_CASES)
+             + len(WEEKLY_COLOR_CASES) + len(SORT_CASES)
              + len(COLLAPSE_CASES))
     print(f"\n{total - failures}/{total} passed")
     return 1 if failures else 0

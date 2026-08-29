@@ -20,9 +20,14 @@ it costs you to ignore the row, not for the widget that is on screen:
 
   blocked      stopped mid-task on a dialog; the task stays frozen
   interrupted  you stopped it and it is asking what to do instead
+  done         turn finished and waiting on you; nothing is frozen
   running      working; needs nothing
   delegated    parked until the agents it spawned report back; needs nothing
-  done         turn finished; there is output to read, nothing is frozen
+
+Rows sort in that order, and inside a state the freshest clock first: the
+pane that handed its turn back a minute ago sits above the one that
+finished an hour ago, and a pane whose clock the screen does not record
+sinks to the bottom of its state. Read top-down, the list is a queue.
 
 Usage: agent-scan [scan] [--no-color]
 
@@ -66,11 +71,11 @@ STATE_COLOR = {
     "delegated": CYAN,
     "done": GREEN,
 }
-# Most-needed first. `running` and `delegated` outrank `done` so work that
-# is still moving stays near the top; none of the three wants anything from
-# you, but only `done` has stopped.
+# Most-needed first, which is what puts `done` above the two states that
+# are still moving: a finished turn is idle until you read it and say
+# something, while a running or delegated pane is asking for nothing.
 STATE_ORDER = {
-    "blocked": 0, "interrupted": 1, "running": 2, "delegated": 3, "done": 4,
+    "blocked": 0, "interrupted": 1, "done": 2, "running": 3, "delegated": 4,
 }
 
 # Context rot: the further past these a session is, the less its earlier
@@ -660,21 +665,20 @@ def parse_done(lines: list[str], now: float) -> float | None:
     return elapsed if 0 <= elapsed < 24 * 3600 else None
 
 
-def parse_elapsed(lines: list[str]) -> str | None:
+def parse_elapsed(lines: list[str]) -> float | None:
     """How long the running turn has been going, from the spinner."""
     for line in reversed(lines[-TAIL_LINES:]):
         if not SPINNER_RE.match(line):
             continue
         m = ELAPSED_RE.search(line)
         if m:
-            minutes = int(m.group(1) or 0)
-            return f"{minutes}m{m.group(2)}s" if minutes else f"{m.group(2)}s"
+            return int(m.group(1) or 0) * 60 + int(m.group(2))
         # A spinner with no parenthetical yet: the turn is ~a second old.
         return None
     return None
 
 
-def tray_elapsed(tray: list[str]) -> str:
+def tray_elapsed(tray: list[str]) -> float | None:
     """How long the wait has run: the oldest delegate still out there."""
     longest = None
     for _, stats in tray_delegates(tray):
@@ -685,27 +689,40 @@ def tray_elapsed(tray: list[str]) -> str:
         seconds = hours * 3600 + minutes * 60 + secs
         if longest is None or seconds > longest:
             longest = seconds
-    return "-" if longest is None else format_elapsed(longest)
+    return longest
 
 
-def state_duration(state: str, lines: list[str], now: float) -> str:
+def state_seconds(state: str, lines: list[str], now: float) -> float | None:
     """How long this pane has been in the state the row reports.
 
     Deliberately not a single clock: for a running pane the honest number is
     the turn's own elapsed time, for an idle one it is the time since the
     last turn finished, for a delegated one it is the oldest delegate's, and
     for a pane blocked on a dialog nothing on screen records when the dialog
-    appeared.
+    appeared. None means the screen does not say, which is not the same as
+    zero and must not be sorted as though it were.
     """
     body, tray = split_tray(lines)
     if state == "running":
-        return parse_elapsed(body) or "-"
+        return parse_elapsed(body)
     if state == "delegated":
         return tray_elapsed(tray)
     if state == "done":
-        seconds = parse_done(body, now)
-        return "-" if seconds is None else format_elapsed(seconds, floor="<1m")
-    return "-"
+        return parse_done(body, now)
+    return None
+
+
+def state_duration(state: str, seconds: float | None) -> str:
+    if seconds is None:
+        return "-"
+    if state == "running":
+        # A turn is worth watching second by second; the states measured in
+        # wall-clock time since something happened are not.
+        minutes, secs = divmod(int(seconds), 60)
+        return f"{minutes}m{secs}s" if minutes else f"{secs}s"
+    if state == "done":
+        return format_elapsed(seconds, floor="<1m")
+    return format_elapsed(seconds)
 
 
 def format_elapsed(seconds: float, floor: str | None = None) -> str:
@@ -732,11 +749,31 @@ class Row:
     agent: str
     context: str
     duration: str
+    # The duration as a number, or None when the screen does not record it.
+    # The column is what you read; this is what the list sorts on.
+    since: float | None
     block: str
     weekly: str
     age: str
     message: str
     flag: str
+
+
+def sort_key(row: Row) -> tuple[int, int, float, str]:
+    """State first, then the freshest row in that state.
+
+    Sorting the newest transition to the top is what makes the list a queue
+    rather than a directory: the session that just finished, or just put a
+    dialog up, is the one still holding a thought you were having. A row
+    whose clock the screen does not record cannot claim to be fresh, so it
+    sits below the ones that can, ahead of nothing but its own name.
+    """
+    return (
+        STATE_ORDER.get(row.state, 9),
+        row.since is None,
+        row.since if row.since is not None else 0.0,
+        row.target,
+    )
 
 
 def collect_rows() -> list[Row]:
@@ -759,12 +796,14 @@ def collect_rows() -> list[Row]:
     for pane, agent in agent_panes:
         lines = visible_lines(capture_pane(pane.pane_id))
         state = classify(lines)
+        since = state_seconds(state, lines, now)
         rows.append(Row(
             state=state,
             target=pane.target,
             agent=agent.name,
             context=parse_context(lines),
-            duration=state_duration(state, lines, now),
+            duration=state_duration(state, since),
+            since=since,
             block=parse_block(lines) or "-",
             weekly=parse_weekly(lines) or "-",
             age=parse_age(lines) or format_elapsed(now - agent.started_at),
@@ -772,7 +811,7 @@ def collect_rows() -> list[Row]:
             flag=SHARED_TREE if trees[pane.cwd] > 1 else " ",
         ))
 
-    rows.sort(key=lambda r: (STATE_ORDER.get(r.state, 9), r.target))
+    rows.sort(key=sort_key)
     return rows
 
 
