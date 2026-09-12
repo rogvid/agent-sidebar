@@ -27,11 +27,18 @@ from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
+import os
+import re
+import subprocess
 import sys
+import tempfile
 import time
+import tomllib
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parents[1] / ".local" / "bin" / "agent-scan"
+CHANNEL = (SCRIPT.parents[3] / "television" / ".config" / "television"
+           / "cable" / "agents.toml")
 AGENT_SCAN = None
 
 
@@ -455,7 +462,8 @@ SORT_CASES = (
 def row(**overrides):
     """A Row with every field filled, for exercising the renderer."""
     fields = dict(
-        state="done", target="s:1.0", agent="claude", context="10.0k",
+        state="done", project="koyr", branch="main", target="s:1.0",
+        agent="claude", context="10.0k",
         duration="5m", since=300.0, block="1h", weekly="-", age="2h",
         message="hello", flag=" ",
     )
@@ -468,6 +476,80 @@ COLLAPSE_CASES = (
     ("hidden when nothing reports it", "-", False),
     ("shown as soon as one row has it", "95%", True),
 )
+
+
+# The repository a git common dir belongs to. Hidden folders and `.git`
+# suffixes are storage, not names.
+PROJECT_CASES = (
+    ("main checkout", "/home/u/projects/koyr/.git", "koyr"),
+    ("bare repository", "/srv/git/koyr.git", "koyr"),
+    ("bare repo in a hidden folder", "/home/u/koyr/.bare", "koyr"),
+)
+
+# (project, branch) for real repositories in every shape the branch column
+# tells apart. `{sha}` is the detached worktree's HEAD, known only once the
+# repositories exist.
+IDENTITY_CASES = (
+    ("branch in the main checkout", "app", ("app", "main")),
+    ("worktree names its main repo", "app-feature-x", ("app", "feature/x")),
+    ("subfolder of a worktree", "app-feature-x/sub", ("app", "feature/x")),
+    ("detached head shows the commit", "app-detached", ("app", "@{sha}")),
+    ("branch with no commits yet", "fresh", ("fresh", "trunk")),
+    ("outside any repository", "plain", ("plain", "no git")),
+)
+
+FIT_CASES = (
+    ("short name kept", "main", "main"),
+    ("exactly the limit kept", "x" * 24, "x" * 24),
+    ("long name cut to the limit", "prototype/improve-file-parsing-for-real",
+     "prototype/improve-file-…"),
+)
+
+# television finds the pane by pulling the first `session:window.pane` out
+# of the row, so nothing to the left of the target may look like one, and a
+# message quoting another pane must not win.
+TARGET_CASES = (
+    ("plain row", dict(target="koyr:1.1"), "koyr:1.1"),
+    ("message quoting another pane",
+     dict(target="user-feedback:1.1", message="compare with koyr:9.9 first"),
+     "user-feedback:1.1"),
+    ("detached head and long names",
+     dict(project="flowform-backend", branch="@4f2e526",
+          target="gpt-core-prototype-improve-file-parsing:1.2"),
+     "gpt-core-prototype-improve-file-parsing:1.2"),
+)
+
+
+def git(cwd: Path, *args: str) -> str:
+    """Run git with an identity and none of the user's hooks or signing."""
+    return subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@t",
+         "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null",
+         *args],
+        cwd=cwd, check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+def make_repos(root: Path) -> str:
+    """Build IDENTITY_CASES' repositories under root; return the HEAD sha."""
+    app = root / "app"
+    git(root, "init", "-q", "-b", "main", str(app))
+    git(app, "commit", "-q", "--allow-empty", "--no-verify", "-m", "init")
+    git(app, "worktree", "add", "-q", "-b", "feature/x",
+        str(root / "app-feature-x"))
+    (root / "app-feature-x" / "sub").mkdir()
+    git(app, "worktree", "add", "-q", "--detach", str(root / "app-detached"))
+    git(root, "init", "-q", "-b", "trunk", str(root / "fresh"))
+    (root / "plain").mkdir()
+    return git(app, "rev-parse", "--short", "HEAD")
+
+
+def channel_target_pattern() -> re.Pattern[str]:
+    """The pattern the television channel pulls the target out with."""
+    output = tomllib.loads(CHANNEL.read_text())["source"]["output"]
+    m = re.fullmatch(r"\{strip_ansi\|regex_extract:(.*)\}", output)
+    assert m, f"unexpected output template: {output}"
+    return re.compile(m.group(1))
 
 
 def main() -> int:
@@ -554,11 +636,72 @@ def main() -> int:
         print(f"{'ok  ' if ok else 'FAIL'}  collapse {name:36} "
               f"want={'shown' if want else 'hidden':8} got={line.strip()!r}")
 
+    for name, common_dir, want in PROJECT_CASES:
+        got = mod.project_name(common_dir)
+        ok = got == want
+        failures += not ok
+        print(f"{'ok  ' if ok else 'FAIL'}  project  {name:36} "
+              f"want={want:8} got={got}")
+
+    # Run as a pre-commit hook, git hands down GIT_INDEX_FILE and friends,
+    # which would aim every git call below at this repository instead.
+    for var in [v for v in os.environ if v.startswith("GIT_")]:
+        del os.environ[var]
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        # Keeps `plain` from finding whatever repository the temp dir
+        # happens to sit inside.
+        os.environ["GIT_CEILING_DIRECTORIES"] = str(root)
+        sha = make_repos(root)
+        for name, folder, (want_project, want_branch) in IDENTITY_CASES:
+            want = (want_project, want_branch.format(sha=sha))
+            got = mod.git_identity(str(root / folder))
+            ok = got == want
+            failures += not ok
+            print(f"{'ok  ' if ok else 'FAIL'}  identity {name:36} "
+                  f"{'ok' if ok else f'want={want} got={got}'}")
+
+    for name, text, want in FIT_CASES:
+        got = mod.fit(text, mod.IDENTITY_MAX)
+        ok = got == want
+        failures += not ok
+        print(f"{'ok  ' if ok else 'FAIL'}  fit      {name:36} "
+              f"{'ok' if ok else f'want={want!r} got={got!r}'}")
+
+    line = mod.render(
+        [row(project="koyr", branch="feature/x", target="koyr:1.1")],
+        color=False,
+    )[0]
+    want_order = ["●", "koyr", "feature/x", "koyr:1.1"]
+    ok = line.split()[:4] == want_order
+    failures += not ok
+    print(f"{'ok  ' if ok else 'FAIL'}  columns  {'project, branch, target':36} "
+          f"{'ok' if ok else f'got={line!r}'}")
+
+    pattern = channel_target_pattern()
+    for name, overrides, want in TARGET_CASES:
+        colored = mod.render([row(**overrides)], color=True)[0]
+        m = pattern.search(re.sub(r"\033\[[0-9;]*m", "", colored))
+        got = m.group(0) if m else None
+        ok = got == want
+        failures += not ok
+        print(f"{'ok  ' if ok else 'FAIL'}  tv       {name:36} "
+              f"want={want} got={got}")
+
+    # Every command in the channel has to agree on which pane a row is.
+    templates = set(re.findall(r"\{strip_ansi\|[^}]*\}", CHANNEL.read_text()))
+    ok = len(templates) == 1
+    failures += not ok
+    print(f"{'ok  ' if ok else 'FAIL'}  tv       {'one target template':36} "
+          f"{'ok' if ok else f'got={sorted(templates)}'}")
+
     total = (len(STATE_CASES) + len(CONTEXT_CASES) + len(AGE_CASES)
              + len(BLOCK_CASES) + len(COLOR_CASES) + len(DURATION_CASES)
              + len(MESSAGE_CASES) + len(WEEKLY_CASES)
              + len(WEEKLY_COLOR_CASES) + len(SORT_CASES)
-             + len(COLLAPSE_CASES))
+             + len(COLLAPSE_CASES) + len(PROJECT_CASES)
+             + len(IDENTITY_CASES) + len(FIT_CASES) + 1
+             + len(TARGET_CASES) + 1)
     print(f"\n{total - failures}/{total} passed")
     return 1 if failures else 0
 

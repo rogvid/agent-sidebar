@@ -31,11 +31,17 @@ sinks to the bottom of its state. Read top-down, the list is a queue.
 
 Usage: agent-scan [scan] [--no-color]
 
-Output columns: session:window.pane, a warning flag, state, agent, context,
-how long the pane has been in its current state, the 5h usage block,
-session age, and the last thing the pane said. The target is always the
-second whitespace-separated field, which is how the television channel
-picks it up, so session names containing spaces are not supported there.
+Output columns: project, branch, session:window.pane, a warning flag,
+state, agent, context, how long the pane has been in its current state,
+the 5h usage block, session age, and the last thing the pane said.
+
+The project is the repository the pane is working in, so every worktree of
+a project reads as that project. The branch is what it has checked out:
+`@<sha>` for a detached HEAD, `no git` outside a repository. Long project
+and branch names are cut short. The target never is, because the
+television channel finds the pane by pulling the first
+`session:window.pane` out of the row, so session names containing spaces
+are not supported there.
 
 The warning flag marks a pane sharing a working directory with another
 agent pane: two agents editing one tree overwrite each other silently.
@@ -50,6 +56,7 @@ import sys
 import time
 from collections import Counter
 from dataclasses import dataclass
+from pathlib import Path
 
 import psutil
 
@@ -276,6 +283,69 @@ def list_panes() -> list[Pane]:
 
 def capture_pane(pane_id: str) -> str:
     return tmux("capture-pane", "-t", pane_id, "-p") or ""
+
+
+# --- git ---
+
+# The branch column's word for a pane outside any repository. A detached
+# HEAD reads `@<sha>` instead: commits made there belong to no branch.
+NO_GIT = "no git"
+# Project and branch are for reading, not addressing - the target is what
+# television attaches by - so a long one is cut rather than allowed to push
+# the state column off the popup.
+IDENTITY_MAX = 24
+
+
+def git(cwd: str, *args: str) -> str | None:
+    try:
+        r = subprocess.run(
+            ["git", "-C", cwd, *args], capture_output=True, text=True,
+            timeout=2, check=False,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def project_name(common_dir: str) -> str:
+    """The repository a git common dir belongs to.
+
+    Every worktree shares its main checkout's common dir, which is what
+    makes them all read as one project. `.git`, and the `.bare` of a
+    bare-repo-with-worktrees layout, are storage inside the project; a bare
+    `koyr.git` is the project itself.
+    """
+    path = Path(common_dir)
+    if path.name.startswith("."):
+        return path.parent.name
+    return path.name.removesuffix(".git")
+
+
+def git_identity(cwd: str) -> tuple[str, str]:
+    """(project, branch) for a working directory."""
+    common = git(
+        cwd, "rev-parse", "--path-format=absolute", "--git-common-dir",
+    )
+    if common is None:
+        return Path(cwd).name or cwd, NO_GIT
+    project = project_name(common)
+    # symbolic-ref rather than rev-parse: it still names the branch of a
+    # repository with no commits yet, where HEAD resolves to nothing.
+    branch = git(cwd, "symbolic-ref", "--short", "-q", "HEAD")
+    if branch:
+        return project, branch
+    sha = git(cwd, "rev-parse", "--short", "HEAD")
+    return project, f"@{sha}" if sha else "@?"
+
+
+def fit(text: str, limit: int) -> str:
+    """text, cut to limit characters with an ellipsis if it is longer."""
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def branch_color(branch: str) -> str:
+    """Grey for a branch, yellow when there is no branch to name."""
+    return YELLOW if branch == NO_GIT or branch.startswith("@") else MUTED
 
 
 # --- process tree ---
@@ -805,6 +875,8 @@ SHARED_TREE = "▲"
 @dataclass(frozen=True)
 class Row:
     state: str
+    project: str
+    branch: str
     target: str
     agent: str
     context: str
@@ -851,14 +923,19 @@ def collect_rows() -> list[Row]:
     # Two agents in one working tree overwrite each other's edits with no
     # conflict and no warning, so it is worth saying out loud.
     trees = Counter(pane.cwd for pane, _ in agent_panes)
+    # One lookup per tree rather than per pane, for the same reason.
+    identities = {cwd: git_identity(cwd) for cwd in trees}
 
     rows: list[Row] = []
     for pane, agent in agent_panes:
         lines = visible_lines(capture_pane(pane.pane_id))
         state = classify(lines)
         since = state_seconds(state, lines, now)
+        project, branch = identities[pane.cwd]
         rows.append(Row(
             state=state,
+            project=fit(project, IDENTITY_MAX),
+            branch=fit(branch, IDENTITY_MAX),
             target=pane.target,
             agent=agent.name,
             context=parse_context(lines),
@@ -883,6 +960,8 @@ def render(rows: list[Row], color: bool) -> list[str]:
         return max(len(getattr(r, field)) for r in rows)
 
     w_state = width("state")
+    w_project = width("project")
+    w_branch = width("branch")
     w_target = width("target")
     w_agent = width("agent")
     w_ctx = width("context")
@@ -902,11 +981,14 @@ def render(rows: list[Row], color: bool) -> list[str]:
     out: list[str] = []
     for r in rows:
         state_color = STATE_COLOR.get(r.state, MUTED)
-        # The target sits at field 1, right after the dot and separated from
-        # it by exactly one space: that is the contract the television
-        # channel splits on to find the pane to attach to or kill.
+        # The television channel attaches to the first `session:window.pane`
+        # on the row, so nothing left of the target may take that shape. git
+        # forbids `:` in a branch name; a project named after a folder with
+        # a colon in it is the one way to break it.
         columns = [
-            paint("●", state_color) + " " + r.target.ljust(w_target),
+            paint("●", state_color) + " " + r.project.ljust(w_project),
+            paint(r.branch.ljust(w_branch), branch_color(r.branch)),
+            paint(r.target.ljust(w_target), MUTED),
             paint(r.flag, RED),
             paint(r.state.ljust(w_state), state_color),
             paint(r.agent.ljust(w_agent), CYAN),
