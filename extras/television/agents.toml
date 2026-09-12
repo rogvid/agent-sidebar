@@ -5,15 +5,18 @@ description = "Monitor active agentic coding sessions (Claude, Codex, opencode, 
 [source]
 command = "agent-scan"
 ansi = true
-# Field 1 is `session:window.pane`, right after the state dot.
-output = "{strip_ansi|split: :1}"
+# The target is the first `session:window.pane` on the row. Project and
+# branch come before it, padded, so it is matched by shape rather than by
+# field number: git forbids `:` in branch names and tmux in session names.
+# `\x3a` is a colon, because a literal one would end the template argument.
+output = "{strip_ansi|regex_extract:[^\\s\\x3a]+\\x3a\\d+[.]\\d+}"
 watch = 1.0
 
 [preview]
 # -e keeps the pane's own SGR sequences, so the preview looks like the pane
 # instead of a grey transcript of it. It pairs with ansi = true below, which
 # is what tells television to render them rather than print them.
-command = "tmux capture-pane -t '{strip_ansi|split: :1}' -p -e -T 2>/dev/null"
+command = "tmux capture-pane -t '{strip_ansi|regex_extract:[^\\s\\x3a]+\\x3a\\d+[.]\\d+}' -p -e -T 2>/dev/null"
 ansi = true
 
 [ui]
@@ -32,10 +35,10 @@ description = "Switch to agent pane"
 # select-pane lands on the pane itself. switch-client alone only reaches the
 # session, dropping you wherever it was last focused - which in a session
 # running three agents is usually not the one you picked.
-command = "tmux switch-client -t '{strip_ansi|split: :1}' 2>/dev/null || tmux attach-session -t '{strip_ansi|split: :1}'; tmux select-pane -t '{strip_ansi|split: :1}'"
+command = "tmux switch-client -t '{strip_ansi|regex_extract:[^\\s\\x3a]+\\x3a\\d+[.]\\d+}' 2>/dev/null || tmux attach-session -t '{strip_ansi|regex_extract:[^\\s\\x3a]+\\x3a\\d+[.]\\d+}'; tmux select-pane -t '{strip_ansi|regex_extract:[^\\s\\x3a]+\\x3a\\d+[.]\\d+}'"
 mode = "execute"
 
 [actions.kill_pane]
 description = "Kill agent pane"
-command = "tmux kill-pane -t '{strip_ansi|split: :1}'"
+command = "tmux kill-pane -t '{strip_ansi|regex_extract:[^\\s\\x3a]+\\x3a\\d+[.]\\d+}'"
 mode = "fork"
