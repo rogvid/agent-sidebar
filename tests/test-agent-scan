@@ -11,7 +11,7 @@
 """Checks for agent-scan's pane-content state classifier.
 
 Every sample below is a real `tmux capture-pane` tail, trimmed to the live
-UI region: claude 2.1.247/2.1.248/2.1.250 and opencode 1.18.23 across the
+UI region: claude 2.1.247/2.1.248/2.1.250/2.1.270 and opencode 1.18.23 across the
 five states.
 They are the regression net for the patterns in agent-scan, which are the
 only thing standing between a status row and a plausible lie.
@@ -213,6 +213,31 @@ CLAUDE_WAITING_TRUST = """ Claude Code'll be able to read, edit, and execute fil
    2. No, exit
  Enter to confirm · Esc to cancel"""
 
+# An AskUserQuestion dialog with a preview pane, from koyr:1.1 on 2.1.270.
+# The preview box pushes the option list well above the bottom of the pane,
+# so only the key-hint row is left inside the dialog window.
+CLAUDE_ASKING_PREVIEW = """  How the registry gets populated changes every other decision.
+────────────────────────────────────────────────────────────
+←  ☐ Registry kind  ☐ Purity rigor  ☐ Lineage  ✔ Submit  →
+
+How should the step registry get populated?
+
+❯ 1. Promotion from real use      ┌──────────────────────────────────────────┐
+    (Recommended)                 │ workflow A: total_by_city   ─┐           │
+  2. Curated primitive library    │ workflow B: total_by_region ─┼─> 3x      │
+  3. Harvest everything           │ workflow C: total_by_dept   ─┘           │
+                                  │                              │           │
+                                  │   propose: group_aggregate(by, measure)  │
+                                  ├─── ✂ ─── 2 lines hidden ─────────────────┤
+                                  └──────────────────────────────────────────┘
+
+                                  Notes: press n to add notes
+
+────────────────────────────────────────────────────────────
+  Chat about this
+
+Enter to select · ↑/↓ to navigate · n to add notes · Tab to switch questions · Esc to cancel"""
+
 # opencode's footer keeps going past the interrupt hint, and says
 # `esc interrupt` rather than claude's `esc to interrupt`.
 OPENCODE_RUNNING = """  ┃  Build · GLM-4.5-Flash Z.AI
@@ -233,6 +258,12 @@ OPENCODE_WAITING = """  ┃  △ Permission required
 # A pane displaying someone else's dialog, with its own input bar below it.
 QUOTED_CLAUDE_DIALOG = CLAUDE_WAITING_EDIT + "\n" + CLAUDE_IDLE
 QUOTED_OPENCODE_DIALOG = OPENCODE_WAITING + "\n" + CLAUDE_IDLE
+QUOTED_ASK_DIALOG = CLAUDE_ASKING_PREVIEW + "\n" + CLAUDE_IDLE
+# A key-hint row quoted right above the input box, inside the dialog window.
+QUOTED_KEY_HINTS = CLAUDE_IDLE.replace(
+    "✻ Worked for 15s · done 7:58 PM",
+    "Enter to select · ↑/↓ to navigate · Esc to cancel",
+)
 # Tool output quoting a spinner: indented, unlike the real thing.
 QUOTED_SPINNER = """  ⎿  --- t+ 0.12s  state=running
        ✢ Sublimating… (1s · thinking)
@@ -267,11 +298,14 @@ STATE_CASES = (
     ("delegates reported back", CLAUDE_DELEGATED_RESUMED, "done"),
     ("claude blocked (edit dialog)", CLAUDE_WAITING_EDIT, "blocked"),
     ("claude blocked (trust dialog)", CLAUDE_WAITING_TRUST, "blocked"),
+    ("claude blocked (question w/ preview)", CLAUDE_ASKING_PREVIEW, "blocked"),
     ("opencode done", OPENCODE_IDLE, "done"),
     ("opencode running", OPENCODE_RUNNING, "running"),
     ("opencode blocked", OPENCODE_WAITING, "blocked"),
     ("done pane quoting claude dialog", QUOTED_CLAUDE_DIALOG, "done"),
     ("done pane quoting opencode dialog", QUOTED_OPENCODE_DIALOG, "done"),
+    ("done pane quoting a question", QUOTED_ASK_DIALOG, "done"),
+    ("done pane quoting key hints", QUOTED_KEY_HINTS, "done"),
     ("done pane quoting a spinner", QUOTED_SPINNER, "done"),
     ("user typed '1. do this'", TYPED_NUMBERED_LINE, "done"),
 )
@@ -368,6 +402,10 @@ MESSAGE_CASES = (
      CLAUDE_IDLE_ELLIPSIS_BULLET, "Running 1 shell command…"),
     ("blocked shows the question", "blocked", CLAUDE_WAITING_EDIT,
      "Do you want to make this edit to file.txt?"),
+    # The key-hint row is closest to the bottom, but the question is what
+    # you have to answer.
+    ("blocked shows claude's question", "blocked", CLAUDE_ASKING_PREVIEW,
+     "How should the step registry get populated?"),
     ("blocked shows opencode's action", "blocked", OPENCODE_WAITING,
      "Edit note.txt"),
     ("delegated shows what the delegate is doing", "delegated",

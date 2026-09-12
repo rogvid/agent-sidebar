@@ -133,6 +133,11 @@ ASK_RE = re.compile(
     r"Do you want|Would you like|Enter to confirm|Esc to cancel",
     re.IGNORECASE,
 )
+# The key-hint row claude closes every dialog with: `Esc to cancel · Tab to
+# amend`, `Enter to select · ↑/↓ to navigate · … · Esc to cancel`. It is
+# the one marker that stays at the bottom however tall the dialog grows -
+# a question's preview pane pushes its option list out of DIALOG_LINES.
+HINT_RE = re.compile(r"^\s{0,2}(?:[^·\s][^·]*·\s+)*Esc to cancel\b")
 # opencode's approval dialog: a `△ Permission required` header and a button
 # row `┃   Allow once   Allow always   Reject`.
 BUTTONS_RE = re.compile(r"Allow once\s{2,}Allow always\s{2,}Reject")
@@ -384,6 +389,7 @@ def waiting_dialog(dialog: list[str]) -> bool:
     last_marker = -1
     for i, line in enumerate(dialog):
         if ((CHOICE_RE.match(line) and corroborated)
+                or HINT_RE.match(line)
                 or BUTTONS_RE.search(line)
                 or PERMISSION_RE.match(line)
                 or YESNO_RE.search(line)):
@@ -501,11 +507,36 @@ def running_message(region: list[str]) -> str:
     return spinner or "-"
 
 
+def claude_question(lines: list[str]) -> str | None:
+    """The question above a live claude option list, if it asks one.
+
+    Only read when claude's key-hint row closes the pane, so a dialog quoted
+    further up the transcript cannot answer for an opencode dialog below.
+    The walk stops at a rule: above it is the transcript, not the dialog.
+    """
+    if not lines or not HINT_RE.match(lines[-1]):
+        return None
+    choices = [i for i, line in enumerate(lines) if CHOICE_RE.match(line)]
+    if not choices:
+        return None
+    for line in reversed(lines[:choices[-1]]):
+        if BORDER_RE.match(line):
+            break
+        if line.rstrip().endswith("?"):
+            return clean(line)
+    return None
+
+
 def dialog_message(lines: list[str]) -> str:
     """What the dialog is asking for."""
+    question = claude_question(lines)
+    if question:
+        return question
     dialog = lines[-DIALOG_LINES:]
+    # The hint row matches ASK_RE too, but it is the last resort: it says
+    # which keys to press, not what the keys decide.
     for line in dialog:
-        if ASK_RE.search(line):
+        if ASK_RE.search(line) and not HINT_RE.match(line):
             return clean(line)
     for line in dialog:
         m = ARROW_RE.match(line)
@@ -513,6 +544,9 @@ def dialog_message(lines: list[str]) -> str:
             return clean(m.group(1))
     for line in dialog:
         if PERMISSION_RE.match(line) or YESNO_RE.search(line):
+            return clean(line)
+    for line in dialog:
+        if HINT_RE.match(line):
             return clean(line)
     return "-"
 
