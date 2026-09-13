@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# Claude Code WorktreeCreate hook: put `claude --worktree <name>` worktrees
+# where git-wt-add puts them, bootstrapped the same way.
+#
+# Contract (https://code.claude.com/docs/en/hooks#worktreecreate):
+#   - JSON on stdin with "name" (the worktree slug) and "cwd".
+#   - The last non-empty stdout line is the worktree path, so everything
+#     else goes to stderr.
+#   - Any non-zero exit aborts the worktree creation.
+#   - The hook replaces Claude Code's own creation entirely, .worktreeinclude
+#     copying included - hence the bootstrap.
+#
+# The hook is global and also fires for subagent and background-session
+# worktrees in any repo, so a repo outside a projects/ folder still gets a
+# worktree: at Claude Code's own default place and branch name.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=git-wt-common.sh
+source "${SCRIPT_DIR}/git-wt-common.sh"
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  cat <<EOF
+Usage: claude-worktree-create < hook-input.json
+
+Claude Code WorktreeCreate hook. Reads the hook JSON on stdin, creates the
+worktree with git-wt-add (or at .claude/worktrees/<name> outside a projects/
+folder), bootstraps it, and prints its path on stdout.
+
+Register it in ~/.claude/settings.json:
+  "hooks": { "WorktreeCreate": [ { "hooks": [
+    { "type": "command", "command": "claude-worktree-create" } ] } ] }
+EOF
+  exit 0
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+  error "jq is required to read the hook input"
+  exit 1
+fi
+
+INPUT="$(cat)"
+NAME="$(jq -r '.name // empty' <<<"${INPUT}")"
+CWD="$(jq -r '.cwd // empty' <<<"${INPUT}")"
+
+if [[ -z "${NAME}" ]]; then
+  error "Hook input has no worktree name"
+  exit 1
+fi
+
+if ! COMMON_DIR="$(git -C "${CWD:-.}" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"; then
+  error "Not in a git repository: ${CWD:-${PWD}}"
+  exit 1
+fi
+# Worktrees hang off the main checkout, even when Claude runs in another one.
+MAIN="$(dirname "${COMMON_DIR}")"
+cd "${MAIN}"
+
+{
+  if [[ "$(basename "$(dirname "${MAIN}")")" == "projects" ]]; then
+    WORKTREE_PATH="$(get_worktrees_root)/$(format_worktree_name "$(basename "${MAIN}")" "${NAME}")"
+    "${SCRIPT_DIR}/git-wt-add" "${NAME}"
+  else
+    WORKTREE_PATH="${MAIN}/.claude/worktrees/${NAME}"
+    if ! worktree_exists "${WORKTREE_PATH}"; then
+      BRANCH="worktree-${NAME}"
+      if git rev-parse --verify --quiet "refs/heads/${BRANCH}" >/dev/null; then
+        git worktree add "${WORKTREE_PATH}" "${BRANCH}"
+      else
+        git worktree add "${WORKTREE_PATH}" -b "${BRANCH}"
+      fi
+      if ! "${SCRIPT_DIR}/git-wt-bootstrap" "${WORKTREE_PATH}"; then
+        warning "Bootstrap failed. Re-run it with: git-wt-bootstrap ${WORKTREE_PATH}"
+      fi
+    fi
+  fi
+} >&2
+
+if [[ ! -d "${WORKTREE_PATH}" ]]; then
+  error "Worktree was not created: ${WORKTREE_PATH}"
+  exit 1
+fi
+
+printf '%s\n' "${WORKTREE_PATH}"
