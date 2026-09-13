@@ -387,7 +387,7 @@ class Merges:
             # Every commit's change is already there: rebased, cherry-picked,
             # or a one-commit squash, which git cannot tell apart.
             if marks and all(mark == "-" for mark in marks):
-                return f"its commits are in {target}"
+                return f"merged into {target}, rebased or squashed"
             merged_tree = run(
                 ["git", "merge-tree", "--write-tree", target, ref],
                 cwd=repo.main, check=False,
@@ -395,10 +395,10 @@ class Merges:
             target_tree = repo.git("rev-parse", f"{target}^{{tree}}").strip()
             lines = merged_tree.stdout.split()
             if merged_tree.returncode == 0 and lines and lines[0] == target_tree:
-                return f"its changes are in {target}"
+                return f"merged into {target}, squashed"
         for pull_request in self.pull_requests().get(branch, []):
             if pull_request.get("headRefOid") == tip:
-                return f"pull request #{pull_request.get('number')} merged"
+                return f"merged by pull request #{pull_request.get('number')}"
         return None
 
     def _had_own_commits(self, ref: str) -> bool:
@@ -995,7 +995,7 @@ def cmd_remove(args: argparse.Namespace) -> int:
         say(f"  Name:   {worktree.name}")
         say(f"  Branch: {worktree.label}")
         say(f"  Path:   {worktree.path}")
-        say(f"  Status: {green('merged, ' + reason) if reason else yellow('not merged')}")
+        say(f"  Status: {green(reason) if reason else yellow('not merged')}")
         if work.unpushed and not reason:
             say(f"  Unpushed commits: {work.unpushed} (they stay on the branch)")
         if work.unreachable:
