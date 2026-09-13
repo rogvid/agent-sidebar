@@ -326,10 +326,11 @@ remove_worktree() {
         return 0
     fi
     popup "${main}" "$0" _worktree-remove "${top}"
-    # git-wt-remove asks before it removes anything. Only once the worktree
-    # is really gone does the agent that was working in it go too.
+    # git-wt-remove asks first, refuses to throw away uncommitted work, and
+    # closes the worktree's own session. Only once the worktree is really
+    # gone does the agent go too, if it lived in some other session.
     if [[ ! -d "${top}" ]]; then
-        tmux kill-pane -t "${pane}"
+        tmux kill-pane -t "${pane}" 2>/dev/null || true
     fi
 }
 
