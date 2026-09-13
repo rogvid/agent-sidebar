@@ -28,13 +28,44 @@ trap cleanup EXIT
 grep -F 'agent-sidebar-tmux' "${repo}/tmux/.tmux.conf" >"${scratch}/tmux.conf"
 # Without it a typed M-2 waits half a second to be told apart from Escape.
 echo 'set -g escape-time 0' >>"${scratch}/tmux.conf"
+# Panes here only run stand-ins; a login shell's rc files would only slow
+# them down.
+echo 'set -g default-shell /bin/sh' >>"${scratch}/tmux.conf"
+
+# The tools the actions drive, as stand-ins that record what they were
+# asked to do.
+mkdir -p "${scratch}/bin"
+cat >"${scratch}/bin/git-wt-add" <<'EOF'
+#!/bin/sh
+set -e
+git worktree add -q -b "$1" "$(dirname "$PWD")/app-$(echo "$1" | tr / -)"
+EOF
+cat >"${scratch}/bin/git-wt-remove" <<'EOF'
+#!/bin/sh
+[ "$1" = -d ] && shift
+git worktree remove --force "$1"
+EOF
+cat >"${scratch}/bin/tuicr" <<'EOF'
+#!/bin/sh
+echo "1. f.txt:~2 - rename B to b"
+EOF
+chmod +x "${scratch}/bin/"*
+
+# A pre-commit hook hands down GIT_INDEX_FILE and friends, which would aim
+# the git calls below at this repository.
+while IFS= read -r var; do unset "${var}"; done < <(env | awk -F= '/^GIT_/ { print $1 }')
+project="${scratch}/projects/app"
+git init -q -b main "${project}"
+git -C "${project}" -c user.name=t -c user.email=t@t -c commit.gpgsign=false \
+    commit -q --allow-empty --no-verify -m init
 
 t() { tmux -L "${socket}" "$@"; }
 
 # The test server's jobs - the hooks - inherit this environment. The sidebar
 # itself is a stand-in: this checks where the pane goes, not what it draws.
-export PATH="${repo}/scripts/.local/bin:${PATH}"
+export PATH="${scratch}/bin:${repo}/scripts/.local/bin:${PATH}"
 export AGENT_SIDEBAR_COMMAND="sleep 3600"
+export AGENT_SIDEBAR_AGENT="touch agent-started"
 unset TMUX TMUX_PANE
 
 t -f "${scratch}/tmux.conf" new-session -d -s main -x 160 -y 45 -n one
@@ -161,6 +192,40 @@ printf 'window\tmain\t1\t:one\t1\t:*\tlayout\t:\n' >>"${scratch}/save"
 agent-sidebar-tmux prune-resurrect "${scratch}/save"
 pruned() { [[ "$(cut -f1,7 "${scratch}/save" | tr '\t\n' ' ;')" == "pane zsh;window layout;" ]]; }
 check "resurrect saves leave the sidebar out" pruned
+
+# The actions, run the way the sidebar runs them: from inside the server.
+act() {
+    TMUX="$(t display-message -p '#{socket_path},#{pid},0')" agent-sidebar-tmux "$@"
+}
+exists() { [[ -e "$1" ]]; }
+pane_alive() { t display-message -p -t "$1" '#{pane_id}' | grep -qxF "$1"; }
+client_session() { t list-clients -F '#{client_pid} #{session_name}' | sort -n | head -1 | cut -d' ' -f2; }
+
+agent="$(t new-window -t main: -n agent -c "${project}" -P -F '#{pane_id}' \
+    "cat >${scratch}/pasted")"
+worktree="${scratch}/projects/app-feat-x"
+act new-worktree "${agent}" feat/x
+check "new-worktree makes the worktree from the main checkout" exists "${worktree}"
+check "gives it a session named after its folder" equals \
+    "t display-message -p -t =app-feat-x: #{pane_current_path}" "${worktree}"
+check "starts the agent in it" exists "${worktree}/agent-started"
+check "and takes you there" equals client_session app-feat-x
+
+act review "${agent}"
+check "review pastes tuicr's export into the agent" grep -qF 'rename B to b' \
+    "${scratch}/pasted"
+check "and takes you to it" equals client_session main
+
+main_agent="$(t new-window -t main: -c "${project}" -P -F '#{pane_id}' 'sleep 3600')"
+act remove-worktree "${main_agent}"
+check "remove-worktree leaves a main checkout alone" pane_alive "${main_agent}"
+wt_agent="$(t new-window -t main: -c "${worktree}" -P -F '#{pane_id}' 'sleep 3600')"
+act remove-worktree "${wt_agent}"
+check "remove-worktree removes the agent's worktree" not exists "${worktree}"
+check "then the agent's pane" not pane_alive "${wt_agent}"
+
+act kill "${main_agent}"
+check "kill kills the pane" not pane_alive "${main_agent}"
 
 printf '\n%s/%s passed\n' "$((total - failures))" "${total}"
 ((failures == 0))

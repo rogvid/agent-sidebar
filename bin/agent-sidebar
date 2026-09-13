@@ -18,10 +18,14 @@ Projects keep agent-scan's queue order: the project holding the agent that
 most needs you comes first, and inside a project the agents keep their
 order too. Read top-down, it is still a queue.
 
-A bar in the gutter marks the agents in the window you are looking at.
+A bar in the gutter marks the agents in the window you are looking at. On
+an agent's second line, `#12` is its branch's pull request, coloured by
+state, and a context size appears once the session is far enough along
+that its early turns are fading.
 
-Keys: up/down or j/k move, enter jumps to the agent, esc goes back to the
-pane you came from, r rescans now, q closes the sidebar.
+Actions work on the highlighted agent, mostly in a tmux popup over the
+current window: `?` lists them and ctrl+p searches them. When an agent in
+another window stops and needs you, tmux says so on the status line.
 """
 
 from __future__ import annotations
@@ -30,21 +34,30 @@ import asyncio
 import json
 import os
 import subprocess
+import time
 from collections import Counter
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
+from dataclasses import dataclass
 from typing import Any
 
 from rich.console import Group
 from rich.table import Table
 from rich.text import Text
-from textual.app import App, ComposeResult
+from textual.app import App, ComposeResult, SystemCommand
 from textual.binding import Binding
-from textual.widgets import OptionList, Static
+from textual.containers import Vertical
+from textual.screen import ModalScreen, Screen
+from textual.widgets import Input, OptionList, Static
 from textual.widgets.option_list import Option
 
 Row = dict[str, Any]
+# Branch name -> {"number", "state", "draft"} for one repository.
+PullRequests = dict[str, dict[str, Any]]
 
 SCAN_INTERVAL = 1.0
+# Pull requests change over minutes, and each look is a round trip to
+# GitHub per project.
+PR_INTERVAL = 120.0
 
 # agent-scan's colours, as terminal palette names so the sidebar reads in
 # the same theme as the panes beside it.
@@ -56,10 +69,49 @@ STATE_COLOR = {
     "delegated": "cyan",
 }
 STATE_ORDER = ("blocked", "interrupted", "done", "running", "delegated")
+# A pane moving from working to one of these has stopped and is waiting on
+# you, which is the moment worth interrupting you for.
+BUSY = frozenset({"running", "delegated"})
+ATTENTION = frozenset({"blocked", "interrupted", "done"})
+PR_COLOR = {"OPEN": "green", "MERGED": "magenta", "CLOSED": "red"}
+CONTEXT_COLOR = {"warn": "yellow", "rot": "red"}
 MUTED = "color(245)"
 HERE = "▌"
 
 PROJECT_PREFIX = "project:"
+GLUE = "agent-sidebar-tmux"
+
+
+@dataclass(frozen=True)
+class Action:
+    """One thing the sidebar does: its key, help line and palette entry."""
+
+    name: str
+    key: str
+    label: str
+    title: str
+    help: str
+
+
+ACTIONS = (
+    Action("jump", "enter", "⏎", "Jump", "Go to the agent's pane"),
+    Action("new_worktree", "n", "n", "New worktree",
+           "Branch the project into a worktree with its own session and agent"),
+    Action("open", "o", "o", "Open project",
+           "Pick a project or session to open"),
+    Action("review", "d", "d", "Review changes",
+           "Review uncommitted changes in tuicr; y pastes comments to the agent"),
+    Action("git", "g", "g", "Git", "lazygit in the agent's directory"),
+    Action("pr", "p", "p", "Pull request",
+           "Show the branch's pull request, or create one"),
+    Action("kill", "x", "x", "Kill agent", "Kill the agent's pane"),
+    Action("remove_worktree", "X", "X", "Remove worktree",
+           "Remove the agent's worktree, then its pane"),
+    Action("rescan", "r", "r", "Rescan", "Scan again now"),
+    Action("back", "escape", "esc", "Back", "Return to the pane you came from"),
+    Action("close", "q", "q", "Close sidebar", "Close the sidebar until M-2"),
+    Action("help", "question_mark", "?", "Help", "Show the keys"),
+)
 
 
 def group_by_project(rows: list[Row]) -> list[tuple[str, list[Row]]]:
@@ -79,7 +131,24 @@ def grid() -> Table:
     return table
 
 
-def agent_prompt(row: Row, here: bool) -> Group:
+def badges(row: Row, pr: dict[str, Any] | None) -> Text:
+    """The pull request and, once it matters, the context size."""
+    text = Text()
+    if pr is not None:
+        draft = pr.get("draft") and pr["state"] == "OPEN"
+        color = MUTED if draft else PR_COLOR.get(pr["state"], MUTED)
+        text.append(f"#{pr['number']}", style=color)
+    level = row.get("context_level")
+    if level in CONTEXT_COLOR:
+        if text:
+            text.append(" ")
+        text.append(row["context"], style=CONTEXT_COLOR[level])
+    return text
+
+
+def agent_prompt(
+    row: Row, here: bool, pr: dict[str, Any] | None = None,
+) -> Group:
     """Two lines: where the agent is and for how long, then what it said."""
     color = STATE_COLOR.get(row["state"], "default")
     gutter = Text(HERE if here else " ", style="bold")
@@ -101,11 +170,12 @@ def agent_prompt(row: Row, here: bool) -> Group:
     )
 
     bottom = grid()
+    extra = badges(row, pr)
     bottom.add_row(
         gutter,
         Text(""),
         Text.assemble((row["state"], color), (message, MUTED)),
-        Text(""),
+        Text.assemble(" ", extra) if extra else Text(""),
     )
     return Group(top, bottom)
 
@@ -134,6 +204,16 @@ def summary(rows: list[Row]) -> Text:
                 parts.append(" ")
             parts.append((f"● {counts[state]}", STATE_COLOR[state]))
     return Text.assemble(*parts)
+
+
+def announcement(row: Row) -> str:
+    """The status line message for an agent that stopped and needs you."""
+    message = "" if row["message"] == "-" else f": {row['message']}"
+    # display-message expands formats, and a message quoting `#12` or `#{`
+    # would otherwise be read as one.
+    return f"{row['project']}/{row['branch']} {row['state']}{message}".replace(
+        "#", "##"
+    )
 
 
 async def tmux(*args: str) -> str | None:
@@ -173,11 +253,115 @@ async def panes_here() -> set[str]:
     return set(out.split()) if out else set()
 
 
+async def pull_requests(cwd: str) -> PullRequests | None:
+    """The newest pull request per branch of cwd's repository, or None
+    when gh cannot say (not on GitHub, offline, not logged in)."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "gh", "pr", "list", "--state", "all", "--limit", "100",
+            "--json", "headRefName,number,state,isDraft",
+            cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        return None
+    out, _ = await proc.communicate()
+    if proc.returncode != 0:
+        return None
+    try:
+        listed = json.loads(out)
+    except json.JSONDecodeError:
+        return None
+    prs: PullRequests = {}
+    # gh lists the newest first, and a branch reused for a second PR should
+    # show that one.
+    for pr in listed:
+        prs.setdefault(pr["headRefName"], {
+            "number": pr["number"],
+            "state": pr["state"],
+            "draft": pr.get("isDraft", False),
+        })
+    return prs
+
+
 async def run(*command: str) -> None:
     proc = await asyncio.create_subprocess_exec(
         *command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     await proc.wait()
+
+
+class BranchPrompt(ModalScreen[str | None]):
+    BINDINGS = [Binding("escape", "cancel", "cancel")]
+
+    def __init__(self, project: str) -> None:
+        super().__init__()
+        self.project = project
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="dialog"):
+            yield Static(Text.assemble(
+                "New worktree of ", (self.project, "bold"),
+            ))
+            yield Input(placeholder="feat/branch-name")
+            yield Static("⏎ create  esc cancel", classes="hint")
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value.strip() or None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class Confirm(ModalScreen[bool]):
+    BINDINGS = [
+        Binding("y", "answer(True)", "yes"),
+        Binding("n,escape", "answer(False)", "no"),
+    ]
+
+    def __init__(self, question: Text) -> None:
+        super().__init__()
+        self.question = question
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="dialog"):
+            yield Static(self.question)
+            yield Static("y yes  n no", classes="hint")
+
+    def action_answer(self, yes: bool) -> None:
+        self.dismiss(yes)
+
+
+class Help(ModalScreen[None]):
+    BINDINGS = [Binding("escape,question_mark,q", "dismiss", "close")]
+
+    def compose(self) -> ComposeResult:
+        keys = Table.grid(padding=(0, 2))
+        keys.add_column(no_wrap=True, style="bold")
+        keys.add_column(no_wrap=True)
+        keys.add_row("j/k", "Move")
+        for action in ACTIONS:
+            keys.add_row(action.label, action.title)
+        keys.add_row("^p", "Search commands")
+
+        legend = Text.assemble(
+            ("#12", "bold"), "  pull request\n     ",
+            ("open", PR_COLOR["OPEN"]), " ", ("draft", MUTED), " ",
+            ("merged", PR_COLOR["MERGED"]), " ",
+            ("closed", PR_COLOR["CLOSED"]), "\n",
+            ("240k", "bold"), " context past\n     ",
+            ("100k", CONTEXT_COLOR["warn"]), " ",
+            ("400k", CONTEXT_COLOR["rot"]), " tokens\n",
+            ("▌", "bold"), "    in this window\n",
+            ("!", "bold red"), "    shares a working tree",
+        )
+        with Vertical(classes="dialog"):
+            yield Static(Text("Keys", style="bold"))
+            yield Static(keys)
+            yield Static(legend, classes="legend")
+            yield Static("esc close", classes="hint")
+
+    async def action_dismiss(self, result: None = None) -> None:
+        self.dismiss(result)
 
 
 class AgentSidebar(App[None]):
@@ -230,14 +414,35 @@ class AgentSidebar(App[None]):
         padding: 0 1;
         color: ansi_bright_black;
     }
+    ModalScreen {
+        background: ansi_default;
+        align: left top;
+    }
+    .dialog {
+        height: auto;
+        padding: 0 1;
+    }
+    .dialog > Static {
+        margin-bottom: 1;
+    }
+    .dialog > .hint {
+        color: ansi_bright_black;
+    }
+    Input {
+        margin-bottom: 1;
+        background: ansi_default;
+        border: tall ansi_bright_black;
+        &:focus {
+            border: tall ansi_blue;
+            background-tint: transparent;
+        }
+    }
     """
 
     BINDINGS = [
         Binding("j", "cursor('down')", "down", show=False),
         Binding("k", "cursor('up')", "up", show=False),
-        Binding("escape", "back", "back"),
-        Binding("r", "rescan", "rescan"),
-        Binding("q", "close", "close"),
+        *(Binding(a.key, a.name, a.title, show=False) for a in ACTIONS),
     ]
 
     def __init__(
@@ -245,20 +450,37 @@ class AgentSidebar(App[None]):
         scan: Callable[[], Awaitable[list[Row] | None]] = scan,
         panes_here: Callable[[], Awaitable[set[str]]] = panes_here,
         run: Callable[..., Awaitable[None]] = run,
+        pull_requests: Callable[[str], Awaitable[PullRequests | None]] = (
+            pull_requests
+        ),
     ) -> None:
         super().__init__(ansi_color=True)
         self._scan = scan
         self._panes_here = panes_here
         self._run = run
+        self._pull_requests = pull_requests
         self._wake = asyncio.Event()
-        self._shown: tuple[str, frozenset[str]] | None = None
+        self._shown: str | None = None
         self._rows: list[Row] = []
+        self._here: set[str] = set()
+        self._by_pane: dict[str, Row] = {}
+        self._states: dict[str, str] | None = None
+        self._prs: dict[str, PullRequests] = {}
+        self._prs_checked: dict[str, float] = {}
 
     def get_css_variables(self) -> dict[str, str]:
         # catppuccin mocha's surface0, the theme the terminal and tmux use.
         # No palette colour is that quiet: bright black under a muted
         # message leaves it unreadable.
         return super().get_css_variables() | {"cursor": "#313244"}
+
+    def get_system_commands(self, screen: Screen) -> Iterable[SystemCommand]:
+        for action in ACTIONS:
+            if action.name != "help":
+                yield SystemCommand(
+                    f"{action.title} ({action.label})", action.help,
+                    getattr(self, f"action_{action.name}"),
+                )
 
     def compose(self) -> ComposeResult:
         yield Static(id="header")
@@ -289,9 +511,39 @@ class AgentSidebar(App[None]):
             # scan is worse than one that is a second old.
             self.show_header(self._rows, ok=False)
             return
-        self._rows = rows
+        self._rows, self._here = rows, here
         self.show_header(rows, ok=True)
-        self.show_rows(rows, here)
+        self.announce(rows, here)
+        self.refresh_pull_requests(rows)
+        self.show_rows()
+
+    def announce(self, rows: list[Row], here: set[str]) -> None:
+        """Say on the status line when an agent elsewhere stops for you."""
+        states = {row["pane_id"]: row["state"] for row in rows}
+        previous, self._states = self._states, states
+        # The first scan has no before; everything in it would announce.
+        if previous is None:
+            return
+        for row in rows:
+            if (previous.get(row["pane_id"]) in BUSY
+                    and row["state"] in ATTENTION
+                    and row["pane_id"] not in here):
+                self.run_worker(self._run(
+                    "tmux", "display-message", "-d", "5000", announcement(row),
+                ))
+
+    def refresh_pull_requests(self, rows: list[Row]) -> None:
+        now = time.monotonic()
+        for project, group in group_by_project(rows):
+            if now - self._prs_checked.get(project, -PR_INTERVAL) < PR_INTERVAL:
+                continue
+            self._prs_checked[project] = now
+            self.run_worker(self.fetch_pull_requests(project, group[0]["cwd"]))
+
+    async def fetch_pull_requests(self, project: str, cwd: str) -> None:
+        # A project gh cannot see simply shows no pull requests.
+        self._prs[project] = await self._pull_requests(cwd) or {}
+        self.show_rows()
 
     def show_header(self, rows: list[Row], ok: bool) -> None:
         title = Table.grid(expand=True)
@@ -299,17 +551,22 @@ class AgentSidebar(App[None]):
         title.add_column(justify="right", no_wrap=True)
         title.add_row(Text("Agents", style="bold"), summary(rows))
         self.query_one("#header", Static).update(title)
-        hints = "⏎ jump  esc back  q close"
+        hints = "⏎ jump  ? help  q close"
         self.query_one("#footer", Static).update(
             hints if ok else Text("scan failed, retrying", style="yellow")
         )
 
-    def show_rows(self, rows: list[Row], here: set[str]) -> None:
-        key = (json.dumps(rows, sort_keys=True), frozenset(here))
+    def pull_request(self, row: Row) -> dict[str, Any] | None:
+        return self._prs.get(row["project"], {}).get(row["branch"])
+
+    def show_rows(self) -> None:
+        rows, here = self._rows, self._here
+        key = json.dumps([rows, sorted(here), self._prs], sort_keys=True)
         if key == self._shown:
             return
         first = self._shown is None
         self._shown = key
+        self._by_pane = {row["pane_id"]: row for row in rows}
 
         agents = self.query_one("#agents", OptionList)
         agents.display = bool(rows)
@@ -326,7 +583,8 @@ class AgentSidebar(App[None]):
                 disabled=True,
             ))
             options.extend(
-                Option(agent_prompt(row, row["pane_id"] in here),
+                Option(agent_prompt(row, row["pane_id"] in here,
+                                    self.pull_request(row)),
                        id=row["pane_id"])
                 for row in group
             )
@@ -341,14 +599,73 @@ class AgentSidebar(App[None]):
         if target is not None:
             agents.highlighted = agents.get_option_index(target)
 
+    def selected(self) -> Row | None:
+        option = self.query_one("#agents", OptionList).highlighted_option
+        if option is None or option.id is None:
+            return None
+        return self._by_pane.get(option.id)
+
+    def on_agent(self, act: Callable[[Row], None]) -> None:
+        row = self.selected()
+        if row is None:
+            self.bell()
+            return
+        act(row)
+
+    def glue(self, *args: str) -> None:
+        # In a worker: most actions hold a popup open for as long as you use
+        # it, and the list keeps scanning meanwhile.
+        self.run_worker(self._run(GLUE, *args))
+
     def on_option_list_option_selected(
         self, event: OptionList.OptionSelected,
     ) -> None:
-        pane = event.option.id
-        if pane and not pane.startswith(PROJECT_PREFIX):
-            # switch-client to a pane lands on its session, window and the
-            # pane itself; the sidebar follows through tmux's hooks.
-            self.run_worker(self._run("tmux", "switch-client", "-t", pane))
+        self.action_jump()
+
+    def action_jump(self) -> None:
+        # switch-client to a pane lands on its session, window and the pane
+        # itself; the sidebar follows through tmux's hooks.
+        self.on_agent(lambda row: self.run_worker(
+            self._run("tmux", "switch-client", "-t", row["pane_id"])
+        ))
+
+    def action_new_worktree(self) -> None:
+        def ask(row: Row) -> None:
+            def create(branch: str | None) -> None:
+                if branch:
+                    self.glue("new-worktree", row["pane_id"], branch)
+            self.push_screen(BranchPrompt(row["project"]), create)
+        self.on_agent(ask)
+
+    def action_open(self) -> None:
+        self.glue("open")
+
+    def action_review(self) -> None:
+        self.on_agent(lambda row: self.glue("review", row["pane_id"]))
+
+    def action_git(self) -> None:
+        self.on_agent(lambda row: self.glue("git", row["pane_id"]))
+
+    def action_pr(self) -> None:
+        self.on_agent(lambda row: self.glue("pr", row["pane_id"]))
+
+    def action_kill(self) -> None:
+        def ask(row: Row) -> None:
+            def kill(yes: bool | None) -> None:
+                if yes:
+                    self.glue("kill", row["pane_id"])
+            question = Text.assemble(
+                "Kill ", (row["agent"], "bold"), " in ",
+                (f"{row['project']}/{row['branch']}", "bold"), "?",
+            )
+            self.push_screen(Confirm(question), kill)
+        self.on_agent(ask)
+
+    def action_remove_worktree(self) -> None:
+        self.on_agent(lambda row: self.glue("remove-worktree", row["pane_id"]))
+
+    def action_help(self) -> None:
+        self.push_screen(Help())
 
     def action_cursor(self, direction: str) -> None:
         agents = self.query_one("#agents", OptionList)
@@ -369,7 +686,7 @@ class AgentSidebar(App[None]):
         )
 
     async def action_close(self) -> None:
-        await self._run("agent-sidebar-tmux", "close")
+        await self._run(GLUE, "close")
 
 
 if __name__ == "__main__":

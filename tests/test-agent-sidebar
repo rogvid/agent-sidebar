@@ -47,9 +47,9 @@ def row(project: str, pane_id: str, state: str = "done", **overrides):
     """An agent-scan --json row with every field filled."""
     return dict(
         state=state, project=project, branch="main", target="s:1.0",
-        pane_id=pane_id, agent="claude", context="10.0k", duration="5m",
-        since=300.0, block="1h", weekly="-", age="2h", message="hello",
-        flag=" ",
+        pane_id=pane_id, cwd=f"/src/{project}", agent="claude",
+        context="10.0k", context_level="ok", duration="5m", since=300.0,
+        block="1h", weekly="-", age="2h", message="hello", flag=" ",
     ) | overrides
 
 
@@ -76,6 +76,8 @@ class Fake:
         self.rows = rows
         self.here = here
         self.ran: list[tuple[str, ...]] = []
+        self.prs = {}
+        self.pr_lookups: list[str] = []
 
     async def scan(self):
         return self.rows
@@ -86,9 +88,13 @@ class Fake:
     async def run(self, *command):
         self.ran.append(command)
 
+    async def pull_requests(self, cwd):
+        self.pr_lookups.append(cwd)
+        return self.prs
+
 
 async def app_cases(mod) -> list[tuple[str, bool, str]]:
-    from textual.widgets import OptionList, Static
+    from textual.widgets import Input, OptionList, Static
 
     results: list[tuple[str, bool, str]] = []
 
@@ -100,8 +106,10 @@ async def app_cases(mod) -> list[tuple[str, bool, str]]:
          row("koyr", "%3", "running")],
         {"%2", "%9"},
     )
+    fake.prs = {"main": {"number": 12, "state": "MERGED", "draft": False}}
     app = mod.AgentSidebar(scan=fake.scan, panes_here=fake.panes_here,
-                           run=fake.run)
+                           run=fake.run, pull_requests=fake.pull_requests)
+    glue = mod.GLUE
 
     async def rescan() -> None:
         app.action_rescan()
@@ -128,11 +136,85 @@ async def app_cases(mod) -> list[tuple[str, bool, str]]:
         check("k moves up past the project header", highlighted() == "%3",
               highlighted())
 
+        prompt = plain(agents.get_option("%3").prompt)
+        check("a branch's pull request shows on its agent", "#12" in prompt,
+              prompt)
+        check("pull requests are looked up once per project",
+              sorted(fake.pr_lookups) == ["/src/dotfiles", "/src/koyr"],
+              fake.pr_lookups)
+        await rescan()
+        check("and not again on the next scan",
+              len(fake.pr_lookups) == 2, fake.pr_lookups)
+
+        async def act(*keys: str) -> tuple[str, ...] | None:
+            before = len(fake.ran)
+            await pilot.press(*keys)
+            await pilot.pause(0.1)
+            return fake.ran[before] if len(fake.ran) > before else None
+
+        for key, verb in (("d", "review"), ("g", "git"), ("p", "pr"),
+                          ("X", "remove-worktree")):
+            got = await act(key)
+            check(f"{key} runs {verb} on the agent's pane",
+                  got == (glue, verb, "%3"), got)
+        got = await act("o")
+        check("o opens a project", got == (glue, "open"), got)
+
+        got = await act("x", "n")
+        check("x asks first, and n keeps the agent", got is None, got)
+        got = await act("x", "y")
+        check("x then y kills it", got == (glue, "kill", "%3"), got)
+
+        await pilot.press("n")
+        await pilot.pause(0.1)
+        check("n asks for a branch",
+              isinstance(app.screen, mod.BranchPrompt), app.screen)
+        app.screen.query_one(Input).value = "feat/x"
+        got = await act("enter")
+        check("and makes a worktree on it",
+              got == (glue, "new-worktree", "%3", "feat/x"), got)
+        got = await act("n", "escape")
+        check("esc makes nothing", got is None, got)
+        check("and returns to the list", not isinstance(
+            app.screen, mod.BranchPrompt), app.screen)
+
+        await pilot.press("question_mark")
+        await pilot.pause(0.1)
+        check("? shows the keys", isinstance(app.screen, mod.Help),
+              app.screen)
+        await pilot.press("escape")
+        await pilot.pause(0.1)
+        check("esc closes them", not isinstance(app.screen, mod.Help),
+              app.screen)
+
+        titles = [c.title for c in app.get_system_commands(app.screen)]
+        want = [f"{a.title} ({a.label})" for a in mod.ACTIONS
+                if a.name != "help"]
+        check("every action is in the command palette", titles == want,
+              titles)
+
+        before = len(fake.ran)
         fake.rows = [row("dotfiles", "%2", "blocked"), row("koyr", "%3"),
                      row("koyr", "%1")]
         await rescan()
         check("the cursor stays on its agent as rows reorder",
               highlighted() == "%3", (ids(), highlighted()))
+        said = [c for c in fake.ran[before:] if c[:2] == ("tmux", "display-message")]
+        check("an agent elsewhere that stops is announced",
+              [c[-1] for c in said] == ["koyr/main done: hello"], said)
+
+        fake.here = {"%1"}
+        fake.rows = [row("koyr", "%3", "running"), row("koyr", "%1", "running"),
+                     row("dotfiles", "%2")]
+        await rescan()
+        before = len(fake.ran)
+        fake.rows = [row("koyr", "%3"), row("koyr", "%1"), row("dotfiles", "%2")]
+        await rescan()
+        said = [c[-1] for c in fake.ran[before:]
+                if c[:2] == ("tmux", "display-message")]
+        check("one in this window is not", said == ["koyr/main done: hello"],
+              said)
+        fake.here = {"%2", "%9"}
 
         await pilot.press("enter")
         await pilot.pause(0.1)
@@ -206,6 +288,26 @@ def main() -> int:
     ok = lines[0].endswith("claude") and lines[1].endswith("done")
     report("prompt", "nothing to say leaves no stray dash", ok,
            "" if ok else f"got={unknown!r}")
+
+    merged_rot = mod.badges(
+        row("koyr", "%1", context="488.7k", context_level="rot"),
+        {"number": 12, "state": "MERGED", "draft": False})
+    ok = (merged_rot.plain == "#12 488.7k"
+          and [str(span.style) for span in merged_rot.spans]
+          == [mod.PR_COLOR["MERGED"], mod.CONTEXT_COLOR["rot"]])
+    report("badges", "merged pull request and rotting context", ok,
+           "" if ok else f"got={merged_rot!r}")
+
+    draft = mod.badges(row("koyr", "%1"),
+                       {"number": 3, "state": "OPEN", "draft": True})
+    ok = draft.plain == "#3" and str(draft.spans[0].style) == mod.MUTED
+    report("badges", "a draft is muted, a fresh context hidden", ok,
+           "" if ok else f"got={draft!r}")
+
+    said = mod.announcement(row("koyr", "%1", message="see #12 and #{x}"))
+    ok = said == "koyr/main done: see ##12 and ##{x}"
+    report("notify", "a message cannot inject tmux formats", ok,
+           "" if ok else f"got={said!r}")
 
     counts = mod.summary([row("a", "%1", "running"), row("a", "%2", "blocked"),
                           row("b", "%3", "running")]).plain

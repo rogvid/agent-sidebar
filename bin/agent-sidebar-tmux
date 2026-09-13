@@ -7,13 +7,27 @@
 # changes, a hook moves that pane into it with join-pane. The process keeps
 # running; only the window around it changes.
 #
-# Usage: agent-sidebar-tmux toggle | close | follow | prune-resurrect FILE
+# Usage: agent-sidebar-tmux COMMAND [ARGS]
 #
-#   toggle           show the sidebar in this window, or close it if it is
-#                    already here (M-2)
-#   close            close it until the next toggle
-#   follow           move it into the window you are looking at (hooks)
-#   prune-resurrect  drop it from a tmux-resurrect save file
+#   toggle                   show the sidebar in this window, or close it if
+#                            it is already here (M-2)
+#   close                    close it until the next toggle
+#   follow                   move it into the window you are looking at
+#                            (hooks)
+#   prune-resurrect FILE     drop it from a tmux-resurrect save file
+#
+# The sidebar's actions, each on an agent's pane:
+#
+#   new-worktree PANE BRANCH create a worktree of PANE's project, give it a
+#                            session of its own and start an agent there
+#   review PANE              review PANE's uncommitted changes in tuicr; its
+#                            export (y) is pasted into PANE's input
+#   git PANE                 lazygit in PANE's directory
+#   pr PANE                  PANE's pull request, or offer to create one
+#   kill PANE                kill PANE
+#   remove-worktree PANE     remove PANE's worktree (git-wt-remove asks
+#                            first), then PANE
+#   open                     pick a project or session to open (tv sesh)
 #
 # Whether the sidebar is wanted is the global @agent-sidebar-open option.
 # The pane itself carries the pane option @agent-sidebar. Keeping the two
@@ -27,6 +41,8 @@ readonly sidebar_command="${AGENT_SIDEBAR_COMMAND:-agent-sidebar}"
 # resurrect saves panes with their title, which is how prune-resurrect
 # recognises this one.
 readonly title="agent-sidebar"
+# What new-worktree starts in the new session.
+readonly agent_command="${AGENT_SIDEBAR_AGENT:-claude}"
 
 usage() {
     sed -n '2,/^$/s/^# \{0,1\}//p' "$0"
@@ -191,6 +207,141 @@ prune_resurrect() {
     mv "${file}.agent-sidebar" "${file}"
 }
 
+# --- actions ---
+
+pane_path() {
+    tmux display-message -p -t "$1" '#{pane_current_path}'
+}
+
+# The main checkout of the repository a directory is in, or nothing. Every
+# worktree shares its main checkout's common dir, which is `<main>/.git`.
+main_checkout() {
+    local common
+    common="$(git -C "$1" rev-parse --path-format=absolute \
+        --git-common-dir 2>/dev/null)" || return 0
+    if [[ "$(basename "${common}")" == ".git" ]]; then
+        dirname "${common}"
+    fi
+}
+
+# The worktree that has a branch checked out, or nothing.
+worktree_for_branch() {
+    git -C "$1" worktree list --porcelain |
+        awk -v ref="refs/heads/$2" '
+            /^worktree / { path = substr($0, 10) }
+            $0 == "branch " ref { print path; exit }'
+}
+
+# Run a command in a popup over the client you are looking through. tmux
+# blocks until the popup closes, so whatever follows sees its result.
+popup() {
+    local dir="$1"
+    shift
+    # display-popup hands its command to a shell, so quote each word.
+    tmux display-popup -E -d "${dir}" -w 90% -h 90% "$(printf '%q ' "$@")" ||
+        true
+}
+
+# Keep a popup open until a key is pressed, so its output can be read.
+hold() {
+    printf '\n%s' "${1:-Press any key to close}"
+    read -rsn1 _ || true
+}
+
+notify() {
+    tmux display-message -d 5000 "agent-sidebar: $1"
+}
+
+new_worktree() {
+    local pane="$1" branch="$2" main path session
+    main="$(main_checkout "$(pane_path "${pane}")")"
+    if [[ -z "${main}" ]]; then
+        notify "no git checkout behind ${pane}"
+        return 0
+    fi
+    # git-wt-add only runs from the main checkout, and it reports as it
+    # goes - setting the worktree up included - so it runs where you can
+    # read it.
+    popup "${main}" "$0" _worktree-add "${branch}"
+    path="$(worktree_for_branch "${main}" "${branch}")"
+    if [[ -z "${path}" ]]; then
+        return 0
+    fi
+    # Named the way tmux-sessionizer and sesh name a folder's session, so
+    # opening the worktree through either later lands in this one.
+    session="$(basename "${path}" | tr . _)"
+    if ! tmux has-session -t "=${session}" 2>/dev/null; then
+        tmux new-session -d -s "${session}" -c "${path}"
+        # Typed into the shell rather than run as the session's command, so
+        # the session outlives the agent.
+        tmux send-keys -t "=${session}:" "${agent_command}" Enter
+    fi
+    tmux switch-client -t "=${session}"
+}
+
+worktree_add() {
+    if ! git-wt-add "$1"; then
+        hold "git-wt-add failed. Press any key to close"
+    fi
+}
+
+review() {
+    local pane="$1" dir out
+    dir="$(pane_path "${pane}")"
+    out="$(mktemp)"
+    # --stdout sends tuicr's export to the file instead of the clipboard, and
+    # exporting ends the review; the review itself still draws on the
+    # terminal. The $1 belongs to the inner sh, hence the single quotes.
+    # shellcheck disable=SC2016
+    popup "${dir}" sh -c 'tuicr -w --stdout --no-update-check >"$1"' sh "${out}"
+    if [[ -s "${out}" ]]; then
+        tmux load-buffer -b agent-sidebar-review "${out}"
+        # Bracketed and without Enter: the comments land in the agent's
+        # input for you to read over and send.
+        tmux paste-buffer -p -d -b agent-sidebar-review -t "${pane}"
+        tmux switch-client -t "${pane}"
+    fi
+    rm -f "${out}"
+}
+
+pull_request() {
+    if ! gh pr view; then
+        local answer
+        read -rp "Create a pull request for this branch? [y/N] " answer
+        if [[ "${answer}" == [yY]* ]]; then
+            gh pr create || true
+        fi
+    fi
+    hold
+}
+
+remove_worktree() {
+    local pane="$1" dir main top
+    dir="$(pane_path "${pane}")"
+    main="$(main_checkout "${dir}")"
+    top="$(git -C "${dir}" rev-parse --show-toplevel 2>/dev/null || true)"
+    if [[ -z "${main}" || -z "${top}" || "${top}" == "${main}" ]]; then
+        notify "${pane} is not working in a worktree"
+        return 0
+    fi
+    popup "${main}" "$0" _worktree-remove "${top}"
+    # git-wt-remove asks before it removes anything. Only once the worktree
+    # is really gone does the agent that was working in it go too.
+    if [[ ! -d "${top}" ]]; then
+        tmux kill-pane -t "${pane}"
+    fi
+}
+
+worktree_remove() {
+    if ! git-wt-remove -d "$1"; then
+        hold "git-wt-remove did not remove it. Press any key to close"
+    fi
+}
+
+open_project() {
+    tmux display-popup -E -d "${HOME}" -w 80% -h 70% -T Sessions tv sesh || true
+}
+
 # Hooks fire in bursts - one window change is several events - and two runs
 # that each see no sidebar would each open one.
 locked() {
@@ -202,17 +353,60 @@ locked() {
     "$@"
 }
 
+need() {
+    local count="$1"
+    shift
+    if [[ $# -ne "${count}" ]]; then
+        usage >&2
+        exit 2
+    fi
+}
+
 main() {
     case "${1:-}" in
     toggle | close | follow)
         locked "$1"
         ;;
     prune-resurrect)
-        if [[ $# -ne 2 ]]; then
-            usage >&2
-            exit 2
-        fi
+        need 2 "$@"
         prune_resurrect "$2"
+        ;;
+    new-worktree)
+        need 3 "$@"
+        new_worktree "$2" "$3"
+        ;;
+    review)
+        need 2 "$@"
+        review "$2"
+        ;;
+    git)
+        need 2 "$@"
+        popup "$(pane_path "$2")" lazygit
+        ;;
+    pr)
+        need 2 "$@"
+        popup "$(pane_path "$2")" "$0" _pull-request
+        ;;
+    kill)
+        need 2 "$@"
+        tmux kill-pane -t "$2"
+        ;;
+    remove-worktree)
+        need 2 "$@"
+        remove_worktree "$2"
+        ;;
+    open)
+        open_project
+        ;;
+    # Run inside the popups above.
+    _worktree-add)
+        worktree_add "$2"
+        ;;
+    _worktree-remove)
+        worktree_remove "$2"
+        ;;
+    _pull-request)
+        pull_request
         ;;
     -h | --help | help)
         usage
