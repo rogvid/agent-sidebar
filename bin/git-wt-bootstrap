@@ -1,0 +1,305 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Source common utilities
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=git-wt-common.sh
+source "${SCRIPT_DIR}/git-wt-common.sh"
+
+usage() {
+  cat <<EOF
+Usage: git-wt-bootstrap [OPTIONS] [worktree-path]
+
+Set up a freshly created worktree from its main checkout, so it is ready to
+run. Safe to re-run: nothing that already exists in the worktree is replaced.
+
+  1. Copy gitignored files matching the main checkout's .worktreeinclude
+     (same rules as Claude Code's own 'claude --worktree').
+  2. Symlink gitignored paths matching .worktreelink (same syntax), for
+     directories too big to copy, like data/.
+  3. 'direnv allow' when the worktree has an .envrc.
+  4. 'mise trust' when the worktree has a mise config.
+  5. Run the mise task 'worktree:setup' if the repo defines one, with
+     WORKTREE_INDEX and WORKTREE_MAIN in its environment.
+
+WORKTREE_INDEX is a small integer that stays with the worktree: 0 for the
+main checkout, and the lowest free integer from 1 for each worktree. Use it
+to offset dev-server ports so worktrees can run side by side.
+
+OPTIONS:
+  --index       Only print the worktree's WORKTREE_INDEX (0 in the main checkout)
+  -h, --help    Show this help message
+
+EXAMPLES:
+  git-wt-bootstrap                          # Bootstrap the current worktree
+  git-wt-bootstrap ../worktrees/app-feat-x  # Bootstrap another worktree
+  git-wt-bootstrap --index                  # e.g. PORT=\$((8000 + index))
+EOF
+  exit 0
+}
+
+TARGET="."
+PRINT_INDEX=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      usage
+      ;;
+    --index)
+      PRINT_INDEX=true
+      shift
+      ;;
+    -*)
+      error "Unknown option: $1"
+      usage
+      ;;
+    *)
+      TARGET="$1"
+      shift
+      ;;
+  esac
+done
+
+if ! WORKTREE="$(git -C "${TARGET}" rev-parse --show-toplevel 2>/dev/null)"; then
+  error "Not a git worktree: ${TARGET}"
+  exit 1
+fi
+COMMON_DIR="$(git -C "${WORKTREE}" rev-parse --path-format=absolute --git-common-dir)"
+MAIN="$(dirname "${COMMON_DIR}")"
+
+if [[ "$(realpath "${WORKTREE}")" == "$(realpath "${MAIN}")" ]]; then
+  if [[ "${PRINT_INDEX}" == true ]]; then
+    echo 0
+    exit 0
+  fi
+  error "${WORKTREE} is the main checkout; bootstrap a linked worktree instead"
+  exit 1
+fi
+
+# The index lives in the worktree's private git dir (.git/worktrees/<name>/),
+# so it survives re-runs and git deletes it along with the worktree, which is
+# what frees the number for the next one.
+worktree_index() {
+  local own
+  own="$(git -C "${WORKTREE}" rev-parse --absolute-git-dir)/worktree-index"
+  if [[ "$(cat "${own}" 2>/dev/null)" =~ ^[1-9][0-9]*$ ]]; then
+    cat "${own}"
+    return 0
+  fi
+
+  # Claude Code can create several subagent worktrees at once; without the
+  # lock two of them could pick the same number.
+  local lock="${COMMON_DIR}/worktree-index.lock" tries=0
+  until mkdir "${lock}" 2>/dev/null; do
+    if ((++tries > 100)); then
+      error "Timed out waiting for ${lock}; remove it if no bootstrap is running"
+      return 1
+    fi
+    sleep 0.1
+  done
+
+  local file index=1
+  local -A used=()
+  for file in "${COMMON_DIR}"/worktrees/*/worktree-index; do
+    [[ -f "${file}" && "${file}" != "${own}" ]] || continue
+    used["$(cat "${file}")"]=1
+  done
+  while [[ -n "${used[${index}]:-}" ]]; do
+    index=$((index + 1))
+  done
+  printf '%s\n' "${index}" >"${own}"
+  rmdir "${lock}"
+  echo "${index}"
+}
+
+WORKTREE_INDEX="$(worktree_index)"
+if [[ "${PRINT_INDEX}" == true ]]; then
+  echo "${WORKTREE_INDEX}"
+  exit 0
+fi
+
+TMP="$(mktemp -d)"
+trap 'rm -rf "${TMP}"' EXIT
+
+# Gitignore-style matching against a pattern file, done by git itself so the
+# syntax is exactly gitignore's. The empty repo and work tree keep the real
+# repo's own .gitignore files out of it. Reads and writes NUL-separated paths.
+git init -q --bare "${TMP}/matcher.git"
+mkdir "${TMP}/matcher"
+matching() {
+  local patterns="$1" status=0
+  git --git-dir="${TMP}/matcher.git" --work-tree="${TMP}/matcher" \
+    -C "${TMP}/matcher" -c core.excludesFile="${patterns}" \
+    check-ignore --no-index --stdin -z || status=$?
+  # 1 only means nothing matched.
+  ((status <= 1))
+}
+
+# Pattern lines the way Claude Code reads them: trimmed, no blanks or comments.
+read_patterns() {
+  local file="$1" out="$2" line
+  : >"${out}"
+  [[ -f "${file}" ]] || return 0
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "${line}" || "${line}" == \#* ]] && continue
+    printf '%s\n' "${line}" >>"${out}"
+  done <"${file}"
+}
+
+# Whether a pattern can match something inside a wholly ignored directory.
+# git lists such a directory as one entry, and looking inside every one of
+# them (.venv, node_modules) would be slow, so Claude Code only looks where a
+# pattern could reach. This is its rule, kept as-is so one .worktreeinclude
+# copies the same files whichever tool made the worktree.
+reaches() {
+  local dir="$1" patterns="$2" pattern stem prefix first name
+  local -a parts
+  IFS=/ read -r -a parts <<<"${dir%/}"
+  while IFS= read -r pattern; do
+    stem="${pattern#/}"
+    [[ "${stem}" == "${dir}"* ]] && return 0
+    prefix="${stem%%[*?[]*}"
+    if [[ "${prefix}" != "${stem}" && -n "${prefix}" && "${dir}" == "${prefix}"* ]]; then
+      return 0
+    fi
+    first="${stem}"
+    while [[ "${first}" == '**/'* ]]; do first="${first#'**/'}"; done
+    [[ "${first}" == "${stem}" ]] && continue
+    first="${first%%/*}"
+    name="${first%%[*?[]*}"
+    name="${name//\\/}"
+    name="${name,,}"
+    [[ -z "${name}" ]] && continue
+    local part
+    for part in "${parts[@]}"; do
+      part="${part,,}"
+      if [[ "${first}" == *[*?[]* ]]; then
+        [[ "${part}" == "${name}"* ]] && return 0
+      else
+        [[ "${part}" == "${name}" ]] && return 0
+      fi
+    done
+  done <"${patterns}"
+  return 1
+}
+
+# Gitignored paths in the main checkout, wholly ignored directories collapsed
+# to one "dir/" entry.
+git -C "${MAIN}" ls-files -z --others --ignored --exclude-standard --directory >"${TMP}/ignored"
+
+# Files to copy: NUL-separated, relative to the main checkout.
+include_files() {
+  local patterns="$1" entry
+  local -a dirs=()
+  while IFS= read -r -d '' entry; do
+    [[ "${entry}" == */ ]] || printf '%s\0' "${entry}"
+  done <"${TMP}/ignored" | matching "${patterns}"
+
+  while IFS= read -r -d '' entry; do
+    [[ "${entry}" == */ ]] || continue
+    if reaches "${entry}" "${patterns}" \
+      || [[ -n "$(printf '%s\0%s\0' "${entry%/}" "${entry}" | matching "${patterns}")" ]]; then
+      dirs+=("${entry}")
+    fi
+  done <"${TMP}/ignored"
+  ((${#dirs[@]} > 0)) || return 0
+  GIT_LITERAL_PATHSPECS=1 git -C "${MAIN}" ls-files -z --others --ignored --exclude-standard -- "${dirs[@]}" \
+    | matching "${patterns}"
+}
+
+# Whether a destination would land outside the worktree through a symlink
+# already in it, which would write into whatever the link points at.
+escapes() {
+  local parent
+  parent="$(realpath -m "$(dirname "$1")")"
+  [[ "${parent}/" != "$(realpath "${WORKTREE}")/"* ]]
+}
+
+echo "Bootstrapping worktree: $(basename "${WORKTREE}")"
+echo "  Main: ${MAIN}"
+
+# Links go first: a directory linked here must not also be copied file by file.
+# Only whole gitignored entries are linked, never anything git tracks, since a
+# link over a tracked path would show up as a change in the worktree.
+read_patterns "${MAIN}/.worktreelink" "${TMP}/link"
+if [[ -s "${TMP}/link" ]]; then
+  while IFS= read -r -d '' path; do
+    path="${path%/}"
+    if [[ -e "${WORKTREE}/${path}" || -L "${WORKTREE}/${path}" ]]; then
+      echo -e "  ${COLOR_DIM}Exists: ${path}${COLOR_RESET}"
+    elif escapes "${WORKTREE}/${path}"; then
+      warning "  Skipped, would leave the worktree: ${path}"
+    else
+      mkdir -p "$(dirname "${WORKTREE}/${path}")"
+      ln -s "${MAIN}/${path}" "${WORKTREE}/${path}"
+      echo "  Linked: ${path}"
+    fi
+  done < <(
+    while IFS= read -r -d '' entry; do
+      printf '%s\0' "${entry}"
+      # "data/" as a pattern only matches a directory, which git spells with
+      # the slash; "data" matches either.
+      [[ "${entry}" == */ ]] && printf '%s\0' "${entry%/}"
+    done <"${TMP}/ignored" | matching "${TMP}/link" | sed -z 's:/$::' | sort -zu
+  )
+fi
+
+read_patterns "${MAIN}/.worktreeinclude" "${TMP}/include"
+if [[ -s "${TMP}/include" ]]; then
+  while IFS= read -r -d '' path; do
+    if [[ -L "${MAIN}/${path}" ]]; then
+      warning "  Skipped symlink: ${path}"
+    elif [[ -e "${WORKTREE}/${path}" || -L "${WORKTREE}/${path}" ]]; then
+      echo -e "  ${COLOR_DIM}Exists: ${path}${COLOR_RESET}"
+    elif escapes "${WORKTREE}/${path}"; then
+      warning "  Skipped, would leave the worktree: ${path}"
+    else
+      mkdir -p "$(dirname "${WORKTREE}/${path}")"
+      cp -p -- "${MAIN}/${path}" "${WORKTREE}/${path}"
+      echo "  Copied: ${path}"
+    fi
+  # A directory holding only ignored files is listed both as "dir/" and by
+  # its files, so the same file can come up twice.
+  done < <(include_files "${TMP}/include" | sort -zu)
+fi
+
+echo "  Index: ${WORKTREE_INDEX}"
+
+if [[ -f "${WORKTREE}/.envrc" ]] && command -v direnv >/dev/null 2>&1; then
+  direnv allow "${WORKTREE}"
+  echo "  direnv: allowed .envrc"
+fi
+
+# Everywhere mise looks for project config and file tasks. Only files need
+# trust; a task directory alone is still a reason to look for worktree:setup.
+MISE_CONFIGS=(mise.toml .mise.toml mise.local.toml .mise.local.toml
+  .config/mise.toml .config/mise/config.toml .mise/config.toml mise/config.toml)
+MISE_TASK_DIRS=(mise-tasks .mise-tasks mise/tasks .mise/tasks .config/mise/tasks)
+
+if command -v mise >/dev/null 2>&1; then
+  uses_mise=false
+  for config in "${MISE_CONFIGS[@]}"; do
+    [[ -f "${WORKTREE}/${config}" ]] || continue
+    mise trust "${WORKTREE}/${config}"
+    echo "  mise: trusted ${config}"
+    uses_mise=true
+  done
+  for dir in "${MISE_TASK_DIRS[@]}"; do
+    [[ -d "${WORKTREE}/${dir}" ]] && uses_mise=true
+  done
+
+  if [[ "${uses_mise}" == true ]] \
+    && (cd "${WORKTREE}" && mise tasks info worktree:setup >/dev/null 2>&1); then
+    info "  Running mise task: worktree:setup"
+    if ! (cd "${WORKTREE}" \
+      && WORKTREE_INDEX="${WORKTREE_INDEX}" WORKTREE_MAIN="${MAIN}" mise run worktree:setup); then
+      error "mise task worktree:setup failed; fix it and re-run git-wt-bootstrap"
+      exit 1
+    fi
+  fi
+fi
+
+success "✓ Worktree bootstrapped"
