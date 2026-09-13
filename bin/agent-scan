@@ -29,7 +29,7 @@ pane that handed its turn back a minute ago sits above the one that
 finished an hour ago, and a pane whose clock the screen does not record
 sinks to the bottom of its state. Read top-down, the list is a queue.
 
-Usage: agent-scan [scan] [--no-color | --json]
+Usage: agent-scan [scan] [--no-color | --json | --tmux]
 
 Output columns: project, branch, session:window.pane, a warning flag,
 state, agent, context, how long the pane has been in its current state,
@@ -48,7 +48,12 @@ agent pane: two agents editing one tree overwrite each other silently.
 
 --json prints the same rows, in the same order, as a JSON list of objects
 for tools that lay them out themselves (agent-sidebar). Nothing is cut
-short there, and each row also carries the pane's tmux id.
+short there, and each row also carries the pane's tmux id, its working
+directory, and how far into context rot it is (`context_level`: ok, warn,
+rot, or unknown).
+
+--tmux prints one coloured count per state in tmux's own style syntax, for
+the status bar, and nothing at all when no agent is running.
 """
 
 from __future__ import annotations
@@ -702,13 +707,19 @@ def context_tokens(text: str) -> int | None:
     return int(value * SUFFIX_SCALE.get(m.group(2).lower(), 1))
 
 
-def context_color(text: str) -> str:
+def context_level(text: str) -> str:
     tokens = context_tokens(text)
     if tokens is None:
-        return MUTED
+        return "unknown"
     if tokens >= CTX_ROT:
-        return RED
-    return YELLOW if tokens >= CTX_WARN else GREEN
+        return "rot"
+    return "warn" if tokens >= CTX_WARN else "ok"
+
+
+def context_color(text: str) -> str:
+    return {
+        "unknown": MUTED, "rot": RED, "warn": YELLOW, "ok": GREEN,
+    }[context_level(text)]
 
 
 def parse_context(lines: list[str]) -> str:
@@ -887,6 +898,8 @@ class Row:
     # tmux's own id for the pane (`%12`). Unlike the target it survives
     # windows being renumbered, so it is what a tool acts on.
     pane_id: str
+    # The pane's working directory: where an action on the agent should run.
+    cwd: str
     agent: str
     context: str
     duration: str
@@ -947,6 +960,7 @@ def collect_rows() -> list[Row]:
             branch=branch,
             target=pane.target,
             pane_id=pane.pane_id,
+            cwd=pane.cwd,
             agent=agent.name,
             context=parse_context(lines),
             duration=state_duration(state, since),
@@ -1029,11 +1043,46 @@ def render(rows: list[Row], color: bool) -> list[str]:
 
 
 def render_json(rows: list[Row]) -> str:
-    return json.dumps([asdict(r) for r in rows], ensure_ascii=False)
+    return json.dumps(
+        [asdict(r) | {"context_level": context_level(r.context)} for r in rows],
+        ensure_ascii=False,
+    )
 
 
-def cmd_scan(color: bool, as_json: bool = False) -> int:
+# tmux's names for the palette colours STATE_COLOR uses.
+TMUX_STATE_COLOR = {
+    "blocked": "yellow",
+    "interrupted": "magenta",
+    "done": "green",
+    "running": "blue",
+    "delegated": "cyan",
+}
+
+
+def render_tmux(rows: list[Row]) -> str:
+    """`● 1 ● 2 ` in tmux style syntax, most urgent state first.
+
+    The trailing space is part of the output, so the status bar only makes
+    room when there is something to show.
+    """
+    counts = Counter(r.state for r in rows)
+    parts = [
+        f"#[fg={TMUX_STATE_COLOR[state]}]● {counts[state]}"
+        for state in sorted(counts, key=lambda s: STATE_ORDER.get(s, 9))
+        if state in TMUX_STATE_COLOR
+    ]
+    return " ".join(parts) + "#[default] " if parts else ""
+
+
+def cmd_scan(
+    color: bool, as_json: bool = False, as_tmux: bool = False,
+) -> int:
     rows = collect_rows()
+    if as_tmux:
+        # An empty line, not a message: the status bar shows whatever this
+        # prints.
+        print(render_tmux(rows))
+        return 0
     if as_json:
         # Always a list, even an empty one: a consumer polling this wants
         # "no agents" as data, not as a message on stderr.
@@ -1054,7 +1103,8 @@ def main() -> int:
     args = [a for a in sys.argv[1:] if a != "scan"]
     color = "--no-color" not in args and not os.environ.get("NO_COLOR")
     as_json = "--json" in args
-    args = [a for a in args if a not in ("--no-color", "--json")]
+    as_tmux = "--tmux" in args
+    args = [a for a in args if a not in ("--no-color", "--json", "--tmux")]
 
     if args and args[0] in ("-h", "--help", "help"):
         assert __doc__
@@ -1062,9 +1112,10 @@ def main() -> int:
         return 0
     if args:
         print(f"Unknown argument: {args[0]}", file=sys.stderr)
-        print("Usage: agent-scan [scan] [--no-color | --json]", file=sys.stderr)
+        print("Usage: agent-scan [scan] [--no-color | --json | --tmux]",
+              file=sys.stderr)
         return 2
-    return cmd_scan(color, as_json)
+    return cmd_scan(color, as_json, as_tmux)
 
 
 if __name__ == "__main__":

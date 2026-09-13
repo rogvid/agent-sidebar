@@ -464,7 +464,7 @@ def row(**overrides):
     """A Row with every field filled, for exercising the renderer."""
     fields = dict(
         state="done", project="koyr", branch="main", target="s:1.0",
-        pane_id="%1", agent="claude", context="10.0k",
+        pane_id="%1", cwd="/tmp/koyr", agent="claude", context="10.0k",
         duration="5m", since=300.0, block="1h", weekly="-", age="2h",
         message="hello", flag=" ",
     )
@@ -504,6 +504,25 @@ FIT_CASES = (
     ("exactly the limit kept", "x" * 24, "x" * 24),
     ("long name cut to the limit", "prototype/improve-file-parsing-for-real",
      "prototype/improve-file-…"),
+)
+
+# How far into context rot a session is, by the same thresholds that colour
+# the context column.
+CONTEXT_LEVEL_CASES = (
+    ("fresh session", "10.0k", "ok"),
+    ("at the warning line", "100k", "warn"),
+    ("past rot", "488.7k", "rot"),
+    ("only a percentage", "58%", "unknown"),
+    ("nothing on screen", "-", "unknown"),
+)
+
+# The status bar's counts: one per state that has agents, most urgent first,
+# and nothing at all when no agent runs so the bar does not grow a gap.
+TMUX_CASES = (
+    ("no agents, no output", (), ""),
+    ("one count per state, queue order",
+     ("running", "blocked", "running"),
+     "#[fg=yellow]● 1 #[fg=blue]● 2#[default] "),
 )
 
 # television finds the pane by pulling the first `session:window.pane` out
@@ -700,6 +719,26 @@ def main() -> int:
     print(f"{'ok  ' if ok else 'FAIL'}  json     {'rows in order, names uncut':36} "
           f"{'ok' if ok else f'got={decoded!r}'}")
 
+    ok = (decoded[0]["cwd"] == "/tmp/koyr"
+          and decoded[0]["context_level"] == "ok")
+    failures += not ok
+    print(f"{'ok  ' if ok else 'FAIL'}  json     {'cwd and context level':36} "
+          f"{'ok' if ok else f'got={decoded[0]!r}'}")
+
+    for name, context, want in CONTEXT_LEVEL_CASES:
+        got = mod.context_level(context)
+        ok = got == want
+        failures += not ok
+        print(f"{'ok  ' if ok else 'FAIL'}  ctxlevel {name:36} "
+              f"want={want:8} got={got}")
+
+    for name, states, want in TMUX_CASES:
+        got = mod.render_tmux([row(state=st) for st in states])
+        ok = got == want
+        failures += not ok
+        print(f"{'ok  ' if ok else 'FAIL'}  tmux     {name:36} "
+              f"{'ok' if ok else f'want={want!r} got={got!r}'}")
+
     ok = json.loads(mod.render_json([])) == []
     failures += not ok
     print(f"{'ok  ' if ok else 'FAIL'}  json     {'no agents is an empty list':36} "
@@ -728,7 +767,8 @@ def main() -> int:
              + len(WEEKLY_COLOR_CASES) + len(SORT_CASES)
              + len(COLLAPSE_CASES) + len(PROJECT_CASES)
              + len(IDENTITY_CASES) + len(FIT_CASES) + 1
-             + len(TARGET_CASES) + 1 + 3)
+             + len(TARGET_CASES) + 1 + 4 + len(CONTEXT_LEVEL_CASES)
+             + len(TMUX_CASES))
     print(f"\n{total - failures}/{total} passed")
     return 1 if failures else 0
 
