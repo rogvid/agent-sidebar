@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+# End-to-end checks for agent-sidebar-tmux on a throwaway tmux server.
+#
+# The sidebar follows the window a client is looking at, so a real client
+# is attached: it runs inside a second throwaway server, and keys are typed
+# into it the way a terminal would. The binding and hooks come straight out
+# of tmux.conf, so the test and the config cannot drift apart.
+#
+# Run: scripts/tests/test-agent-sidebar-tmux     (or `mise run test`)
+
+set -euo pipefail
+
+repo="$(cd "$(dirname "$0")/../.." && pwd)"
+readonly repo
+readonly socket="agent-sidebar-test-$$"
+readonly host="agent-sidebar-host-$$"
+readonly width=36
+scratch="$(mktemp -d)"
+readonly scratch
+
+cleanup() {
+    tmux -L "${socket}" kill-server 2>/dev/null || true
+    tmux -L "${host}" kill-server 2>/dev/null || true
+    rm -rf "${scratch}"
+}
+trap cleanup EXIT
+
+grep -F 'agent-sidebar-tmux' "${repo}/tmux/.tmux.conf" >"${scratch}/tmux.conf"
+# Without it a typed M-2 waits half a second to be told apart from Escape.
+echo 'set -g escape-time 0' >>"${scratch}/tmux.conf"
+
+t() { tmux -L "${socket}" "$@"; }
+
+# The test server's jobs - the hooks - inherit this environment. The sidebar
+# itself is a stand-in: this checks where the pane goes, not what it draws.
+export PATH="${repo}/scripts/.local/bin:${PATH}"
+export AGENT_SIDEBAR_COMMAND="sleep 3600"
+unset TMUX TMUX_PANE
+
+t -f "${scratch}/tmux.conf" new-session -d -s main -x 160 -y 45 -n one
+t new-window -d -t main: -n two
+t new-window -d -t main: -n three
+t new-session -d -s other -x 160 -y 45
+t new-session -d -s popup -x 160 -y 45
+tmux -L "${host}" -f /dev/null new-session -d -s host -x 160 -y 45 \
+    "env -u TMUX tmux -L ${socket} attach -t main"
+
+press() { tmux -L "${host}" send-keys -t host "$@"; }
+
+sidebars() { t list-panes -a -F '#{pane_id} #{@agent-sidebar}' | awk '$2 == "1" { print $1 }'; }
+sidebar_count() { sidebars | wc -l | tr -d ' '; }
+sidebar() { sidebars | head -1; }
+viewed() { t list-clients -F '#{client_pid} #{window_id}' | sort -n | head -1 | cut -d' ' -f2; }
+sidebar_window() { t display-message -p -t "$(sidebar)" '#{window_id}'; }
+
+# One sidebar, in the window the client is looking at, full height down the
+# left edge at its width.
+in_place() {
+    [[ "$(sidebar_count)" == 1 ]] || return 1
+    [[ "$(sidebar_window)" == "$(viewed)" ]] || return 1
+    local shape
+    shape="$(t display-message -p -t "$(sidebar)" \
+        '#{pane_left} #{pane_top} #{pane_width} #{pane_height} #{window_height}')"
+    read -r left top pane_width pane_height window_height <<<"${shape}"
+    ((left == 0 && top == 0 && pane_width == width && pane_height == window_height))
+}
+
+failures=0
+total=0
+
+# Hooks run in the background, so give the server a moment to settle.
+check() {
+    local name="$1" _
+    shift
+    total=$((total + 1))
+    for _ in $(seq 60); do
+        if "$@" 2>/dev/null; then
+            printf 'ok    %s\n' "${name}"
+            return 0
+        fi
+        sleep 0.05
+    done
+    printf 'FAIL  %s\n' "${name}"
+    failures=$((failures + 1))
+}
+
+not() { ! "$@"; }
+equals() { [[ "$($1)" == "$2" ]]; }
+open_flag() { t show-options -gqv @agent-sidebar-open; }
+active_pane() { t display-message -p -t "$(viewed)" '#{pane_id}'; }
+
+check "client attached" equals viewed "$(t display-message -p -t main:one '#{window_id}')"
+
+press M-2
+check "M-2 opens it down the left of this window" in_place
+check "M-2 focuses it" equals active_pane "$(sidebar)"
+first="$(sidebar)"
+
+t select-window -t main:two
+check "it follows to another window" in_place
+check "it is the same pane, still running" equals sidebar "${first}"
+check "the window it left is whole again" equals \
+    "t display-message -p -t main:one #{pane_width}" 160
+check "moving it does not steal focus" not equals active_pane "${first}"
+
+t switch-client -t other
+check "it follows to another session" in_place
+
+t new-window -t other:
+check "it follows to a new window" in_place
+
+tmux -L "${host}" resize-window -t host -x 200
+check "it keeps its width when the terminal grows" in_place
+
+t split-window -t main:three
+t resize-pane -Z -t main:three
+t switch-client -t main
+t select-window -t main:three
+sleep 0.5
+check "a zoomed window keeps its zoom" equals \
+    "t display-message -p -t main:three #{window_zoomed_flag}" 1
+check "and does not take the sidebar" not equals sidebar_window \
+    "$(t display-message -p -t main:three '#{window_id}')"
+t resize-pane -Z -t main:three
+check "unzooming brings it in" in_place
+
+t kill-window -t main:three
+check "killing its window brings a fresh one to where you land" in_place
+check "and only one" equals sidebar_count 1
+
+brief_window="$(t new-window -t main: -P -F '#{window_id}' 'sleep 1')"
+check "it follows into a short-lived window" in_place
+window_exists() { t list-windows -a -F '#{window_id}' | grep -qxF "$1"; }
+check "that window starts with the sidebar beside its pane" equals \
+    "t display-message -p -t ${brief_window} #{window_panes}" 2
+check "when the window's last pane exits, the window closes" not \
+    window_exists "${brief_window}"
+check "and the sidebar lands where you do" in_place
+
+client="$(t list-clients -F '#{client_name}' | head -1)"
+t display-popup -c "${client}" -E \
+    "env -u TMUX tmux -L ${socket} attach -t popup" &
+check "a popup attaches its own client" equals \
+    "t list-clients -F #{session_name}" "$(printf 'main\npopup')"
+sleep 0.5
+check "the sidebar stays with the client under the popup" in_place
+t detach-client -s popup
+wait
+
+t select-pane -t "$(sidebar)"
+press M-2
+check "M-2 in its window closes it" equals sidebar_count 0
+check "and forgets it was open" equals open_flag ""
+t select-window -t main:two
+sleep 0.5
+check "a closed sidebar stays closed" equals sidebar_count 0
+
+printf 'pane\tmain\t1\t1\t:*\t0\tagent-sidebar\t:/home\t0\tsleep\t:\n' >"${scratch}/save"
+printf 'pane\tmain\t1\t1\t:*\t1\tzsh\t:/home\t1\tzsh\t:\n' >>"${scratch}/save"
+printf 'window\tmain\t1\t:one\t1\t:*\tlayout\t:\n' >>"${scratch}/save"
+agent-sidebar-tmux prune-resurrect "${scratch}/save"
+pruned() { [[ "$(cut -f1,7 "${scratch}/save" | tr '\t\n' ' ;')" == "pane zsh;window layout;" ]]; }
+check "resurrect saves leave the sidebar out" pruned
+
+printf '\n%s/%s passed\n' "$((total - failures))" "${total}"
+((failures == 0))

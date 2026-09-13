@@ -1,0 +1,224 @@
+#!/usr/bin/env -S uv run --script
+# vim: set ft=python:
+# -*- mode: python -*-
+# language: python
+# /// script
+# requires-python = ">=3.13"
+# dependencies = [
+#   "textual==8.2.8",
+# ]
+# ///
+"""Checks for agent-sidebar: the grouping, and the app itself driven
+headless against scans it is handed instead of agent-scan's.
+
+Where the pane goes is agent-sidebar-tmux's job and has its own test.
+
+Run: scripts/tests/test-agent-sidebar     (or `mise run test`)
+"""
+
+from __future__ import annotations
+
+import asyncio
+import importlib.machinery
+import importlib.util
+import io
+import sys
+from pathlib import Path
+
+from rich.console import Console
+
+SCRIPT = Path(__file__).resolve().parents[1] / ".local" / "bin" / "agent-sidebar"
+
+
+def load_agent_sidebar():
+    spec = importlib.util.spec_from_loader(
+        "agent_sidebar",
+        importlib.machinery.SourceFileLoader("agent_sidebar", str(SCRIPT)),
+    )
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["agent_sidebar"] = module
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def row(project: str, pane_id: str, state: str = "done", **overrides):
+    """An agent-scan --json row with every field filled."""
+    return dict(
+        state=state, project=project, branch="main", target="s:1.0",
+        pane_id=pane_id, agent="claude", context="10.0k", duration="5m",
+        since=300.0, block="1h", weekly="-", age="2h", message="hello",
+        flag=" ",
+    ) | overrides
+
+
+# agent-scan's rows arrive in queue order, so a project's place is its
+# most urgent agent's place.
+GROUP_CASES = (
+    ("projects in order of their first row",
+     [row("koyr", "%1"), row("hoyr", "%2"), row("koyr", "%3")],
+     [("koyr", ["%1", "%3"]), ("hoyr", ["%2"])]),
+    ("no rows, no groups", [], []),
+)
+
+
+def plain(renderable, width: int = 34) -> str:
+    console = Console(file=io.StringIO(), width=width, color_system=None)
+    console.print(renderable)
+    return console.file.getvalue()
+
+
+class Fake:
+    """Stands in for agent-scan and tmux, and records what the app runs."""
+
+    def __init__(self, rows, here):
+        self.rows = rows
+        self.here = here
+        self.ran: list[tuple[str, ...]] = []
+
+    async def scan(self):
+        return self.rows
+
+    async def panes_here(self):
+        return self.here
+
+    async def run(self, *command):
+        self.ran.append(command)
+
+
+async def app_cases(mod) -> list[tuple[str, bool, str]]:
+    from textual.widgets import OptionList, Static
+
+    results: list[tuple[str, bool, str]] = []
+
+    def check(name: str, ok: bool, detail: object) -> None:
+        results.append((name, ok, "" if ok else f"got={detail!r}"))
+
+    fake = Fake(
+        [row("koyr", "%1", "blocked"), row("dotfiles", "%2"),
+         row("koyr", "%3", "running")],
+        {"%2", "%9"},
+    )
+    app = mod.AgentSidebar(scan=fake.scan, panes_here=fake.panes_here,
+                           run=fake.run)
+
+    async def rescan() -> None:
+        app.action_rescan()
+        await pilot.pause(0.3)
+
+    async with app.run_test(size=(36, 30)) as pilot:
+        await pilot.pause(0.3)
+        agents = app.query_one("#agents", OptionList)
+
+        def ids() -> list[str | None]:
+            return [agents.get_option_at_index(i).id
+                    for i in range(agents.option_count)]
+
+        def highlighted() -> str | None:
+            option = agents.highlighted_option
+            return option.id if option else None
+
+        want = ["project:koyr", "%1", "%3", "project:dotfiles", "%2"]
+        check("agents listed under their project", ids() == want, ids())
+        check("starts on the agent in this window", highlighted() == "%2",
+              highlighted())
+
+        await pilot.press("k")
+        check("k moves up past the project header", highlighted() == "%3",
+              highlighted())
+
+        fake.rows = [row("dotfiles", "%2", "blocked"), row("koyr", "%3"),
+                     row("koyr", "%1")]
+        await rescan()
+        check("the cursor stays on its agent as rows reorder",
+              highlighted() == "%3", (ids(), highlighted()))
+
+        await pilot.press("enter")
+        await pilot.pause(0.1)
+        check("enter jumps to the agent's pane",
+              ("tmux", "switch-client", "-t", "%3") in fake.ran, fake.ran)
+
+        fake.rows = [row("dotfiles", "%2")]
+        await rescan()
+        check("a gone agent moves the cursor to this window's",
+              highlighted() == "%2", highlighted())
+
+        before = ids()
+        fake.rows = None
+        await rescan()
+        footer = str(app.query_one("#footer", Static).render())
+        check("a failed scan keeps the list", ids() == before, ids())
+        check("and says so", "scan failed" in footer, footer)
+
+        fake.rows = []
+        await rescan()
+        empty = app.query_one("#empty")
+        check("no agents shows the empty state",
+              empty.display and not agents.display,
+              (empty.display, agents.display))
+
+        await pilot.press("q")
+        await pilot.pause(0.1)
+        check("q closes the sidebar",
+              ("agent-sidebar-tmux", "close") in fake.ran, fake.ran)
+
+    return results
+
+
+def main() -> int:
+    mod = load_agent_sidebar()
+    failures = 0
+    total = 0
+
+    def report(kind: str, name: str, ok: bool, detail: str) -> None:
+        nonlocal failures, total
+        total += 1
+        failures += not ok
+        print(f"{'ok  ' if ok else 'FAIL'}  {kind:8} {name:48} {detail}")
+
+    for name, rows, want in GROUP_CASES:
+        got = [(project, [r["pane_id"] for r in group])
+               for project, group in mod.group_by_project(rows)]
+        report("group", name, got == want, "" if got == want else f"got={got}")
+
+    here = plain(mod.agent_prompt(row("koyr", "%1"), here=True))
+    elsewhere = plain(mod.agent_prompt(row("koyr", "%1"), here=False))
+    ok = here.startswith(mod.HERE) and mod.HERE not in elsewhere
+    report("prompt", "the bar marks agents in this window", ok,
+           "" if ok else f"got={here!r} / {elsewhere!r}")
+
+    shared = plain(mod.agent_prompt(row("koyr", "%1", flag="!"), here=False))
+    ok = "! main" in shared
+    report("prompt", "a shared working tree is flagged", ok,
+           "" if ok else f"got={shared!r}")
+
+    long = plain(mod.agent_prompt(
+        row("koyr", "%1", branch="feature/" + "x" * 60,
+            message="y" * 80), here=False))
+    ok = all(len(line) <= 34 for line in long.splitlines())
+    report("prompt", "long branch and message stay on their line", ok,
+           "" if ok else f"got={long!r}")
+
+    unknown = plain(mod.agent_prompt(
+        row("koyr", "%1", duration="-", message="-"), here=False))
+    lines = [line.rstrip() for line in unknown.splitlines()]
+    ok = lines[0].endswith("claude") and lines[1].endswith("done")
+    report("prompt", "nothing to say leaves no stray dash", ok,
+           "" if ok else f"got={unknown!r}")
+
+    counts = mod.summary([row("a", "%1", "running"), row("a", "%2", "blocked"),
+                          row("b", "%3", "running")]).plain
+    ok = counts == "● 1 ● 2"
+    report("summary", "counts per state, most urgent first", ok,
+           "" if ok else f"got={counts!r}")
+
+    for name, ok, detail in asyncio.run(app_cases(mod)):
+        report("app", name, ok, detail)
+
+    print(f"\n{total - failures}/{total} passed")
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

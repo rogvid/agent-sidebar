@@ -1,0 +1,376 @@
+#!/usr/bin/env -S uv run --script
+# vim: set ft=python:
+# -*- mode: python -*-
+# language: python
+# /// script
+# requires-python = ">=3.13"
+# dependencies = [
+#   "textual==8.2.8",
+# ]
+# ///
+"""agent-sidebar - agent-scan as a sidebar, one group per project.
+
+Runs in the pane agent-sidebar-tmux keeps down the left of the window you
+are looking at (M-2). Every second it reads `agent-scan --json` and lists
+the agents under the project they are working in.
+
+Projects keep agent-scan's queue order: the project holding the agent that
+most needs you comes first, and inside a project the agents keep their
+order too. Read top-down, it is still a queue.
+
+A bar in the gutter marks the agents in the window you are looking at.
+
+Keys: up/down or j/k move, enter jumps to the agent, esc goes back to the
+pane you came from, r rescans now, q closes the sidebar.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import subprocess
+from collections import Counter
+from collections.abc import Awaitable, Callable
+from typing import Any
+
+from rich.console import Group
+from rich.table import Table
+from rich.text import Text
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.widgets import OptionList, Static
+from textual.widgets.option_list import Option
+
+Row = dict[str, Any]
+
+SCAN_INTERVAL = 1.0
+
+# agent-scan's colours, as terminal palette names so the sidebar reads in
+# the same theme as the panes beside it.
+STATE_COLOR = {
+    "blocked": "yellow",
+    "interrupted": "magenta",
+    "done": "green",
+    "running": "blue",
+    "delegated": "cyan",
+}
+STATE_ORDER = ("blocked", "interrupted", "done", "running", "delegated")
+MUTED = "color(245)"
+HERE = "▌"
+
+PROJECT_PREFIX = "project:"
+
+
+def group_by_project(rows: list[Row]) -> list[tuple[str, list[Row]]]:
+    """Rows grouped by project, groups in order of their first row."""
+    groups: dict[str, list[Row]] = {}
+    for row in rows:
+        groups.setdefault(row["project"], []).append(row)
+    return list(groups.items())
+
+
+def grid() -> Table:
+    table = Table.grid(expand=True)
+    table.add_column(width=1, no_wrap=True)
+    table.add_column(width=2, no_wrap=True)
+    table.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
+    table.add_column(justify="right", no_wrap=True)
+    return table
+
+
+def agent_prompt(row: Row, here: bool) -> Group:
+    """Two lines: where the agent is and for how long, then what it said."""
+    color = STATE_COLOR.get(row["state"], "default")
+    gutter = Text(HERE if here else " ", style="bold")
+
+    top = grid()
+    branch = Text(row["branch"])
+    # Two agents in one working tree overwrite each other's edits.
+    if row.get("flag", " ").strip():
+        branch = Text.assemble(("! ", "bold red"), branch)
+    # agent-scan writes `-` for what the screen does not say; a column can
+    # hold the dash, but here it would read as part of the sentence.
+    duration = "" if row["duration"] == "-" else " " + row["duration"]
+    message = "" if row["message"] == "-" else " · " + row["message"]
+    top.add_row(
+        gutter,
+        Text("●", style=color),
+        branch,
+        Text.assemble(" ", (row["agent"], MUTED), duration),
+    )
+
+    bottom = grid()
+    bottom.add_row(
+        gutter,
+        Text(""),
+        Text.assemble((row["state"], color), (message, MUTED)),
+        Text(""),
+    )
+    return Group(top, bottom)
+
+
+def project_prompt(project: str, count: int) -> Table:
+    """The project's name, lined up with the state dots under it."""
+    table = Table.grid(expand=True)
+    table.add_column(width=1, no_wrap=True)
+    table.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
+    table.add_column(justify="right", no_wrap=True)
+    table.add_row(
+        Text(""),
+        Text(project, style="bold"),
+        Text(f" {count}", style=MUTED),
+    )
+    return table
+
+
+def summary(rows: list[Row]) -> Text:
+    """One coloured count per state that has agents in it."""
+    counts = Counter(row["state"] for row in rows)
+    parts: list[tuple[str, str] | str] = []
+    for state in STATE_ORDER:
+        if counts[state]:
+            if parts:
+                parts.append(" ")
+            parts.append((f"● {counts[state]}", STATE_COLOR[state]))
+    return Text.assemble(*parts)
+
+
+async def tmux(*args: str) -> str | None:
+    proc = await asyncio.create_subprocess_exec(
+        "tmux", *args,
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    )
+    out, _ = await proc.communicate()
+    return out.decode() if proc.returncode == 0 else None
+
+
+async def scan() -> list[Row] | None:
+    """agent-scan's rows, or None when the scan failed."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "agent-scan", "--json",
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        return None
+    out, _ = await proc.communicate()
+    if proc.returncode != 0:
+        return None
+    try:
+        rows = json.loads(out)
+    except json.JSONDecodeError:
+        return None
+    return rows if isinstance(rows, list) else None
+
+
+async def panes_here() -> set[str]:
+    """The panes sharing a window with this one."""
+    pane = os.environ.get("TMUX_PANE")
+    if not pane:
+        return set()
+    out = await tmux("list-panes", "-t", pane, "-F", "#{pane_id}")
+    return set(out.split()) if out else set()
+
+
+async def run(*command: str) -> None:
+    proc = await asyncio.create_subprocess_exec(
+        *command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    await proc.wait()
+
+
+class AgentSidebar(App[None]):
+    CSS = """
+    Screen {
+        layout: vertical;
+    }
+    #header {
+        height: 1;
+        padding: 0 1;
+    }
+    #header-rule {
+        height: 1;
+        color: ansi_bright_black;
+    }
+    OptionList {
+        height: 1fr;
+        max-height: 100%;
+        border: none;
+        padding: 0;
+        background: ansi_default;
+        scrollbar-size-vertical: 0;
+        &:focus {
+            border: none;
+            background-tint: transparent;
+        }
+        & > .option-list--option {
+            padding: 0 1 0 0;
+        }
+        & > .option-list--option-highlighted,
+        &:focus > .option-list--option-highlighted {
+            color: ansi_default;
+            background: $cursor;
+            text-style: none;
+        }
+        & > .option-list--option-disabled {
+            color: ansi_default;
+        }
+        & > .option-list--separator {
+            color: ansi_bright_black;
+        }
+    }
+    #empty {
+        height: 1fr;
+        padding: 1 1;
+        color: ansi_bright_black;
+    }
+    #footer {
+        height: 1;
+        padding: 0 1;
+        color: ansi_bright_black;
+    }
+    """
+
+    BINDINGS = [
+        Binding("j", "cursor('down')", "down", show=False),
+        Binding("k", "cursor('up')", "up", show=False),
+        Binding("escape", "back", "back"),
+        Binding("r", "rescan", "rescan"),
+        Binding("q", "close", "close"),
+    ]
+
+    def __init__(
+        self,
+        scan: Callable[[], Awaitable[list[Row] | None]] = scan,
+        panes_here: Callable[[], Awaitable[set[str]]] = panes_here,
+        run: Callable[..., Awaitable[None]] = run,
+    ) -> None:
+        super().__init__(ansi_color=True)
+        self._scan = scan
+        self._panes_here = panes_here
+        self._run = run
+        self._wake = asyncio.Event()
+        self._shown: tuple[str, frozenset[str]] | None = None
+        self._rows: list[Row] = []
+
+    def get_css_variables(self) -> dict[str, str]:
+        # catppuccin mocha's surface0, the theme the terminal and tmux use.
+        # No palette colour is that quiet: bright black under a muted
+        # message leaves it unreadable.
+        return super().get_css_variables() | {"cursor": "#313244"}
+
+    def compose(self) -> ComposeResult:
+        yield Static(id="header")
+        yield Static("─" * 200, id="header-rule")
+        yield OptionList(id="agents")
+        yield Static("No agents running", id="empty")
+        yield Static(id="footer")
+
+    def on_mount(self) -> None:
+        self.query_one("#agents").display = False
+        self.query_one("#empty").display = False
+        self.show_header([], ok=True)
+        self.run_worker(self.poll(), exclusive=True)
+
+    async def poll(self) -> None:
+        while True:
+            await self.rescan()
+            self._wake.clear()
+            try:
+                await asyncio.wait_for(self._wake.wait(), SCAN_INTERVAL)
+            except TimeoutError:
+                pass
+
+    async def rescan(self) -> None:
+        rows, here = await asyncio.gather(self._scan(), self._panes_here())
+        if rows is None:
+            # Keep what is on screen; a list that blinks empty on one bad
+            # scan is worse than one that is a second old.
+            self.show_header(self._rows, ok=False)
+            return
+        self._rows = rows
+        self.show_header(rows, ok=True)
+        self.show_rows(rows, here)
+
+    def show_header(self, rows: list[Row], ok: bool) -> None:
+        title = Table.grid(expand=True)
+        title.add_column(ratio=1, no_wrap=True)
+        title.add_column(justify="right", no_wrap=True)
+        title.add_row(Text("Agents", style="bold"), summary(rows))
+        self.query_one("#header", Static).update(title)
+        hints = "⏎ jump  esc back  q close"
+        self.query_one("#footer", Static).update(
+            hints if ok else Text("scan failed, retrying", style="yellow")
+        )
+
+    def show_rows(self, rows: list[Row], here: set[str]) -> None:
+        key = (json.dumps(rows, sort_keys=True), frozenset(here))
+        if key == self._shown:
+            return
+        first = self._shown is None
+        self._shown = key
+
+        agents = self.query_one("#agents", OptionList)
+        agents.display = bool(rows)
+        self.query_one("#empty").display = not rows
+
+        previous = agents.highlighted_option
+        options: list[Option | None] = []
+        for index, (project, group) in enumerate(group_by_project(rows)):
+            if index:
+                options.append(None)
+            options.append(Option(
+                project_prompt(project, len(group)),
+                id=PROJECT_PREFIX + project,
+                disabled=True,
+            ))
+            options.extend(
+                Option(agent_prompt(row, row["pane_id"] in here),
+                       id=row["pane_id"])
+                for row in group
+            )
+        agents.set_options(options)
+
+        ids = [row["pane_id"] for row in rows]
+        # The same agent stays under the cursor as rows reorder. On the first
+        # scan there is nothing to keep, so start on where you already are.
+        target = previous.id if previous is not None and not first else None
+        if target not in ids:
+            target = next((i for i in ids if i in here), ids[0] if ids else None)
+        if target is not None:
+            agents.highlighted = agents.get_option_index(target)
+
+    def on_option_list_option_selected(
+        self, event: OptionList.OptionSelected,
+    ) -> None:
+        pane = event.option.id
+        if pane and not pane.startswith(PROJECT_PREFIX):
+            # switch-client to a pane lands on its session, window and the
+            # pane itself; the sidebar follows through tmux's hooks.
+            self.run_worker(self._run("tmux", "switch-client", "-t", pane))
+
+    def action_cursor(self, direction: str) -> None:
+        agents = self.query_one("#agents", OptionList)
+        if direction == "down":
+            agents.action_cursor_down()
+        else:
+            agents.action_cursor_up()
+
+    def action_rescan(self) -> None:
+        self._wake.set()
+
+    async def action_back(self) -> None:
+        pane = os.environ.get("TMUX_PANE", "")
+        await self._run(
+            "sh", "-c",
+            'tmux last-pane 2>/dev/null || tmux select-pane -R -t "$1"',
+            "sh", pane,
+        )
+
+    async def action_close(self) -> None:
+        await self._run("agent-sidebar-tmux", "close")
+
+
+if __name__ == "__main__":
+    AgentSidebar().run()

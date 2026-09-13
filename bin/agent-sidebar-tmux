@@ -1,0 +1,227 @@
+#!/usr/bin/env bash
+# agent-sidebar-tmux - keep one agent-sidebar pane down the left of the
+# window you are looking at.
+#
+# tmux has no sidebar, only panes, and a pane lives in exactly one window.
+# So there is one sidebar pane, and whenever the window you are looking at
+# changes, a hook moves that pane into it with join-pane. The process keeps
+# running; only the window around it changes.
+#
+# Usage: agent-sidebar-tmux toggle | close | follow | prune-resurrect FILE
+#
+#   toggle           show the sidebar in this window, or close it if it is
+#                    already here (M-2)
+#   close            close it until the next toggle
+#   follow           move it into the window you are looking at (hooks)
+#   prune-resurrect  drop it from a tmux-resurrect save file
+#
+# Whether the sidebar is wanted is the global @agent-sidebar-open option.
+# The pane itself carries the pane option @agent-sidebar. Keeping the two
+# apart is what lets follow bring a fresh sidebar back after the old one
+# died with a window you killed.
+
+set -euo pipefail
+
+readonly width="${AGENT_SIDEBAR_WIDTH:-36}"
+readonly sidebar_command="${AGENT_SIDEBAR_COMMAND:-agent-sidebar}"
+# resurrect saves panes with their title, which is how prune-resurrect
+# recognises this one.
+readonly title="agent-sidebar"
+
+usage() {
+    sed -n '2,/^$/s/^# \{0,1\}//p' "$0"
+}
+
+# The sidebar's pane id, or nothing.
+sidebar_pane() {
+    tmux list-panes -a -F '#{pane_id} #{@agent-sidebar}' |
+        awk '$2 == "1" { print $1; exit }'
+}
+
+# Whether a client process was started by the tmux server itself. A popup
+# that attaches a nested client (M-3) is a client too, and it is the most
+# recently active one while it is open, but you are looking through the
+# client underneath it.
+spawned_by_server() {
+    local pid="$1" server_pid="$2" _
+    for _ in 1 2 3 4; do
+        pid="$(ps -o ppid= -p "${pid}" 2>/dev/null | tr -d ' ')"
+        if [[ -z "${pid}" || "${pid}" -le 1 ]]; then
+            return 1
+        fi
+        if [[ "${pid}" == "${server_pid}" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# "<window_id> <zoomed>" for the window you are looking at, or nothing when
+# no client is attached.
+#
+# Asked of the client rather than taken from the hook's own format: in
+# hooks such as pane-exited, #{window_id} names whatever window tmux picks
+# as current, which is not necessarily the one on screen.
+viewed_window() {
+    local server_pid pid window zoomed
+    local -a clients
+    local client
+    server_pid="$(tmux display-message -p '#{pid}')"
+    mapfile -t clients < <(
+        tmux list-clients -F \
+            '#{client_activity} #{client_pid} #{window_id} #{window_zoomed_flag}' |
+            sort -rn
+    )
+    for client in "${clients[@]}"; do
+        read -r _ pid window zoomed <<<"${client}"
+        if spawned_by_server "${pid}" "${server_pid}"; then
+            continue
+        fi
+        echo "${window} ${zoomed}"
+        return 0
+    done
+}
+
+# Start a sidebar in a window without focusing it; print its pane id.
+#
+# COLORTERM because tmux does not set it, and without it textual rounds its
+# colours to the 256 palette: the cursor row's quiet surface turns grey.
+# tmux converts true colour for any terminal that lacks it, so it is safe.
+open_in() {
+    local window="$1" pane
+    pane="$(tmux split-window -hbf -l "${width}" -d -t "${window}" \
+        -e COLORTERM=truecolor -P -F '#{pane_id}' "${sidebar_command}")"
+    tmux set-option -p -t "${pane}" @agent-sidebar 1 \; \
+        select-pane -t "${pane}" -T "${title}"
+    echo "${pane}"
+}
+
+follow() {
+    if [[ "$(tmux show-options -gqv @agent-sidebar-open)" != 1 ]]; then
+        return 0
+    fi
+    local viewed window zoomed pane home panes pane_width
+    viewed="$(viewed_window)"
+    if [[ -z "${viewed}" ]]; then
+        return 0
+    fi
+    read -r window zoomed <<<"${viewed}"
+    pane="$(sidebar_pane)"
+
+    if [[ -n "${pane}" ]]; then
+        read -r home panes pane_width <<<"$(tmux display-message -p \
+            -t "${pane}" '#{window_id} #{window_panes} #{pane_width}')"
+        if ((panes == 1)); then
+            # Everything it sat beside is gone and it is all that keeps the
+            # window open. Letting the window go moves you somewhere else,
+            # so ask again where that is.
+            tmux kill-pane -t "${pane}"
+            pane=""
+            viewed="$(viewed_window)"
+            if [[ -z "${viewed}" ]]; then
+                return 0
+            fi
+            read -r window zoomed <<<"${viewed}"
+        fi
+    fi
+
+    # A zoomed window is showing one pane on purpose. Joining it would undo
+    # the zoom; unzooming fires a hook that brings the sidebar in then.
+    if [[ "${zoomed}" == 1 ]]; then
+        return 0
+    fi
+    if [[ -z "${pane}" ]]; then
+        open_in "${window}" >/dev/null
+    elif [[ "${home}" != "${window}" ]]; then
+        tmux join-pane -hbf -l "${width}" -d -s "${pane}" -t "${window}"
+    elif ((pane_width != width)); then
+        # A layout change or a resized terminal spread the columns out
+        # again. Only when it is off: resize-pane fires the very hooks that
+        # run this.
+        tmux resize-pane -t "${pane}" -x "${width}"
+    fi
+}
+
+toggle() {
+    local viewed window zoomed pane home
+    viewed="$(viewed_window)"
+    if [[ -z "${viewed}" ]]; then
+        return 0
+    fi
+    read -r window zoomed <<<"${viewed}"
+    pane="$(sidebar_pane)"
+    home=""
+    if [[ -n "${pane}" ]]; then
+        home="$(tmux display-message -p -t "${pane}" '#{window_id}')"
+    fi
+
+    if [[ "${home}" == "${window}" && "${zoomed}" != 1 ]]; then
+        close
+        return 0
+    fi
+    tmux set-option -g @agent-sidebar-open 1
+    if [[ "${home}" == "${window}" ]]; then
+        # Here, but hidden behind a zoomed pane: pressing M-2 means you
+        # want to see it.
+        tmux resize-pane -Z -t "${window}"
+    elif [[ -n "${pane}" ]]; then
+        tmux join-pane -hbf -l "${width}" -d -s "${pane}" -t "${window}"
+    else
+        pane="$(open_in "${window}")"
+    fi
+    tmux select-pane -t "${pane}"
+}
+
+close() {
+    local pane
+    tmux set-option -gu @agent-sidebar-open
+    pane="$(sidebar_pane)"
+    if [[ -n "${pane}" ]]; then
+        tmux kill-pane -t "${pane}"
+    fi
+}
+
+# Restoring a saved sidebar would bring back a plain shell squeezed into
+# its slot, because resurrect restores commands, not what they were for.
+# resurrect hands this hook the file it has just written.
+prune_resurrect() {
+    local file="$1"
+    awk -F '\t' -v title="${title}" '!($1 == "pane" && $7 == title)' \
+        "${file}" >"${file}.agent-sidebar"
+    mv "${file}.agent-sidebar" "${file}"
+}
+
+# Hooks fire in bursts - one window change is several events - and two runs
+# that each see no sidebar would each open one.
+locked() {
+    local socket lock
+    socket="${TMUX%%,*}"
+    lock="${TMPDIR:-/tmp}/agent-sidebar-$(id -u)-$(basename "${socket:-default}").lock"
+    exec 9>"${lock}"
+    flock -w 5 9
+    "$@"
+}
+
+main() {
+    case "${1:-}" in
+    toggle | close | follow)
+        locked "$1"
+        ;;
+    prune-resurrect)
+        if [[ $# -ne 2 ]]; then
+            usage >&2
+            exit 2
+        fi
+        prune_resurrect "$2"
+        ;;
+    -h | --help | help)
+        usage
+        ;;
+    *)
+        usage >&2
+        exit 2
+        ;;
+    esac
+}
+
+main "$@"
