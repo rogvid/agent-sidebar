@@ -29,7 +29,7 @@ pane that handed its turn back a minute ago sits above the one that
 finished an hour ago, and a pane whose clock the screen does not record
 sinks to the bottom of its state. Read top-down, the list is a queue.
 
-Usage: agent-scan [scan] [--no-color]
+Usage: agent-scan [scan] [--no-color | --json]
 
 Output columns: project, branch, session:window.pane, a warning flag,
 state, agent, context, how long the pane has been in its current state,
@@ -45,17 +45,22 @@ are not supported there.
 
 The warning flag marks a pane sharing a working directory with another
 agent pane: two agents editing one tree overwrite each other silently.
+
+--json prints the same rows, in the same order, as a JSON list of objects
+for tools that lay them out themselves (agent-sidebar). Nothing is cut
+short there, and each row also carries the pane's tmux id.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
 import sys
 import time
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 import psutil
@@ -292,7 +297,8 @@ def capture_pane(pane_id: str) -> str:
 NO_GIT = "no git"
 # Project and branch are for reading, not addressing - the target is what
 # television attaches by - so a long one is cut rather than allowed to push
-# the state column off the popup.
+# the state column off the popup. The cut happens when a row is rendered,
+# so --json consumers group and cut by the real names.
 IDENTITY_MAX = 24
 
 
@@ -878,6 +884,9 @@ class Row:
     project: str
     branch: str
     target: str
+    # tmux's own id for the pane (`%12`). Unlike the target it survives
+    # windows being renumbered, so it is what a tool acts on.
+    pane_id: str
     agent: str
     context: str
     duration: str
@@ -934,9 +943,10 @@ def collect_rows() -> list[Row]:
         project, branch = identities[pane.cwd]
         rows.append(Row(
             state=state,
-            project=fit(project, IDENTITY_MAX),
-            branch=fit(branch, IDENTITY_MAX),
+            project=project,
+            branch=branch,
             target=pane.target,
+            pane_id=pane.pane_id,
             agent=agent.name,
             context=parse_context(lines),
             duration=state_duration(state, since),
@@ -955,6 +965,15 @@ def collect_rows() -> list[Row]:
 def render(rows: list[Row], color: bool) -> list[str]:
     def paint(text: str, code: str) -> str:
         return f"{code}{text}{RESET}" if color else text
+
+    rows = [
+        replace(
+            r,
+            project=fit(r.project, IDENTITY_MAX),
+            branch=fit(r.branch, IDENTITY_MAX),
+        )
+        for r in rows
+    ]
 
     def width(field: str) -> int:
         return max(len(getattr(r, field)) for r in rows)
@@ -1009,8 +1028,17 @@ def render(rows: list[Row], color: bool) -> list[str]:
     return out
 
 
-def cmd_scan(color: bool) -> int:
+def render_json(rows: list[Row]) -> str:
+    return json.dumps([asdict(r) for r in rows], ensure_ascii=False)
+
+
+def cmd_scan(color: bool, as_json: bool = False) -> int:
     rows = collect_rows()
+    if as_json:
+        # Always a list, even an empty one: a consumer polling this wants
+        # "no agents" as data, not as a message on stderr.
+        print(render_json(rows))
+        return 0
     if not rows:
         # stderr so consumers parsing stdout see an empty list, not a row.
         print("no agents running in tmux", file=sys.stderr)
@@ -1025,7 +1053,8 @@ def cmd_scan(color: bool) -> int:
 def main() -> int:
     args = [a for a in sys.argv[1:] if a != "scan"]
     color = "--no-color" not in args and not os.environ.get("NO_COLOR")
-    args = [a for a in args if a != "--no-color"]
+    as_json = "--json" in args
+    args = [a for a in args if a not in ("--no-color", "--json")]
 
     if args and args[0] in ("-h", "--help", "help"):
         assert __doc__
@@ -1033,9 +1062,9 @@ def main() -> int:
         return 0
     if args:
         print(f"Unknown argument: {args[0]}", file=sys.stderr)
-        print("Usage: agent-scan [scan] [--no-color]", file=sys.stderr)
+        print("Usage: agent-scan [scan] [--no-color | --json]", file=sys.stderr)
         return 2
-    return cmd_scan(color)
+    return cmd_scan(color, as_json)
 
 
 if __name__ == "__main__":

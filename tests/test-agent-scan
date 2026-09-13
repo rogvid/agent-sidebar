@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
+import json
 import os
 import re
 import subprocess
@@ -463,7 +464,7 @@ def row(**overrides):
     """A Row with every field filled, for exercising the renderer."""
     fields = dict(
         state="done", project="koyr", branch="main", target="s:1.0",
-        agent="claude", context="10.0k",
+        pane_id="%1", agent="claude", context="10.0k",
         duration="5m", since=300.0, block="1h", weekly="-", age="2h",
         message="hello", flag=" ",
     )
@@ -678,6 +679,32 @@ def main() -> int:
     print(f"{'ok  ' if ok else 'FAIL'}  columns  {'project, branch, target':36} "
           f"{'ok' if ok else f'got={line!r}'}")
 
+    # Rendering cuts long names so the columns fit the popup; --json hands
+    # the real ones on, so a consumer never groups two projects together
+    # because they happen to share a prefix.
+    long_project = "gpt-core-prototype-improve-file-parsing"
+    long = row(project=long_project, pane_id="%42")
+    line = mod.render([long], color=False)[0]
+    ok = line.split()[1] == mod.fit(long_project, mod.IDENTITY_MAX)
+    failures += not ok
+    print(f"{'ok  ' if ok else 'FAIL'}  render   {'long project is cut':36} "
+          f"{'ok' if ok else f'got={line!r}'}")
+
+    decoded = json.loads(mod.render_json([long, row()]))
+    ok = (
+        [r["pane_id"] for r in decoded] == ["%42", "%1"]
+        and decoded[0]["project"] == long_project
+        and decoded[0]["since"] == 300.0
+    )
+    failures += not ok
+    print(f"{'ok  ' if ok else 'FAIL'}  json     {'rows in order, names uncut':36} "
+          f"{'ok' if ok else f'got={decoded!r}'}")
+
+    ok = json.loads(mod.render_json([])) == []
+    failures += not ok
+    print(f"{'ok  ' if ok else 'FAIL'}  json     {'no agents is an empty list':36} "
+          f"{'ok' if ok else 'got something else'}")
+
     pattern = channel_target_pattern()
     for name, overrides, want in TARGET_CASES:
         colored = mod.render([row(**overrides)], color=True)[0]
@@ -701,7 +728,7 @@ def main() -> int:
              + len(WEEKLY_COLOR_CASES) + len(SORT_CASES)
              + len(COLLAPSE_CASES) + len(PROJECT_CASES)
              + len(IDENTITY_CASES) + len(FIT_CASES) + 1
-             + len(TARGET_CASES) + 1)
+             + len(TARGET_CASES) + 1 + 3)
     print(f"\n{total - failures}/{total} passed")
     return 1 if failures else 0
 
