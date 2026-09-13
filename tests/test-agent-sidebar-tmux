@@ -49,6 +49,10 @@ cat >"${scratch}/bin/tuicr" <<'EOF'
 #!/bin/sh
 echo "1. f.txt:~2 - rename B to b"
 EOF
+cat >"${scratch}/bin/tv" <<EOF
+#!/bin/sh
+echo "\$*" >"${scratch}/tv-args"
+EOF
 chmod +x "${scratch}/bin/"*
 
 # A pre-commit hook hands down GIT_INDEX_FILE and friends, which would aim
@@ -226,6 +230,9 @@ check "then the agent's pane" not pane_alive "${wt_agent}"
 
 act kill "${main_agent}"
 check "kill kills the pane" not pane_alive "${main_agent}"
+
+act open
+check "open picks from the projects channel" equals "cat ${scratch}/tv-args" projects
 
 printf '\n%s/%s passed\n' "$((total - failures))" "${total}"
 ((failures == 0))

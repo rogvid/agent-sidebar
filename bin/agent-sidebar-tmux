@@ -27,7 +27,8 @@
 #   kill PANE                kill PANE
 #   remove-worktree PANE     remove PANE's worktree (git-wt-remove asks
 #                            first), then PANE
-#   open                     pick a project or session to open (tv sesh)
+#   open                     pick a git repository to open in its own
+#                            session (tv projects)
 #
 # Whether the sidebar is wanted is the global @agent-sidebar-open option.
 # The pane itself carries the pane option @agent-sidebar. Keeping the two
@@ -267,9 +268,9 @@ new_worktree() {
     if [[ -z "${path}" ]]; then
         return 0
     fi
-    # Named the way tmux-sessionizer and sesh name a folder's session, so
-    # opening the worktree through either later lands in this one.
-    session="$(basename "${path}" | tr . _)"
+    # Named the way tmux-sessionizer names a folder's session, so opening
+    # the worktree through it later (or `o`) lands in this one.
+    session="$(basename "${path}" | tr .: __)"
     if ! tmux has-session -t "=${session}" 2>/dev/null; then
         tmux new-session -d -s "${session}" -c "${path}"
         # Typed into the shell rather than run as the session's command, so
@@ -339,7 +340,8 @@ worktree_remove() {
 }
 
 open_project() {
-    tmux display-popup -E -d "${HOME}" -w 80% -h 70% -T Sessions tv sesh || true
+    tmux display-popup -E -d "${HOME}" -w 80% -h 70% -T Projects tv projects ||
+        true
 }
 
 # Hooks fire in bursts - one window change is several events - and two runs

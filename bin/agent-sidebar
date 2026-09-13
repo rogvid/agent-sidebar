@@ -98,7 +98,7 @@ ACTIONS = (
     Action("new_worktree", "n", "n", "New worktree",
            "Branch the project into a worktree with its own session and agent"),
     Action("open", "o", "o", "Open project",
-           "Pick a project or session to open"),
+           "Pick a git repository to open in its own session"),
     Action("review", "d", "d", "Review changes",
            "Review uncommitted changes in tuicr; y pastes comments to the agent"),
     Action("git", "g", "g", "Git", "lazygit in the agent's directory"),
