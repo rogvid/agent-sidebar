@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# Checks for git-projects: which directories count as projects, and their
+# order.
+#
+# Run: scripts/tests/test-git-projects     (or `mise run test`)
+
+set -euo pipefail
+
+repo="$(cd "$(dirname "$0")/../.." && pwd)"
+readonly repo
+scratch="$(mktemp -d)"
+readonly scratch
+trap 'rm -rf "${scratch}"' EXIT
+
+# A pre-commit hook hands down GIT_INDEX_FILE and friends, which would aim
+# the git calls below at this repository.
+while IFS= read -r var; do unset "${var}"; done < <(env | awk -F= '/^GIT_/ { print $1 }')
+export GIT_CEILING_DIRECTORIES="${scratch}"
+
+g() {
+    git -c user.name=t -c user.email=t@t -c commit.gpgsign=false "$@"
+}
+
+# A repository with one commit, so it has a logs/HEAD, dated at $2.
+project() {
+    g init -q -b main "$1"
+    g -C "$1" commit -q --allow-empty --no-verify -m init
+    touch -d "$2" "$1/.git/logs/HEAD"
+}
+
+root="${scratch}/home"
+project "${root}/projects/older" "2024-01-01"
+project "${root}/projects/newest" "2026-01-01"
+project "${root}/projects/with space" "2025-01-01"
+project "${root}/projects/newest/vendor/nested" "2023-01-01"
+g -C "${root}/projects/older" worktree add -q "${root}/worktrees/older-feat" -b feat
+project "${root}/.oh-my-zsh/custom/plugins/tool" "2026-06-01"
+project "${root}/projects/web/node_modules/pkg" "2026-06-01"
+g init -q -b main "${root}/projects/fresh"
+touch -d "2022-01-01" "${root}/projects/fresh/.git"
+mkdir -p "${root}/projects/plain"
+project "${scratch}/.hidden-root/inside" "2026-01-01"
+
+list="$(PATH="${repo}/scripts/.local/bin:${PATH}" git-projects "${root}")"
+
+failures=0
+total=0
+check() {
+    local name="$1"
+    shift
+    total=$((total + 1))
+    if "$@"; then
+        printf 'ok    %s\n' "${name}"
+    else
+        printf 'FAIL  %s\n' "${name}"
+        failures=$((failures + 1))
+    fi
+}
+listed() { grep -qxF "$1" <<<"${list}"; }
+not() { ! "$@"; }
+
+check "a main checkout is a project" listed "${root}/projects/older"
+check "a path with a space is listed whole" listed "${root}/projects/with space"
+check "a repository nested in another is its own project" \
+    listed "${root}/projects/newest/vendor/nested"
+check "a repository with no commits yet is a project" listed "${root}/projects/fresh"
+check "a worktree is not" not listed "${root}/worktrees/older-feat"
+check "nothing under a hidden directory is" \
+    not listed "${root}/.oh-my-zsh/custom/plugins/tool"
+check "nothing under node_modules is" not listed "${root}/projects/web/node_modules/pkg"
+check "a folder that is not a repository is not" not listed "${root}/projects/plain"
+
+want="$(printf '%s\n' \
+    "${root}/projects/newest" \
+    "${root}/projects/with space" \
+    "${root}/projects/older" \
+    "${root}/projects/newest/vendor/nested" \
+    "${root}/projects/fresh")"
+same_order() { [[ "${list}" == "${want}" ]]; }
+check "most recently used first" same_order
+
+hidden_root="$(PATH="${repo}/scripts/.local/bin:${PATH}" git-projects "${scratch}/.hidden-root")"
+check "a hidden root asked for by name is searched" \
+    [ "${hidden_root}" == "${scratch}/.hidden-root/inside" ]
+
+printf '\n%s/%s passed\n' "$((total - failures))" "${total}"
+((failures == 0))

@@ -1,0 +1,25 @@
+[metadata]
+name = "projects"
+description = "Open a git repository in its own tmux session, most recently used first"
+requirements = ["git-projects", "tmux-sessionizer"]
+
+[source]
+command = "git-projects"
+# git-projects lists what you used last first; keep that order among the
+# matches instead of re-ranking by match score.
+no_sort = true
+
+[preview]
+# Preview commands get the entry as it is, so it is quoted here. Actions get
+# it shell-quoted already; quoting it again there splits a path at a space.
+command = "git -C '{}' log --color=always --oneline --decorate -20 && echo && git -C '{}' -c color.status=always status --short --branch"
+
+[keybindings]
+enter = "actions:open"
+
+[actions.open]
+description = "Switch to the project's tmux session, starting one if needed"
+# tmux-sessionizer names the session after the folder, as the agent
+# sidebar's new worktrees do, so a project opened either way is one session.
+command = "tmux-sessionizer {}"
+mode = "execute"
