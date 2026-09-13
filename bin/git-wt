@@ -1,0 +1,1239 @@
+#!/usr/bin/env -S uv run --script
+# vim: set ft=python:
+# -*- mode: python -*-
+# language: python
+# /// script
+# requires-python = ">=3.13"
+# dependencies = []
+# ///
+"""git-wt - one worktree per branch, laid out per project, set up and
+cleaned up without losing work.
+
+Usage: git-wt <command> [options]
+
+Commands:
+  add [-b BASE] [-t] BRANCH     create a worktree for BRANCH and set it up
+  list [-v] [--no-fetch]        list worktrees with their merge and work state
+  switch [-t] [TARGET]          go to a worktree (its tmux session in tmux)
+  remove [-f] [-d] [--discard] [--no-fetch] [TARGET]
+                                remove a worktree, refusing to lose work
+  prune [-f] [-d] [--dry-run] [--no-fetch]
+                                remove every worktree whose branch is merged
+  bootstrap [--index] [PATH]    copy and link local files into a worktree
+  claude-hook                   Claude Code's WorktreeCreate hook
+
+`git-wt <command> --help` describes a command. git-wt-add, git-wt-list,
+git-wt-switch, git-wt-remove, git-wt-prune, git-wt-bootstrap and
+claude-worktree-create run the matching command.
+
+Layout: a repository at <root>/projects/<repo> gets its worktrees at
+<root>/worktrees/<repo>-<branch>, the branch folded to lowercase letters,
+digits and dashes. A worktree's tmux session is named after its folder.
+
+Merged: a branch counts as merged into origin's main branch when its own
+commits are there, whether they got there by a merge, a fast-forward, a
+rebase or a squash, or when GitHub has merged a pull request for exactly
+its current commit. A branch that never had a commit of its own is never
+merged, so a fresh worktree is never pruned.
+
+Work: uncommitted changes and untracked files are what removing a worktree
+would lose; git-wt refuses to remove them without --discard. Commits stay
+on the branch, so they never block removing the worktree, and only a merged
+branch is ever deleted.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import unicodedata
+from dataclasses import dataclass
+from functools import cached_property
+from pathlib import Path
+
+GLOB_CHARS = re.compile(r"[*?\[]")
+# Reflog subjects of a branch getting commits of its own, as opposed to
+# being created, reset or renamed.
+OWN_COMMIT_RE = re.compile(r"^(commit|merge|rebase|cherry-pick|pull|am|revert)\b")
+MISE_CONFIGS = (
+    "mise.toml", ".mise.toml", "mise.local.toml", ".mise.local.toml",
+    ".config/mise.toml", ".config/mise/config.toml", ".mise/config.toml",
+    "mise/config.toml",
+)
+MISE_TASK_DIRS = (
+    "mise-tasks", ".mise-tasks", "mise/tasks", ".mise/tasks",
+    ".config/mise/tasks",
+)
+EXCLUDE_MARKER = "# git-wt: paths linked into worktrees by .worktreelink"
+
+
+class Fail(Exception):
+    """Something the user needs to hear about; exit 1."""
+
+
+# --- output ---
+
+def colour(text: str, code: str, stream=None) -> str:
+    stream = stream or sys.stdout
+    if stream.isatty() and not os.environ.get("NO_COLOR"):
+        return f"\033[{code}m{text}\033[0m"
+    return text
+
+
+def green(text: str) -> str:
+    return colour(text, "32")
+
+
+def blue(text: str) -> str:
+    return colour(text, "34")
+
+
+def yellow(text: str) -> str:
+    return colour(text, "33")
+
+
+def red(text: str) -> str:
+    return colour(text, "31")
+
+
+def dim(text: str) -> str:
+    return colour(text, "2")
+
+
+def bold(text: str) -> str:
+    return colour(text, "1")
+
+
+def say(text: str = "") -> None:
+    print(text, flush=True)
+
+
+def warn(text: str) -> None:
+    print(colour(text, "33", sys.stderr), file=sys.stderr, flush=True)
+
+
+# --- processes ---
+
+def run(
+    command: list[str], cwd: Path | None = None, check: bool = True,
+    input: str | None = None, env: dict[str, str] | None = None,
+    timeout: float | None = None,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        result = subprocess.run(
+            command, cwd=cwd, input=input, env=env, timeout=timeout,
+            capture_output=True, text=True,
+        )
+    except FileNotFoundError as error:
+        raise Fail(f"{command[0]} is not installed") from error
+    except subprocess.TimeoutExpired as error:
+        raise Fail(f"{' '.join(command)} timed out") from error
+    if check and result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise Fail(detail or f"{' '.join(command)} failed")
+    return result
+
+
+def git(*args: str, cwd: Path, check: bool = True) -> str:
+    return run(["git", *args], cwd=cwd, check=check).stdout
+
+
+def git_ok(*args: str, cwd: Path) -> bool:
+    return run(["git", *args], cwd=cwd, check=False).returncode == 0
+
+
+def stream(command: list[str], cwd: Path) -> int:
+    """Run with its output going straight to ours, so git's own messages
+    show; returns the exit code."""
+    sys.stdout.flush()
+    return subprocess.run(
+        command, cwd=cwd, stdout=sys.stdout, stderr=sys.stderr,
+    ).returncode
+
+
+def current_dir() -> Path:
+    try:
+        return Path.cwd()
+    except FileNotFoundError as error:
+        raise Fail("the current directory no longer exists") from error
+
+
+def same_path(a: Path, b: Path) -> bool:
+    return os.path.realpath(a) == os.path.realpath(b)
+
+
+def inside(path: Path, parent: Path) -> bool:
+    real, top = os.path.realpath(path), os.path.realpath(parent)
+    return real == top or real.startswith(top + os.sep)
+
+
+# --- names ---
+
+def slug(branch: str) -> str:
+    folded = unicodedata.normalize("NFKD", branch)
+    ascii_only = folded.encode("ascii", "ignore").decode().lower()
+    return re.sub(r"[^a-z0-9]+", "-", ascii_only).strip("-")
+
+
+def session_name(path: Path) -> str:
+    # tmux reads `.` and `:` in a target as window and pane separators.
+    return path.name.translate(str.maketrans(".:", "__"))
+
+
+# --- repository ---
+
+@dataclass
+class Worktree:
+    path: Path
+    head: str
+    branch: str | None
+    locked: str | None
+    prunable: bool
+    is_main: bool
+
+    @property
+    def name(self) -> str:
+        return self.path.name
+
+    @property
+    def label(self) -> str:
+        return self.branch or f"(detached {self.head[:8]})"
+
+    @property
+    def missing(self) -> bool:
+        return self.prunable or not self.path.is_dir()
+
+
+@dataclass
+class Work:
+    changes: list[str]
+    unpushed: int
+    unreachable: int
+
+    @property
+    def at_risk(self) -> bool:
+        return bool(self.changes) or self.unreachable > 0
+
+
+class Repo:
+    def __init__(self, main: Path, common: Path) -> None:
+        self.main = main
+        self.common = common
+
+    @classmethod
+    def at(cls, start: Path) -> Repo:
+        result = run(
+            ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            cwd=start, check=False,
+        )
+        if result.returncode != 0:
+            raise Fail(f"Not in a git repository: {start}")
+        common = Path(result.stdout.strip())
+        # A bare repository or a submodule keeps its git dir elsewhere, and
+        # has no main checkout to hang worktrees off.
+        if common.name != ".git":
+            raise Fail(f"Unsupported repository layout: {common} is not a .git directory")
+        return cls(common.parent, common)
+
+    def git(self, *args: str, check: bool = True) -> str:
+        return git(*args, cwd=self.main, check=check)
+
+    def ok(self, *args: str) -> bool:
+        return git_ok(*args, cwd=self.main)
+
+    def ref_exists(self, ref: str) -> bool:
+        return self.ok("show-ref", "--verify", "--quiet", ref)
+
+    @cached_property
+    def main_branch(self) -> str:
+        configured = self.git("config", "--get", "worktree.mainBranch", check=False).strip()
+        if configured:
+            return configured
+        origin_head = self.git(
+            "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD",
+            check=False,
+        ).strip()
+        if origin_head.startswith("origin/"):
+            return origin_head.removeprefix("origin/")
+        for name in ("main", "master", "trunk"):
+            if (self.ref_exists(f"refs/heads/{name}")
+                    or self.ref_exists(f"refs/remotes/origin/{name}")):
+                return name
+        raise Fail(
+            "Could not tell the main branch; set it with: "
+            "git config worktree.mainBranch <branch>"
+        )
+
+    @cached_property
+    def target(self) -> str:
+        """What merged means merged into: origin's main branch if known."""
+        if self.ref_exists(f"refs/remotes/origin/{self.main_branch}"):
+            return f"origin/{self.main_branch}"
+        if self.ref_exists(f"refs/heads/{self.main_branch}"):
+            return self.main_branch
+        raise Fail(f"The main branch {self.main_branch} does not exist")
+
+    @cached_property
+    def has_origin(self) -> bool:
+        return self.ok("remote", "get-url", "origin")
+
+    @property
+    def worktrees_root(self) -> Path | None:
+        if self.main.parent.name != "projects":
+            return None
+        return self.main.parent.parent / "worktrees"
+
+    def worktrees(self) -> list[Worktree]:
+        out = self.git("worktree", "list", "--porcelain", "-z")
+        worktrees = []
+        for record in out.split("\0\0"):
+            fields = [f for f in record.split("\0") if f]
+            if not fields or not fields[0].startswith("worktree "):
+                continue
+            path = Path(fields[0].removeprefix("worktree "))
+            head, branch, locked, prunable, bare = "", None, None, False, False
+            for field in fields[1:]:
+                key, _, value = field.partition(" ")
+                if key == "HEAD":
+                    head = value
+                elif key == "branch":
+                    branch = value.removeprefix("refs/heads/")
+                elif key == "locked":
+                    locked = value
+                elif key == "prunable":
+                    prunable = True
+                elif key == "bare":
+                    bare = True
+            if bare:
+                continue
+            worktrees.append(Worktree(
+                path, head, branch, locked, prunable, same_path(path, self.main),
+            ))
+        return worktrees
+
+    def fetch(self) -> None:
+        if not self.has_origin:
+            return
+        result = run(
+            ["git", "fetch", "--quiet", "origin"], cwd=self.main, check=False,
+            timeout=120,
+        )
+        if result.returncode != 0:
+            reason = (result.stderr.strip().splitlines() or ["unknown error"])[0]
+            warn(f"Could not fetch origin ({reason}); using what is already known.")
+
+    def work(self, worktree: Worktree) -> Work:
+        if worktree.missing:
+            return Work([], 0, 0)
+        out = git(
+            "status", "--porcelain=v1", "-z", "--untracked-files=all",
+            cwd=worktree.path,
+        )
+        changes, tokens = [], iter(out.split("\0"))
+        for token in tokens:
+            if not token:
+                continue
+            changes.append(token)
+            # A rename or copy is followed by the path it came from.
+            if token[0] in "RC":
+                next(tokens, None)
+        if worktree.branch:
+            local_main = f"refs/heads/{self.main_branch}"
+            exclude = [local_main] if self.ref_exists(local_main) else []
+            unpushed = self.git(
+                "rev-list", "--count", f"refs/heads/{worktree.branch}",
+                "--not", "--remotes", *exclude,
+            ).strip()
+            return Work(changes, int(unpushed or 0), 0)
+        unreachable = self.git(
+            "rev-list", "--count", worktree.head, "--not", "--branches", "--remotes",
+        ).strip()
+        return Work(changes, 0, int(unreachable or 0))
+
+
+class Merges:
+    """Answers "is this branch merged", fetching and asking GitHub once."""
+
+    def __init__(self, repo: Repo, fetch: bool) -> None:
+        self.repo = repo
+        if fetch:
+            repo.fetch()
+        self._pull_requests: dict[str, list[dict]] | None = None
+
+    def reason(self, branch: str | None) -> str | None:
+        """Why the branch counts as merged, or None when it does not."""
+        repo = self.repo
+        if not branch or branch == repo.main_branch:
+            return None
+        ref = f"refs/heads/{branch}"
+        if not repo.ref_exists(ref):
+            return None
+        target = repo.target
+        tip = repo.git("rev-parse", ref).strip()
+        own = int(repo.git("rev-list", "--count", f"{target}..{ref}").strip())
+        if own == 0:
+            if self._had_own_commits(ref):
+                return f"merged into {target}"
+        else:
+            cherry = repo.git("cherry", target, ref).split()
+            marks = cherry[0::2]
+            # Every commit's change is already there: rebased, cherry-picked,
+            # or a one-commit squash, which git cannot tell apart.
+            if marks and all(mark == "-" for mark in marks):
+                return f"its commits are in {target}"
+            merged_tree = run(
+                ["git", "merge-tree", "--write-tree", target, ref],
+                cwd=repo.main, check=False,
+            )
+            target_tree = repo.git("rev-parse", f"{target}^{{tree}}").strip()
+            lines = merged_tree.stdout.split()
+            if merged_tree.returncode == 0 and lines and lines[0] == target_tree:
+                return f"its changes are in {target}"
+        for pull_request in self.pull_requests().get(branch, []):
+            if pull_request.get("headRefOid") == tip:
+                return f"pull request #{pull_request.get('number')} merged"
+        return None
+
+    def _had_own_commits(self, ref: str) -> bool:
+        subjects = self.repo.git("reflog", "show", "--format=%gs", ref, check=False)
+        return any(OWN_COMMIT_RE.match(line) for line in subjects.splitlines())
+
+    def pull_requests(self) -> dict[str, list[dict]]:
+        if self._pull_requests is not None:
+            return self._pull_requests
+        self._pull_requests = {}
+        if not self.repo.has_origin or not shutil.which("gh"):
+            return self._pull_requests
+        try:
+            result = run(
+                ["gh", "pr", "list", "--state", "merged", "--limit", "500",
+                 "--json", "number,headRefName,headRefOid"],
+                cwd=self.repo.main, check=False, timeout=30,
+            )
+            listed = json.loads(result.stdout) if result.returncode == 0 else []
+        except (Fail, json.JSONDecodeError):
+            listed = []
+        for pull_request in listed if isinstance(listed, list) else []:
+            name = pull_request.get("headRefName")
+            if name:
+                self._pull_requests.setdefault(name, []).append(pull_request)
+        return self._pull_requests
+
+
+# --- tmux ---
+
+def tmux(*args: str) -> subprocess.CompletedProcess[str] | None:
+    if not shutil.which("tmux"):
+        return None
+    return subprocess.run(["tmux", *args], capture_output=True, text=True)
+
+
+def has_session(name: str) -> bool:
+    result = tmux("has-session", "-t", f"={name}")
+    return result is not None and result.returncode == 0
+
+
+def ensure_session(path: Path) -> str:
+    name = session_name(path)
+    if not has_session(name):
+        result = tmux("new-session", "-d", "-s", name, "-c", str(path))
+        if result is None or result.returncode != 0:
+            raise Fail(f"Could not start tmux session {name}")
+    return name
+
+
+def open_session(path: Path) -> None:
+    if not shutil.which("tmux"):
+        raise Fail("tmux is not installed")
+    name = ensure_session(path)
+    verb = "switch-client" if os.environ.get("TMUX") else "attach-session"
+    sys.stdout.flush()
+    os.execvp("tmux", ["tmux", verb, "-t", f"={name}"])
+
+
+def close_session(repo: Repo, worktree: Worktree) -> None:
+    name = session_name(worktree.path)
+    if not has_session(name):
+        return
+    listed = tmux("list-clients", "-t", f"={name}", "-F", "#{client_name}")
+    clients = listed.stdout.split() if listed and listed.returncode == 0 else []
+    if clients:
+        # Somewhere to stand before the floor goes, so nobody is detached.
+        refuge = ensure_session(repo.main)
+        for client in clients:
+            tmux("switch-client", "-c", client, "-t", f"={refuge}")
+    tmux("kill-session", "-t", f"={name}")
+    say(f"Closed tmux session: {name}")
+
+
+# --- picking a worktree ---
+
+def find_worktree(worktrees: list[Worktree], target: str) -> Worktree | None:
+    candidate = Path(target).expanduser()
+    if candidate.exists():
+        real = candidate.resolve()
+        # The deepest worktree containing it: a subdirectory counts, and a
+        # worktree nested in another one's folder wins over its parent.
+        for worktree in sorted(worktrees, key=lambda w: len(str(w.path)), reverse=True):
+            if inside(real, worktree.path):
+                return worktree
+    for worktree in worktrees:
+        if worktree.branch == target:
+            return worktree
+    for worktree in worktrees:
+        if worktree.name == target:
+            return worktree
+    return None
+
+
+def pick_worktree(worktrees: list[Worktree], header: str) -> Worktree:
+    if not shutil.which("fzf"):
+        raise Fail("fzf is needed to pick a worktree; name a branch, folder or path instead")
+    lines = [f"{w.label}  [{w.name}]\t{i}" for i, w in enumerate(worktrees)]
+    result = subprocess.run(
+        ["fzf", "--delimiter=\t", "--with-nth=1", f"--header={header}"],
+        input="\n".join(lines) + "\n", stdout=subprocess.PIPE, text=True,
+    )
+    chosen = result.stdout.strip()
+    if result.returncode != 0 or not chosen:
+        raise Fail("No worktree selected.")
+    return worktrees[int(chosen.rsplit("\t", 1)[-1])]
+
+
+def resolve(worktrees: list[Worktree], target: str | None, header: str) -> Worktree:
+    if target is None:
+        return pick_worktree(worktrees, header)
+    found = find_worktree(worktrees, target)
+    if found is None:
+        available = "\n".join(f"  - {w.label} ({w.name})" for w in worktrees)
+        raise Fail(f"Worktree not found: {target}\nAvailable worktrees:\n{available or '  (none)'}")
+    return found
+
+
+def confirm(question: str) -> bool:
+    print(f"{question} [y/N] ", end="", flush=True)
+    answer = sys.stdin.readline()
+    return answer.strip().lower() in ("y", "yes")
+
+
+# --- bootstrap ---
+
+def read_patterns(path: Path) -> list[str]:
+    """Pattern lines the way Claude Code reads .worktreeinclude: trimmed,
+    without blanks or comments."""
+    if not path.is_file():
+        return []
+    lines = (line.strip() for line in path.read_text().splitlines())
+    return [line for line in lines if line and not line.startswith("#")]
+
+
+class Matcher:
+    """gitignore matching done by git itself, so the syntax is exactly
+    gitignore's. The empty repository keeps the real one's own .gitignore
+    files out of it."""
+
+    def __init__(self, scratch: Path) -> None:
+        self.bare = scratch / "matcher.git"
+        self.tree = scratch / "matcher"
+        self.tree.mkdir()
+        run(["git", "init", "-q", "--bare", str(self.bare)], cwd=scratch)
+
+    def matching(self, patterns: Path, paths: list[str]) -> list[str]:
+        if not paths:
+            return []
+        result = run(
+            ["git", f"--git-dir={self.bare}", f"--work-tree={self.tree}",
+             "-c", f"core.excludesFile={patterns}",
+             "check-ignore", "--no-index", "--stdin", "-z"],
+            cwd=self.tree, check=False, input="\0".join(paths) + "\0",
+        )
+        # 1 only means nothing matched.
+        if result.returncode > 1:
+            raise Fail(result.stderr.strip())
+        return [path for path in result.stdout.split("\0") if path]
+
+
+def reaches(entry: str, patterns: list[str]) -> bool:
+    """Whether a pattern can match inside a wholly ignored directory.
+
+    git lists such a directory as one entry, and looking inside every one
+    (.venv, node_modules) would be slow, so Claude Code only looks where a
+    pattern could reach. This is its rule, kept as it is so one
+    .worktreeinclude copies the same files whichever tool made the worktree.
+    """
+    parts = [part.lower() for part in entry.rstrip("/").split("/")]
+    for pattern in patterns:
+        stem = pattern.removeprefix("/")
+        if stem.startswith(entry):
+            return True
+        prefix = GLOB_CHARS.split(stem, maxsplit=1)[0]
+        if prefix != stem and prefix and entry.startswith(prefix):
+            return True
+        first = stem
+        while first.startswith("**/"):
+            first = first[3:]
+        if first == stem:
+            continue
+        first = first.split("/", 1)[0]
+        name = GLOB_CHARS.split(first, maxsplit=1)[0].replace("\\", "").lower()
+        if not name:
+            continue
+        wild = bool(GLOB_CHARS.search(first))
+        if any(part.startswith(name) if wild else part == name for part in parts):
+            return True
+    return False
+
+
+def worktree_index(worktree: Path, common: Path) -> int:
+    """A small integer that stays with the worktree: the lowest free one
+    from 1. It lives in the worktree's private git dir, so git deletes it
+    with the worktree, which frees the number for the next one."""
+    own = Path(git("rev-parse", "--absolute-git-dir", cwd=worktree).strip()) / "worktree-index"
+    try:
+        existing = own.read_text().strip()
+        if existing.isdigit() and int(existing) > 0:
+            return int(existing)
+    except FileNotFoundError:
+        pass
+    # Claude Code can create several subagent worktrees at once; without
+    # the lock two of them could pick the same number.
+    lock = common / "worktree-index.lock"
+    for _ in range(100):
+        try:
+            lock.mkdir()
+            break
+        except FileExistsError:
+            time.sleep(0.1)
+    else:
+        raise Fail(f"Timed out waiting for {lock}; remove it if no bootstrap is running")
+    try:
+        used = set()
+        for other in (common / "worktrees").glob("*/worktree-index"):
+            if other != own:
+                text = other.read_text().strip()
+                if text.isdigit():
+                    used.add(int(text))
+        index = 1
+        while index in used:
+            index += 1
+        own.write_text(f"{index}\n")
+        return index
+    finally:
+        lock.rmdir()
+
+
+def exclude_links(common: Path, paths: list[str]) -> None:
+    """Keep linked paths out of `git status` everywhere.
+
+    A `data/` pattern only matches a directory, and the link is a file, so
+    without this the link shows as untracked, and committing and merging it
+    would replace main's own data/ with a link to itself. info/exclude is
+    shared by every worktree, and excluding the path in the main checkout
+    too, where it is the real ignored directory, changes nothing there.
+    """
+    exclude = common / "info" / "exclude"
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    lines = exclude.read_text().splitlines() if exclude.exists() else []
+    wanted = [f"/{path}" for path in paths if f"/{path}" not in lines]
+    if not wanted:
+        return
+    if EXCLUDE_MARKER not in lines:
+        wanted.insert(0, EXCLUDE_MARKER)
+    text = "\n".join(lines + wanted) + "\n"
+    exclude.write_text(text)
+
+
+def bootstrap(target: Path, print_index: bool = False) -> int:
+    result = run(["git", "rev-parse", "--show-toplevel"], cwd=target, check=False) \
+        if target.is_dir() else None
+    if result is None or result.returncode != 0:
+        raise Fail(f"Not a git worktree: {target}")
+    worktree = Path(result.stdout.strip())
+    common = Path(git("rev-parse", "--path-format=absolute", "--git-common-dir", cwd=worktree).strip())
+    main = common.parent
+
+    if same_path(worktree, main):
+        if print_index:
+            say("0")
+            return 0
+        raise Fail(f"{worktree} is the main checkout; bootstrap a linked worktree instead")
+    if common.name != ".git":
+        raise Fail(f"Unsupported repository layout: {common} is not a .git directory")
+
+    index = worktree_index(worktree, common)
+    if print_index:
+        say(str(index))
+        return 0
+
+    say(f"Bootstrapping worktree: {worktree.name}")
+    say(f"  Main: {main}")
+    ignored = [e for e in git(
+        "ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--directory",
+        cwd=main,
+    ).split("\0") if e]
+
+    def escapes(dest: Path) -> bool:
+        """Whether writing dest would go through a symlink out of the worktree."""
+        return not inside(dest.parent.resolve(), worktree)
+
+    with tempfile.TemporaryDirectory() as scratch_dir:
+        scratch = Path(scratch_dir)
+        matcher = Matcher(scratch)
+
+        # Links go first: a directory linked here must not also be copied
+        # file by file. Only whole gitignored entries are linked, never
+        # anything git tracks.
+        link_patterns = read_patterns(main / ".worktreelink")
+        if link_patterns:
+            patterns = scratch / "link"
+            patterns.write_text("\n".join(link_patterns) + "\n")
+            candidates = []
+            for entry in ignored:
+                candidates.append(entry)
+                # "data/" as a pattern only matches a directory, which git
+                # spells with the slash; "data" matches either.
+                if entry.endswith("/"):
+                    candidates.append(entry.rstrip("/"))
+            linked = sorted({m.rstrip("/") for m in matcher.matching(patterns, candidates)})
+            for path in linked:
+                dest = worktree / path
+                if dest.exists() or dest.is_symlink():
+                    say(dim(f"  Exists: {path}"))
+                elif escapes(dest):
+                    warn(f"  Skipped, would leave the worktree: {path}")
+                else:
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    dest.symlink_to(main / path)
+                    say(f"  Linked: {path}")
+            exclude_links(common, linked)
+
+        include_patterns = read_patterns(main / ".worktreeinclude")
+        if include_patterns:
+            patterns = scratch / "include"
+            patterns.write_text("\n".join(include_patterns) + "\n")
+            files = matcher.matching(patterns, [e for e in ignored if not e.endswith("/")])
+            reached = [
+                entry for entry in ignored
+                if entry.endswith("/") and (
+                    reaches(entry, include_patterns)
+                    or matcher.matching(patterns, [entry.rstrip("/"), entry])
+                )
+            ]
+            if reached:
+                inside_dirs = run(
+                    ["git", "ls-files", "-z", "--others", "--ignored",
+                     "--exclude-standard", "--", *reached],
+                    cwd=main, env=os.environ | {"GIT_LITERAL_PATHSPECS": "1"},
+                ).stdout
+                files += matcher.matching(patterns, [p for p in inside_dirs.split("\0") if p])
+            for path in sorted(set(files)):
+                source, dest = main / path, worktree / path
+                if source.is_symlink():
+                    warn(f"  Skipped symlink: {path}")
+                elif dest.exists() or dest.is_symlink():
+                    say(dim(f"  Exists: {path}"))
+                elif escapes(dest):
+                    warn(f"  Skipped, would leave the worktree: {path}")
+                else:
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source, dest)
+                    say(f"  Copied: {path}")
+
+    say(f"  Index: {index}")
+
+    if (worktree / ".envrc").is_file() and shutil.which("direnv"):
+        run(["direnv", "allow", str(worktree)], cwd=worktree)
+        say("  direnv: allowed .envrc")
+
+    if shutil.which("mise"):
+        uses_mise = False
+        for config in MISE_CONFIGS:
+            if (worktree / config).is_file():
+                run(["mise", "trust", str(worktree / config)], cwd=worktree)
+                say(f"  mise: trusted {config}")
+                uses_mise = True
+        uses_mise = uses_mise or any((worktree / d).is_dir() for d in MISE_TASK_DIRS)
+        env = os.environ | {"PWD": str(worktree)}
+        if uses_mise and run(
+            ["mise", "tasks", "info", "worktree:setup"], cwd=worktree, check=False, env=env,
+        ).returncode == 0:
+            say(blue("  Running mise task: worktree:setup"))
+            code = subprocess.run(
+                ["mise", "run", "worktree:setup"], cwd=worktree,
+                env=env | {"WORKTREE_INDEX": str(index), "WORKTREE_MAIN": str(main)},
+                stdout=sys.stdout, stderr=sys.stderr,
+            ).returncode
+            if code != 0:
+                raise Fail("mise task worktree:setup failed; fix it and re-run git-wt bootstrap")
+
+    say(green("✓ Worktree bootstrapped"))
+    return 0
+
+
+# --- commands ---
+
+def add_worktree(repo: Repo, branch: str, base: str | None) -> Path:
+    root = repo.worktrees_root
+    if root is None:
+        raise Fail(
+            f"{repo.main} is not in a projects/ folder; git-wt keeps a repository's "
+            "worktrees in the worktrees/ folder next to projects/"
+        )
+    if not git_ok("check-ref-format", "--branch", branch, cwd=repo.main):
+        raise Fail(f"Not a valid branch name: {branch}")
+
+    worktrees = repo.worktrees()
+    existing = next((w for w in worktrees if w.branch == branch), None)
+    if existing is not None and existing.missing:
+        repo.git("worktree", "prune")
+        say(dim(f"Pruned the stale registration of {existing.path}"))
+        worktrees = repo.worktrees()
+        existing = None
+    if existing is not None:
+        say(f"Worktree already exists: {existing.name}")
+        say(f"  Branch: {branch}")
+        say(f"  Path: {existing.path}")
+        return existing.path
+
+    folder = slug(branch)
+    if not folder:
+        raise Fail(f"{branch} makes no usable folder name")
+    path = root / f"{repo.main.name}-{folder}"
+    occupant = next((w for w in worktrees if same_path(w.path, path)), None)
+    if occupant is not None:
+        if occupant.missing:
+            repo.git("worktree", "prune")
+        else:
+            raise Fail(
+                f"{path} already holds {occupant.label}; {branch} would share its "
+                "folder, so pick a branch name that makes a different one"
+            )
+    if path.exists():
+        raise Fail(f"{path} already exists and is not a worktree; move it away first")
+
+    for remote in repo.git("remote").split():
+        if (branch.startswith(f"{remote}/")
+                and repo.ref_exists(f"refs/remotes/{branch}")
+                and not repo.ref_exists(f"refs/heads/{branch}")):
+            raise Fail(
+                f"{branch} is {remote}'s branch; to work on it, use: "
+                f"git-wt add {branch.removeprefix(remote + '/')}"
+            )
+
+    if repo.ref_exists(f"refs/heads/{branch}"):
+        if base:
+            warn(f"{branch} already exists; ignoring -b {base}")
+        say(blue(f"Using existing local branch: {branch}"))
+        command = ["git", "worktree", "add", str(path), branch]
+    elif repo.ref_exists(f"refs/remotes/origin/{branch}"):
+        say(blue(f"Checking out origin/{branch}"))
+        command = ["git", "worktree", "add", "--track", "-b", branch, str(path), f"origin/{branch}"]
+    else:
+        if base is None:
+            base = repo.main_branch
+            if not repo.ref_exists(f"refs/heads/{base}"):
+                base = repo.target
+        if not repo.ok("rev-parse", "--verify", "--quiet", f"{base}^{{commit}}"):
+            raise Fail(f"Base not found: {base}")
+        say(blue(f"Creating branch {branch} from {base}"))
+        command = ["git", "worktree", "add", "-b", branch, str(path), base]
+
+    root.mkdir(parents=True, exist_ok=True)
+    if stream(command, repo.main) != 0:
+        raise Fail("git worktree add failed")
+    say()
+    say(green("✓ Worktree created"))
+    say(f"  Branch: {branch}")
+    say(f"  Path: {path}")
+    say()
+    try:
+        bootstrap(path)
+    except Fail as error:
+        warn(f"Bootstrap failed: {error}")
+        warn(f"Re-run it with: git-wt bootstrap {path}")
+    return path
+
+
+def cmd_add(args: argparse.Namespace) -> int:
+    repo = Repo.at(current_dir())
+    path = add_worktree(repo, args.branch, args.base)
+    if args.tmux:
+        open_session(path)
+    return 0
+
+
+def work_flags(worktree: Worktree, work: Work, reason: str | None) -> list[str]:
+    flags = []
+    if worktree.missing:
+        flags.append(red("[MISSING]"))
+    elif not worktree.branch:
+        flags.append(red("[DETACHED]"))
+    elif reason:
+        flags.append(green("[MERGED]"))
+    if worktree.locked is not None:
+        flags.append(yellow("[LOCKED]"))
+    if work.changes:
+        flags.append(yellow(f"[DIRTY {len(work.changes)}]"))
+    # A merged branch's commits being on no remote is how a squash merge
+    # looks, not work waiting to be pushed.
+    if work.unpushed and not reason:
+        flags.append(yellow(f"[UNPUSHED {work.unpushed}]"))
+    if work.unreachable:
+        flags.append(red(f"[UNREACHABLE {work.unreachable}]"))
+    return flags
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    repo = Repo.at(current_dir())
+    merges = Merges(repo, fetch=not args.no_fetch)
+    say(f"{bold('Main repository:')} {repo.main}")
+    say(f"{bold('Merged into:')}     {repo.target}")
+    root = repo.worktrees_root
+    say(f"{bold('Worktrees root:')}  {root if root else '(not in a projects/ folder)'}")
+    say()
+
+    linked = [w for w in repo.worktrees() if not w.is_main]
+    if not linked:
+        say("No worktrees found.")
+        say()
+        say("Create one with:")
+        say("  git-wt add <branch>")
+        return 0
+
+    say(bold("Worktrees:"))
+    width = max(len(w.label) for w in linked)
+    for worktree in linked:
+        work = repo.work(worktree)
+        reason = merges.reason(worktree.branch)
+        if worktree.missing or not worktree.branch:
+            symbol = red("!")
+        elif reason:
+            symbol = green("✓")
+        else:
+            symbol = blue("•")
+        parts = [f"{symbol} {worktree.label.ljust(width)}", dim(worktree.name)]
+        if args.verbose:
+            parts.append(dim(worktree.head[:8]))
+        parts.extend(work_flags(worktree, work, reason))
+        if args.verbose and reason:
+            parts.append(dim(reason))
+        say("  " + "  ".join(parts))
+
+    say()
+    say("Legend:")
+    say(f"  {green('✓')} merged into {repo.target} (or its pull request is)")
+    say(f"  {blue('•')} not merged")
+    say(f"  {red('!')} detached HEAD, or its folder is missing")
+    say("  [DIRTY n]     uncommitted or untracked files, lost if removed")
+    say("  [UNPUSHED n]  commits on no remote; they stay on the branch")
+    say("  [LOCKED]      locked with git worktree lock")
+    return 0
+
+
+def cmd_switch(args: argparse.Namespace) -> int:
+    repo = Repo.at(current_dir())
+    worktrees = [w for w in repo.worktrees() if not w.missing]
+    worktree = resolve(worktrees, args.target, "Switch to worktree:")
+    say(blue(f"Switching to worktree: {worktree.label}"))
+    say(f"  Path: {worktree.path}")
+    if os.environ.get("TMUX") or args.tmux:
+        open_session(worktree.path)
+    shell = os.environ.get("SHELL") or "/bin/sh"
+    os.chdir(worktree.path)
+    sys.stdout.flush()
+    os.execvp(shell, [shell])
+    return 0
+
+
+def delete_branch(repo: Repo, branch: str) -> None:
+    # -D: the merge check above is the safety, and git's own -d refuses
+    # branches that were squash-merged.
+    result = run(["git", "branch", "-D", branch], cwd=repo.main, check=False)
+    if result.returncode == 0:
+        say(green(f"✓ Deleted branch {branch}"))
+    else:
+        warn(f"Could not delete branch {branch}: {result.stderr.strip()}")
+
+
+def cmd_remove(args: argparse.Namespace) -> int:
+    start = current_dir()
+    repo = Repo.at(start)
+    worktrees = repo.worktrees()
+    if args.target is None:
+        linked = [w for w in worktrees if not w.is_main]
+        if not linked:
+            say("No worktrees found.")
+            return 0
+        worktree = pick_worktree(linked, "Remove worktree:")
+    else:
+        worktree = resolve(worktrees, args.target, "Remove worktree:")
+    if worktree.is_main:
+        raise Fail(f"Cannot remove the main checkout: {worktree.path}")
+    if worktree.locked is not None:
+        why = f" ({worktree.locked})" if worktree.locked else ""
+        raise Fail(
+            f"{worktree.name} is locked{why}; unlock it first with: "
+            f"git worktree unlock {worktree.path}"
+        )
+
+    merges = Merges(repo, fetch=not args.no_fetch)
+    reason = merges.reason(worktree.branch)
+
+    if worktree.missing:
+        repo.git("worktree", "prune")
+        say(f"The folder of {worktree.name} was already gone; removed its registration.")
+    else:
+        work = repo.work(worktree)
+        say("Removing worktree:")
+        say(f"  Name:   {worktree.name}")
+        say(f"  Branch: {worktree.label}")
+        say(f"  Path:   {worktree.path}")
+        say(f"  Status: {green('merged, ' + reason) if reason else yellow('not merged')}")
+        if work.unpushed and not reason:
+            say(f"  Unpushed commits: {work.unpushed} (they stay on the branch)")
+        if work.unreachable:
+            say(red(f"  Commits on no branch: {work.unreachable} (lost when removed)"))
+        if work.changes:
+            say(yellow(f"  Uncommitted or untracked files: {len(work.changes)}"))
+            for change in work.changes[:10]:
+                say(f"    {change}")
+            if len(work.changes) > 10:
+                say(f"    ... and {len(work.changes) - 10} more")
+        say()
+        if work.at_risk and not args.discard:
+            raise Fail(
+                f"{worktree.name} has work that removing it would lose. "
+                "Commit or stash it, or re-run with --discard to throw it away."
+            )
+        if not args.force:
+            deleting = f" and delete branch {worktree.branch}" if args.delete and reason else ""
+            if not confirm(f"Remove {worktree.name}{deleting}?"):
+                say("Aborted.")
+                return 1
+        command = ["git", "worktree", "remove", str(worktree.path)]
+        if args.discard:
+            command.insert(3, "--force")
+        result = run(command, cwd=repo.main, check=False)
+        if result.returncode != 0:
+            raise Fail(f"git worktree remove failed: {result.stderr.strip()}")
+        say(green(f"✓ Removed worktree {worktree.name}"))
+
+    close_session(repo, worktree)
+    if worktree.branch:
+        if args.delete and reason:
+            delete_branch(repo, worktree.branch)
+        elif args.delete:
+            say(f"Kept branch {worktree.branch}: it is not merged into {repo.target}.")
+        elif reason:
+            say(dim(f"Branch {worktree.branch} is merged; delete it with: git-wt remove -d, or git branch -D {worktree.branch}"))
+    if inside(start, worktree.path):
+        warn(f"Your shell is still in the removed folder; cd {repo.main}")
+    return 0
+
+
+def cmd_prune(args: argparse.Namespace) -> int:
+    repo = Repo.at(current_dir())
+    merges = Merges(repo, fetch=not args.no_fetch)
+    candidates: list[tuple[Worktree, str | None]] = []
+    skipped: list[tuple[Worktree, str]] = []
+    for worktree in repo.worktrees():
+        if worktree.is_main:
+            continue
+        reason = merges.reason(worktree.branch)
+        if worktree.missing:
+            candidates.append((worktree, reason))
+            continue
+        if not reason:
+            continue
+        if worktree.locked is not None:
+            skipped.append((worktree, "locked"))
+            continue
+        work = repo.work(worktree)
+        if work.at_risk:
+            skipped.append((worktree, f"{len(work.changes)} uncommitted or untracked files"))
+            continue
+        candidates.append((worktree, reason))
+
+    if not candidates and not skipped:
+        say(green("No merged worktrees found. Nothing to prune."))
+        return 0
+    if candidates:
+        verb = "Would remove" if args.dry_run else "Will remove"
+        say(f"{verb} {len(candidates)} worktree(s):")
+        for worktree, reason in candidates:
+            why = "folder missing" if worktree.missing else reason
+            say(f"  {green('✓')} {worktree.label}  {dim(worktree.name)}  {dim(why or '')}")
+    if skipped:
+        say(f"Skipping {len(skipped)} merged worktree(s):")
+        for worktree, why in skipped:
+            say(f"  {yellow('!')} {worktree.label}  {dim(worktree.name)}  {yellow(why)}")
+    say()
+    if args.dry_run or not candidates:
+        return 0
+    if not args.force:
+        deleting = " and delete their merged branches" if args.delete else ""
+        if not confirm(f"Remove these worktrees{deleting}?"):
+            say("Aborted.")
+            return 1
+
+    failures = 0
+    for worktree, reason in candidates:
+        if worktree.missing:
+            repo.git("worktree", "prune")
+            say(green(f"✓ Pruned {worktree.name} (folder was gone)"))
+        else:
+            result = run(
+                ["git", "worktree", "remove", str(worktree.path)],
+                cwd=repo.main, check=False,
+            )
+            if result.returncode != 0:
+                failures += 1
+                warn(f"✗ Could not remove {worktree.name}: {result.stderr.strip()}")
+                continue
+            say(green(f"✓ Removed {worktree.name}"))
+        close_session(repo, worktree)
+        if args.delete and worktree.branch and reason:
+            delete_branch(repo, worktree.branch)
+    if failures:
+        raise Fail(f"{failures} worktree(s) could not be removed")
+    return 0
+
+
+def cmd_bootstrap(args: argparse.Namespace) -> int:
+    return bootstrap(Path(args.path), print_index=args.index)
+
+
+def cmd_claude_hook(args: argparse.Namespace) -> int:
+    # Claude Code reads the worktree path from stdout, so everything else,
+    # git's own output included, goes to stderr.
+    real_stdout, sys.stdout = sys.stdout, sys.stderr
+    try:
+        try:
+            data = json.load(sys.stdin)
+        except json.JSONDecodeError as error:
+            raise Fail("Hook input is not JSON") from error
+        name = data.get("name") if isinstance(data, dict) else None
+        if not name:
+            raise Fail("Hook input has no worktree name")
+        start = Path(data.get("cwd") or current_dir())
+        common_out = run(
+            ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            cwd=start, check=False,
+        ) if start.is_dir() else None
+        if common_out is None or common_out.returncode != 0:
+            raise Fail(f"Not in a git repository: {start}")
+        common = Path(common_out.stdout.strip())
+        if common.name == ".git" and common.parent.parent.name == "projects":
+            path = add_worktree(Repo(common.parent, common), name, None)
+        else:
+            # Claude Code's own place and branch name. A submodule's git dir
+            # lives in its superproject's .git/modules, so the checkout is
+            # taken from the working tree, not from the git dir.
+            if common.name == ".git":
+                top = common.parent
+            else:
+                top = Path(git("rev-parse", "--show-toplevel", cwd=start).strip())
+            path = top / ".claude" / "worktrees" / name
+            registered = git("worktree", "list", "--porcelain", cwd=top)
+            if f"worktree {path}\n" not in registered + "\n" or not path.is_dir():
+                branch = f"worktree-{name}"
+                command = ["git", "worktree", "add", str(path)]
+                if git_ok("show-ref", "--verify", "--quiet", f"refs/heads/{branch}", cwd=top):
+                    command.append(branch)
+                else:
+                    command[3:3] = ["-b", branch]
+                if stream(command, top) != 0:
+                    raise Fail("git worktree add failed")
+                try:
+                    bootstrap(path)
+                except Fail as error:
+                    warn(f"Bootstrap failed: {error}")
+        if not path.is_dir():
+            raise Fail(f"Worktree was not created: {path}")
+    finally:
+        sys.stdout = real_stdout
+    print(path)
+    return 0
+
+
+def parser() -> argparse.ArgumentParser:
+    top = argparse.ArgumentParser(
+        prog="git-wt", description=__doc__.split("\n\n")[0],
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="\n\n".join(__doc__.split("\n\n")[2:]),
+    )
+    commands = top.add_subparsers(dest="command", required=True, metavar="<command>")
+
+    def command(name: str, help: str) -> argparse.ArgumentParser:
+        return commands.add_parser(name, help=help, description=help)
+
+    add = command("add", "Create a worktree for a branch and set it up.")
+    add.add_argument("-b", "--base", help="branch a new branch off BASE (default: the main branch)")
+    add.add_argument("-t", "--tmux", action="store_true", help="open its tmux session")
+    add.add_argument("branch")
+    add.set_defaults(func=cmd_add)
+
+    list_ = command("list", "List worktrees with their merge and work state.")
+    list_.add_argument("-v", "--verbose", action="store_true", help="show why a branch counts as merged")
+    list_.add_argument("--no-fetch", action="store_true", help="do not fetch origin first")
+    list_.set_defaults(func=cmd_list)
+
+    switch = command("switch", "Go to a worktree: its tmux session inside tmux, a shell in it outside.")
+    switch.add_argument("-t", "--tmux", action="store_true", help="open its tmux session outside tmux too")
+    switch.add_argument("target", nargs="?", help="branch, folder name or path (default: pick with fzf)")
+    switch.set_defaults(func=cmd_switch)
+
+    remove = command("remove", "Remove a worktree and close its tmux session.")
+    remove.add_argument("-f", "--force", action="store_true", help="do not ask for confirmation")
+    remove.add_argument("-d", "--delete", action="store_true", help="also delete its branch if merged")
+    remove.add_argument("--discard", action="store_true", help="throw away uncommitted and untracked files")
+    remove.add_argument("--no-fetch", action="store_true", help="do not fetch origin first")
+    remove.add_argument("target", nargs="?", help="branch, folder name or path (default: pick with fzf)")
+    remove.set_defaults(func=cmd_remove)
+
+    prune = command("prune", "Remove every worktree whose branch is merged.")
+    prune.add_argument("-f", "--force", action="store_true", help="do not ask for confirmation")
+    prune.add_argument("-d", "--delete", action="store_true", help="also delete their merged branches")
+    prune.add_argument("--dry-run", action="store_true", help="only show what would be removed")
+    prune.add_argument("--no-fetch", action="store_true", help="do not fetch origin first")
+    prune.set_defaults(func=cmd_prune)
+
+    boot = command(
+        "bootstrap",
+        "Set a worktree up from its main checkout: copy .worktreeinclude files, "
+        "link .worktreelink paths, allow direnv, trust mise, run the "
+        "worktree:setup mise task with WORKTREE_INDEX and WORKTREE_MAIN.",
+    )
+    boot.add_argument("--index", action="store_true", help="only print the worktree's WORKTREE_INDEX")
+    boot.add_argument("path", nargs="?", default=".")
+    boot.set_defaults(func=cmd_bootstrap)
+
+    hook = command(
+        "claude-hook",
+        "Claude Code WorktreeCreate hook: reads the hook JSON on stdin, prints the worktree path.",
+    )
+    hook.set_defaults(func=cmd_claude_hook)
+    return top
+
+
+def main() -> int:
+    args = parser().parse_args()
+    try:
+        return args.func(args)
+    except Fail as error:
+        sys.stdout.flush()
+        print(colour(f"Error: {error}", "31", sys.stderr), file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

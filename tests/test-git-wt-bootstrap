@@ -22,6 +22,10 @@ scratch="$(mktemp -d)"
 readonly scratch
 trap 'rm -rf "${scratch}"' EXIT
 
+# git-wt is a uv script; keep uv's caches where they are, or every run
+# under the scratch HOME would download Python again.
+export UV_CACHE_DIR="${UV_CACHE_DIR:-${HOME}/.cache/uv}"
+export UV_PYTHON_INSTALL_DIR="${UV_PYTHON_INSTALL_DIR:-${HOME}/.local/share/uv/python}"
 export HOME="${scratch}/home"
 export GIT_CONFIG_NOSYSTEM=1
 export GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.com
@@ -146,6 +150,8 @@ check "an existing path is never replaced by a link" \
     content_is "${wt}/models/mine.bin" "already here"
 check "re-running with links in place succeeds" quiet git-wt-bootstrap "${wt}"
 check "and leaves the link as it was" is_link_to "${wt}/data" "${main}/data"
+check "a linked path never shows up in git status" \
+    same "$(git -C "${wt}" status --porcelain)" ""
 
 # --- WORKTREE_INDEX -----------------------------------------------------------
 
@@ -230,7 +236,7 @@ check "a failing setup task fails the bootstrap" not quiet git-wt-bootstrap "${w
 # Only the tools the script really needs, so direnv and mise are missing.
 bare="${scratch}/bare-bin"
 mkdir -p "${bare}"
-for tool in bash git realpath sed sort cp ln mkdir mktemp rm rmdir cat dirname basename sleep; do
+for tool in bash env uv readlink git realpath sed sort cp ln mkdir mktemp rm rmdir cat dirname basename sleep; do
     ln -s "$(command -v "${tool}")" "${bare}/${tool}"
 done
 main="$(make_repo nomise app ".gitignore=.envrc" ".worktreeinclude=.envrc" "mise.toml=")"
