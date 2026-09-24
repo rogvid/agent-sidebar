@@ -12,14 +12,17 @@ no_sort = true
 [preview]
 # Preview commands get the entry as it is, so it is quoted here. Actions get
 # it shell-quoted already; quoting it again there splits a path at a space.
-command = "git -C '{}' log --color=always --oneline --decorate -20 && echo && git -C '{}' -c color.status=always status --short --branch"
+# A git-wt project folder holds no checkout, so it shows its worktrees
+# where a plain clone shows its status.
+command = "git -C '{}' log --color=always --oneline --decorate -20 && echo && { git -C '{}' -c color.status=always status --short --branch 2>/dev/null || git -C '{}' worktree list; }"
 
 [keybindings]
 enter = "actions:open"
 
 [actions.open]
 description = "Switch to the project's tmux session, starting one if needed"
-# tmux-sessionizer names the session after the folder, as the agent
-# sidebar's new worktrees do, so a project opened either way is one session.
+# tmux-sessionizer opens a git-wt project in its main worktree, in the
+# session git-wt names, as the agent sidebar does, so a project opened
+# either way is one session.
 command = "tmux-sessionizer {}"
 mode = "execute"

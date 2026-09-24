@@ -34,6 +34,19 @@ project "${root}/projects/newest" "2026-01-01"
 project "${root}/projects/with space" "2025-01-01"
 project "${root}/projects/newest/vendor/nested" "2023-01-01"
 g -C "${root}/projects/older" worktree add -q "${root}/worktrees/older-feat" -b feat
+touch -d "2024-01-01" "${root}/projects/older/.git/worktrees/older-feat/logs/HEAD"
+# git-wt's layout: .bare, a .git file pointing at it, a folder per worktree.
+# Only the worktrees' HEADs move, and the latest of them dates the project.
+bare="${root}/projects/bare"
+g init -q --bare -b main "${bare}/.bare"
+echo 'gitdir: ./.bare' >"${bare}/.git"
+g -C "${bare}" config core.logAllRefUpdates true
+g -C "${bare}" worktree add -q --orphan -b main "${bare}/main"
+g -C "${bare}/main" commit -q --allow-empty --no-verify -m init
+g -C "${bare}" worktree add -q -b feat "${bare}/feat"
+touch -d "2022-06-01" "${bare}/.bare/worktrees/main/logs/HEAD"
+touch -d "2025-06-01" "${bare}/.bare/worktrees/feat/logs/HEAD"
+g init -q --bare -b main "${root}/projects/loose/.bare"
 project "${root}/.oh-my-zsh/custom/plugins/tool" "2026-06-01"
 project "${root}/projects/web/node_modules/pkg" "2026-06-01"
 g init -q -b main "${root}/projects/fresh"
@@ -65,6 +78,9 @@ check "a repository nested in another is its own project" \
     listed "${root}/projects/newest/vendor/nested"
 check "a repository with no commits yet is a project" listed "${root}/projects/fresh"
 check "a worktree is not" not listed "${root}/worktrees/older-feat"
+check "a git-wt project is, by its folder" listed "${bare}"
+check "its worktrees are not" not listed "${bare}/main"
+check "a .bare with no .git file next to it is not" not listed "${root}/projects/loose"
 check "nothing under a hidden directory is" \
     not listed "${root}/.oh-my-zsh/custom/plugins/tool"
 check "nothing under node_modules is" not listed "${root}/projects/web/node_modules/pkg"
@@ -72,6 +88,7 @@ check "a folder that is not a repository is not" not listed "${root}/projects/pl
 
 want="$(printf '%s\n' \
     "${root}/projects/newest" \
+    "${bare}" \
     "${root}/projects/with space" \
     "${root}/projects/older" \
     "${root}/projects/newest/vendor/nested" \

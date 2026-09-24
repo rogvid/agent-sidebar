@@ -84,6 +84,9 @@ STUBS = SCRATCH / "stubs"
 OUTSIDE = SCRATCH / "outside"
 GH_PRS = SCRATCH / "gh-prs.json"
 GH_CALLS = SCRATCH / "gh-calls"
+GLAB_MRS = SCRATCH / "glab-mrs.json"
+GLAB_HOSTS = SCRATCH / "glab-hosts"
+GLAB_CALLS = SCRATCH / "glab-calls"
 FZF_INPUT = SCRATCH / "fzf-input"
 SHELL_LOG = SCRATCH / "shell-log"
 # A unix socket path is capped near 108 bytes.
@@ -101,11 +104,14 @@ def base_env() -> dict[str, str]:
     env.setdefault(
         "UV_PYTHON_INSTALL_DIR", str(REAL_HOME / ".local" / "share" / "uv" / "python")
     )
-    for name in ("TMUX", "TMUX_PANE", "EMAIL", "FZF_PICK", "FZF_DEFAULT_OPTS"):
+    for name in ("TMUX", "TMUX_PANE", "EMAIL", "FZF_PICK", "FZF_QUERY", "FZF_DEFAULT_OPTS"):
         env.pop(name, None)
     env.update(
         HOME=str(HOME),
         XDG_CONFIG_HOME=str(HOME / ".config"),
+        # Pinned, so a check can point HOME at a case for --all and keep
+        # the identity and settings below.
+        GIT_CONFIG_GLOBAL=str(HOME / ".gitconfig"),
         XDG_DATA_HOME=str(HOME / ".local" / "share"),
         XDG_STATE_HOME=str(HOME / ".local" / "state"),
         GIT_CONFIG_NOSYSTEM="1",
@@ -183,17 +189,43 @@ else:
         0o755,
     )
     write(
+        STUBS / "glab",
+        f"""#!{py}
+import json, sys
+from pathlib import Path
+args = sys.argv[1:]
+with open({str(GLAB_CALLS)!r}, "a") as log:
+    log.write(json.dumps(args) + "\\n")
+hosts = Path({str(GLAB_HOSTS)!r})
+if args[:3] == ["config", "get", "token"]:
+    host = args[args.index("--host") + 1] if "--host" in args else ""
+    known = hosts.read_text().split() if hosts.exists() else []
+    print("glpat-stub" if host in known else "")
+    sys.exit(0)
+mrs = Path({str(GLAB_MRS)!r})
+if args[:2] != ["mr", "list"] or "--merged" not in args or not mrs.exists():
+    print("glab stub: no answer for " + " ".join(args), file=sys.stderr)
+    sys.exit(1)
+page = int(args[args.index("--page") + 1]) if "--page" in args else 1
+print(json.dumps(json.loads(mrs.read_text()) if page == 1 else []))
+""",
+        0o755,
+    )
+    write(
         STUBS / "fzf",
         f"""#!{py}
 import os, sys
 data = sys.stdin.read()
 with open({str(FZF_INPUT)!r}, "w") as f:
     f.write(data)
+query = os.environ.get("FZF_QUERY")
 pick = os.environ.get("FZF_PICK")
-if pick is None:
+if pick is None and query is None:
     sys.exit(130)
+if "--print-query" in sys.argv:
+    print(query or "")
 for line in data.splitlines():
-    if pick in line:
+    if pick is not None and pick in line:
         print(line)
         sys.exit(0)
 sys.exit(1)
@@ -335,13 +367,38 @@ def wait_until(fn, timeout: float = 5.0) -> bool:
 # --- repos -------------------------------------------------------------------------
 
 
-def slug_folder(repo: str, branch: str) -> str:
+def slug_folder(branch: str) -> str:
     """Folder name for plain ASCII branch names (the Unicode rule has its own check)."""
-    return f"{repo}-" + re.sub(r"[^a-z0-9]+", "-", branch.lower()).strip("-")
+    return re.sub(r"[^a-z0-9]+", "-", branch.lower()).strip("-")
+
+
+def make_project(project: Path, branch: str) -> Path:
+    """<project>/.bare, the .git file pointing at it, and an empty main
+    worktree <project>/<branch>, the way git-wt clone and convert leave
+    one. Built with plain git, so the harness does not lean on git-wt."""
+    project.mkdir(parents=True)
+    git(project.parent, "init", "-q", "--bare", "-b", branch, str(project / ".bare"))
+    write(project / ".git", "gitdir: ./.bare\n")
+    git(project, "config", "core.logAllRefUpdates", "true")
+    main = project / slug_folder(branch)
+    git(project, "worktree", "add", "-q", "--orphan", "-b", branch, str(main))
+    return main
+
+
+def plain_clone(path: Path, files: dict[str, str] | None = None) -> Path:
+    """A repository the old way: a checkout with .git inside it."""
+    path.mkdir(parents=True)
+    git(path, "init", "-q", "-b", "main")
+    for rel, content in ({"README.md": "hello\n"} | (files or {})).items():
+        write(path / rel, content)
+    git(path, "add", "-A")
+    git(path, "commit", "-qm", "init")
+    return path
 
 
 class Case:
-    """<scratch>/<name>/projects/<repo> with a bare origin, main pushed."""
+    """<scratch>/<name>/projects/<repo>, a project with its main worktree
+    <repo>/<branch>, and a bare origin with main pushed."""
 
     def __init__(
         self,
@@ -351,18 +408,22 @@ class Case:
         files: dict[str, str] | None = None,
         remote: bool = True,
         branch: str = "main",
-        parent: str = "projects",
+        forge: str | None = "github",
     ):
         self.root = SCRATCH / name
         if self.root.exists():
             raise HarnessError(f"case {name} used twice")
         self.repo = repo
-        self.main = self.root / parent / repo
+        self.project = self.root / "projects" / repo
+        self.bare = self.project / ".bare"
         self.origin = self.root / "origin.git"
-        self.wts = self.root / "worktrees"
+        self.wts = self.project
         self.branch = branch
-        self.main.mkdir(parents=True)
-        git(self.main, "init", "-q", "-b", branch)
+        self.main = make_project(self.project, branch)
+        # The origins here are local paths, which name no forge; the gh
+        # stand-in answers for GitHub.
+        if forge:
+            git(self.project, "config", "worktree.forge", forge)
         for rel, content in ({"README.md": "hello\n"} | (files or {})).items():
             write(self.main / rel, content)
         git(self.main, "add", "-A")
@@ -374,7 +435,12 @@ class Case:
             git(self.main, "remote", "set-head", "origin", "-a")
 
     def folder(self, branch: str) -> Path:
-        return self.wts / slug_folder(self.repo, branch)
+        return self.wts / slug_folder(branch)
+
+    def session(self, path: Path) -> str:
+        """The tmux session git-wt gives the worktree at path."""
+        name = self.repo if path == self.main else f"{self.repo}-{path.name}"
+        return name.replace(".", "_").replace(":", "_")
 
     def add_wt(
         self, branch: str, *, base: str | None = None, path: Path | None = None
@@ -457,7 +523,8 @@ def user_dirs(root: Path) -> set[str]:
     """Directories a user would see, not git's own bookkeeping."""
     return {
         d for d in dirs_under(root)
-        if ".git" not in Path(d).parts and not d.startswith(("origin.git", "clone"))
+        if not {".git", ".bare"} & set(Path(d).parts)
+        and not d.startswith(("origin.git", "clone"))
     }
 
 
@@ -543,7 +610,10 @@ def section(fn):
     return fn
 
 
-COMMANDS = ("add", "list", "switch", "remove", "prune", "bootstrap", "claude-hook")
+COMMANDS = (
+    "clone", "add", "list", "switch", "remove", "prune", "convert", "bootstrap", "session",
+    "claude-hook",
+)
 
 
 def usage_on(text: str) -> bool:
@@ -573,13 +643,16 @@ def conventions():
         )
 
     usage_errors = {
-        "add without a branch": ("add",),
         "add with an extra argument": ("add", "one", "two"),
         "add -b without a value": ("add", "-b"),
         "list with an argument": ("list", "extra"),
         "switch with an extra argument": ("switch", "one", "two"),
         "remove with an extra argument": ("remove", "one", "two"),
         "prune with an argument": ("prune", "extra"),
+        "clone without a URL": ("clone",),
+        "clone with an extra argument": ("clone", "url", "dir", "extra"),
+        "convert with an extra argument": ("convert", "one", "two"),
+        "session with an extra argument": ("session", "one", "two"),
     }
     for name, (cmd, *args) in usage_errors.items():
         r = wt(cmd, *args, cwd=c.main)
@@ -602,6 +675,8 @@ def conventions():
         ("switch", ("feat/x",)),
         ("remove", ("-f", "feat/x")),
         ("prune", ("-f",)),
+        ("convert", ("-f",)),
+        ("session", ()),
     ):
         r = wt(cmd, *args, cwd=OUTSIDE, env=recording_shell())
         check(
@@ -664,11 +739,11 @@ def wrappers():
 def folder_names():
     c = Case("names")
     for branch, folder in (
-        ("feat/new-config", "app-feat-new-config"),
-        ("Feat/Ünï", "app-feat-uni"),
-        ("Fix/Some_Thing.v2", "app-fix-some-thing-v2"),
-        ("chore/x__y--z_", "app-chore-x-y-z"),
-        ("plain", "app-plain"),
+        ("feat/new-config", "feat-new-config"),
+        ("Feat/Ünï", "feat-uni"),
+        ("Fix/Some_Thing.v2", "fix-some-thing-v2"),
+        ("chore/x__y--z_", "chore-x-y-z"),
+        ("plain", "plain"),
     ):
         r = wt("add", branch, cwd=c.main)
         path = c.wts / folder
@@ -687,9 +762,9 @@ def folder_names():
     env = inside_tmux_env("home")
     attach_client("home")
     r = wt("switch", "feat/s", cwd=d.main, env=env)
-    expected = path.name.replace(".", "_").replace(":", "_")
+    expected = "my_app-feat-s"
     check(
-        f"the tmux session for {path.name} is {expected}",
+        f"the tmux session for {path.name} of my.app is {expected}",
         r.code == 0 and wait_until(lambda: expected in sessions()),
         r.desc() + f" sessions={sorted(sessions())}",
     )
@@ -830,12 +905,12 @@ def merged():
     ok, d = not_merged_in_list(c, dotted)
     check("feat/a.b is not [MERGED] because feat/axb is", ok, d)
 
-    detached = c.add_detached(c.wts / "app-detached", "HEAD~1")
+    detached = c.add_detached(c.wts / "detached", "HEAD~1")
     ok, d = not_merged_in_list(c, detached)
     check("a detached worktree is never [MERGED]", ok, d)
 
     git(c.main, "checkout", "-q", "-b", "primary-only")
-    on_main = c.wts / "app-on-main"
+    on_main = c.wts / "on-main"
     git(c.main, "worktree", "add", "-q", str(on_main), "main")
     ok, d = not_merged_in_list(c, on_main)
     check("a worktree on the main branch itself is never [MERGED]", ok, d)
@@ -853,7 +928,8 @@ def merged_without_identity():
     c.commit(b, "s2.txt", "s2\n")
     squash_merge(c, "feat/squash")
     git_config_home(NOID_HOME, identity=False)
-    env = {"HOME": str(NOID_HOME), "XDG_CONFIG_HOME": str(NOID_HOME / ".config")}
+    env = {"HOME": str(NOID_HOME), "XDG_CONFIG_HOME": str(NOID_HOME / ".config"),
+           "GIT_CONFIG_GLOBAL": str(NOID_HOME / ".gitconfig")}
     precondition = run(["git", "commit-tree", "-m", "x", "HEAD^{tree}"], c.main, env=env)
     ok, d = merged_in_list(c, b, env=env)
     check("with no git identity configured a squash merge is still [MERGED]",
@@ -959,13 +1035,12 @@ def list_command():
     r = wt("list", cwd=c.main)
     check("list with no linked worktrees says No worktrees found. and exits 0",
           r.code == 0 and "No worktrees found." in r.out, r.desc())
-    check("list does not create the worktrees directory", not c.wts.exists(),
-          str(user_dirs(c.root)))
+    before = user_dirs(c.root)
     wt("prune", "-f", cwd=c.main)
     wt("switch", "nothing-here", cwd=c.main, env=recording_shell())
     wt("remove", "-f", "nothing-here", cwd=c.main)
-    check("prune, switch and remove do not create it either", not c.wts.exists(),
-          str(user_dirs(c.root)))
+    check("list, prune, switch and remove create no directory", user_dirs(c.root) == before,
+          str(user_dirs(c.root) ^ before))
 
     c = Case("list", files={".gitignore": "ignored.txt\n", "src/code.txt": "code\n"})
     git(c.main, "checkout", "-q", "-b", "primary-only")
@@ -982,7 +1057,7 @@ def list_command():
     git(c.main, "worktree", "lock", str(locked))
     missing = c.add_wt("feat/missing", base="main")
     shutil.rmtree(missing)
-    detached = c.add_detached(c.wts / "app-loose", "main")
+    detached = c.add_detached(c.wts / "loose", "main")
     before = user_dirs(c.root)
 
     r = c.list()
@@ -990,7 +1065,7 @@ def list_command():
     check("list exits 0", r.code == 0, r.desc())
     check("the header names the main repository", str(c.main) in out, r.desc())
     check("the header names the main branch and target", "origin/main" in out, r.desc())
-    check("the header names the worktrees root", str(c.wts) in out, r.desc())
+    check("the header names the project", str(c.project) in out, r.desc())
     check("the main checkout gets no row", "primary-only" not in out, r.desc())
 
     def flags(path: Path) -> str:
@@ -1018,8 +1093,9 @@ def list_command():
     r = c.list("-v")
     check("list -v exits 0 with the rows", r.code == 0 and row(r.out, clean.name) is not None,
           r.desc())
-    for where, name in ((c.main / "src", "the main checkout's subdirectory"),
-                        (clean / "src", "a linked worktree's subdirectory")):
+    for where, name in ((c.main / "src", "the main worktree's subdirectory"),
+                        (clean / "src", "a linked worktree's subdirectory"),
+                        (c.project, "the project folder")):
         r = c.list(cwd=where)
         check(f"list works from {name}",
               r.code == 0 and row(r.out, dirty.name) is not None and str(c.main) in r.out,
@@ -1033,7 +1109,7 @@ def add_command():
 
     r = wt("add", "feat/new", cwd=c.main)
     path = c.folder("feat/new")
-    check("add creates the worktree in worktrees/ on a new branch",
+    check("add creates the worktree in the project folder on a new branch",
           r.code == 0 and c.is_registered(path) and c.tip("feat/new") == main_tip, r.desc())
     check("add prints a '  Path: <path>' line",
           re.search(rf"^  Path: {re.escape(str(path))}$", r.out, re.MULTILINE) is not None,
@@ -1062,7 +1138,7 @@ def add_command():
 
     r = wt("add", "bad..name", cwd=c.main)
     check("an invalid branch name exits 1 and creates nothing",
-          r.code == 1 and not c.has_branch("bad..name") and not (c.wts / "app-bad-name").exists(),
+          r.code == 1 and not c.has_branch("bad..name") and not (c.wts / "bad-name").exists(),
           r.desc())
 
     c.add_wt("feat/a-b")
@@ -1130,17 +1206,58 @@ def add_command():
     check("a failing bootstrap is a warning and add still exits 0",
           r.code == 0 and c2.is_registered(c2.folder("feat/x")), r.desc())
 
-    c3 = Case("add-elsewhere", parent="src")
-    r = wt("add", "feat/x", cwd=c3.main)
-    check("add outside a projects/ folder exits 1 and creates nothing",
-          r.code == 1 and not c3.has_branch("feat/x") and not c3.wts.exists(), r.desc())
+    old = plain_clone(SCRATCH / "add-plain" / "projects" / "app")
+    before = user_dirs(old.parent.parent)
+    for cmd, args in (("add", ("feat/x",)), ("list", ()), ("prune", ("-f",))):
+        r = wt(cmd, *args, cwd=old)
+        check(f"{cmd} in a plain clone exits 1 pointing at git-wt convert",
+              r.code == 1 and "git-wt convert" in r.err, r.desc())
+    check("and changes nothing there",
+          not git_ok(old, "show-ref", "--verify", "--quiet", "refs/heads/feat/x")
+          and user_dirs(old.parent.parent) == before, str(user_dirs(old.parent.parent)))
+
+    c5 = Case("add-from-project")
+    r = wt("add", "feat/p", cwd=c5.project)
+    check("add from the project folder itself works",
+          r.code == 0 and c5.is_registered(c5.folder("feat/p")), r.desc())
+    r = wt("add", "Main", cwd=c5.project)
+    check("a branch that would take the main worktree's folder exits 1",
+          r.code == 1 and not c5.has_branch("Main"), r.desc())
+
+    c6 = Case("add-pick", files={"src/code.txt": "code\n"})
+    c6.add_wt("feat/taken")
+    git(c6.main, "branch", "feat/local")
+    clone = c6.root / "clone"
+    git(c6.root, "clone", "-q", str(c6.origin), str(clone))
+    git(clone, "checkout", "-q", "-b", "feat/remote")
+    c6.commit(clone, "remote.txt", "remote\n")
+    git(clone, "push", "-q", "origin", "feat/remote")
+    FZF_INPUT.unlink(missing_ok=True)
+    r = wt("add", cwd=c6.main, env={"FZF_PICK": "feat/remote"})
+    offered = FZF_INPUT.read_text() if FZF_INPUT.exists() else ""
+    check("add with no branch fetches and adds the picked remote branch",
+          r.code == 0 and c6.is_registered(c6.folder("feat/remote"))
+          and git(c6.folder("feat/remote"), "rev-parse", "--abbrev-ref", "@{upstream}")
+          == "origin/feat/remote", r.desc())
+    check("the pick offers local and remote branches without a worktree",
+          "feat/local" in offered and "feat/remote" in offered
+          and "feat/taken" not in offered and not re.search(r"\bmain\b", offered), offered)
+    r = wt("add", "--no-fetch", cwd=c6.main, env={"FZF_QUERY": "feat/typed"})
+    check("a name typed in the pick that matches nothing becomes a new branch",
+          r.code == 0 and c6.is_registered(c6.folder("feat/typed"))
+          and c6.tip("feat/typed") == c6.tip("main"), r.desc())
+    before = c6.registered()
+    r = wt("add", "--no-fetch", cwd=c6.main)
+    check("a cancelled pick exits 1 with No branch selected and adds nothing",
+          r.code == 1 and "No branch selected" in r.err and c6.registered() == before,
+          r.desc())
 
     kill_tmux()
     c4 = Case("add-tmux")
     new_session("home", c4.main)
     attach_client("home")
     r = wt("add", "-t", "feat/t", cwd=c4.main, env=inside_tmux_env("home"))
-    session = c4.folder("feat/t").name
+    session = c4.session(c4.folder("feat/t"))
     check("add -t inside tmux switches the client to the new worktree's session",
           r.code == 0 and wait_until(lambda: client_sessions() == [session])
           and session_path(session) == str(c4.folder("feat/t")),
@@ -1193,10 +1310,11 @@ def switch_command():
 
     r = wt("switch", "feat/one", cwd=c.main, env=inside | recording_shell())
     check("switch inside tmux creates the worktree's session in its folder",
-          r.code == 0 and wait_until(lambda: one.name in sessions())
-          and session_path(one.name) == str(one), r.desc() + f" sessions={sorted(sessions())}")
+          r.code == 0 and wait_until(lambda: c.session(one) in sessions())
+          and session_path(c.session(one)) == str(one),
+          r.desc() + f" sessions={sorted(sessions())}")
     check("and switches the client to it",
-          wait_until(lambda: client_sessions() == [one.name]) and shell_calls() == [],
+          wait_until(lambda: client_sessions() == [c.session(one)]) and shell_calls() == [],
           f"clients={client_sessions()} shell={shell_calls()}")
     r = wt("switch", "main", cwd=one, env=inside)
     check("switch inside tmux to the main checkout switches to its session",
@@ -1204,16 +1322,17 @@ def switch_command():
           r.desc() + f" clients={client_sessions()}")
     r = wt("switch", one.name, cwd=c.main, env=inside)
     check("switching back reuses the existing session",
-          r.code == 0 and wait_until(lambda: client_sessions() == [one.name])
-          and sessions() == {"app", one.name}, r.desc() + f" sessions={sorted(sessions())}")
+          r.code == 0 and wait_until(lambda: client_sessions() == [c.session(one)])
+          and sessions() == {"app", c.session(one)},
+          r.desc() + f" sessions={sorted(sessions())}")
     kill_tmux()
 
     two = c.add_wt("feat/two")
     status = SCRATCH / "switch-t-status"
     run_in_host_pane(command("switch", "-t", "feat/two"), c.main, status)
     check("switch -t outside tmux attaches to the worktree's session",
-          wait_until(lambda: client_sessions() == [two.name], timeout=20)
-          and session_path(two.name) == str(two),
+          wait_until(lambda: client_sessions() == [c.session(two)], timeout=20)
+          and session_path(c.session(two)) == str(two),
           f"clients={client_sessions()} sessions={sorted(sessions())}"
           f" status={status.read_text().strip() if status.exists() else 'running'}")
     kill_tmux()
@@ -1312,14 +1431,14 @@ def remove_command():
     r = remove("-f", "feat/unpushed")
     check("unpushed commits on a branch are not at risk and the branch is kept",
           r.code == 0 and removed(p) and c.tip("feat/unpushed") == tip, r.desc())
-    p = c.add_detached(c.wts / "app-orphan")
+    p = c.add_detached(c.wts / "orphan")
     c.commit(p, "orphan.txt", "on no branch\n")
     r = remove("-f", p.name)
     check("a detached worktree with commits on no branch is refused",
           r.code == 1 and kept(p), r.desc())
     r = remove("-f", "--discard", p.name)
     check("--discard removes it", r.code == 0 and removed(p), r.desc())
-    p = c.add_detached(c.wts / "app-clean-detached")
+    p = c.add_detached(c.wts / "clean-detached")
     r = remove("-f", p.name)
     check("a clean detached worktree at a branch commit is removed",
           r.code == 0 and removed(p), r.desc())
@@ -1375,21 +1494,21 @@ def remove_command():
     # tmux.
     kill_tmux()
     p = c.add_wt("feat/tmux")
-    new_session(p.name, p)
-    attach_client(p.name)
+    new_session(c.session(p), p)
+    attach_client(c.session(p))
     r = remove("-f", "feat/tmux")
     check("remove closes the worktree's tmux session",
-          r.code == 0 and removed(p) and wait_until(lambda: p.name not in sessions()),
+          r.code == 0 and removed(p) and wait_until(lambda: c.session(p) not in sessions()),
           r.desc() + f" sessions={sorted(sessions())}")
     check("an attached client is moved to the main checkout's session first",
           wait_until(lambda: client_sessions() == ["app"])
           and session_path("app") == str(c.main),
           f"clients={client_sessions()} sessions={sorted(sessions())}")
     q = c.add_wt("feat/tmux-detached")
-    new_session(q.name, q)
+    new_session(c.session(q), q)
     r = remove("-f", "feat/tmux-detached")
     check("a session with no client is closed too",
-          r.code == 0 and wait_until(lambda: q.name not in sessions())
+          r.code == 0 and wait_until(lambda: c.session(q) not in sessions())
           and "app" in sessions(), r.desc() + f" sessions={sorted(sessions())}")
     kill_tmux()
 
@@ -1436,8 +1555,8 @@ def prune_command():
           r.code == 1 and ffm.exists() and sq.exists() and c.is_registered(missing), r.desc())
 
     kill_tmux()
-    new_session(ffm.name, ffm)
-    new_session(fresh.name, fresh)
+    new_session(c.session(ffm), ffm)
+    new_session(c.session(fresh), fresh)
     r = wt("prune", "-d", "--no-fetch", cwd=c.main, stdin="y\n")
     check("one yes removes every merged worktree",
           not ffm.exists() and not sq.exists()
@@ -1454,7 +1573,8 @@ def prune_command():
           (dirty / "notes.txt").exists() and c.has_branch("feat/dirty")
           and dirty.name in r.all, r.desc())
     check("prune closes the removed worktrees' tmux sessions only",
-          wait_until(lambda: ffm.name not in sessions()) and fresh.name in sessions(),
+          wait_until(lambda: c.session(ffm) not in sessions())
+          and c.session(fresh) in sessions(),
           f"sessions={sorted(sessions())}")
     kill_tmux()
 
@@ -1560,18 +1680,431 @@ def claude_hook():
     git(s.main, "submodule", "add", "-q", str(src), "sub")
     git(s.main, "commit", "-qm", "add sub")
     # git keeps a submodule's branches and worktree records in
-    # .git/modules/<name>, so those land there whatever the tool does. The
+    # its modules/<name>, so those land there whatever the tool does. The
     # audit bug was the checkout itself landing there.
-    modules = s.main / ".git" / "modules"
+    modules = Path(git(s.main / "sub", "rev-parse", "--path-format=absolute",
+                       "--git-common-dir")).parent
     r = hook("feat/sub", s.main / "sub")
     printed = Path(r.out.strip()) if r.out.strip() else None
     check("the hook in a submodule checkout puts the worktree in the submodule, "
-          "not under .git/modules",
+          "not under git's modules folder",
           r.code == 0 and printed is not None
           and printed.is_relative_to(s.main / "sub" / ".claude" / "worktrees")
           and not printed.resolve().is_relative_to(modules.resolve())
           and git(printed, "rev-parse", "--show-toplevel") == str(printed),
           r.desc())
+
+
+def calls(log: Path) -> list[list[str]]:
+    return [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+
+
+def asked(log: Path, *command: str) -> list[list[str]]:
+    return [call for call in calls(log) if call[: len(command)] == list(command)]
+
+
+def use_remote_url(c: Case, url: str) -> None:
+    """origin named by url, which git still sends to the local origin."""
+    git(c.project, "config", f"url.{c.origin}.insteadOf", url)
+    git(c.project, "remote", "set-url", "origin", url)
+
+
+def squash_reworked(c: Case, branch: str) -> tuple[Path, str]:
+    """A branch squash-merged, then reworked on main, so only its merged
+    pull or merge request can tell it was merged."""
+    p = c.add_wt(branch)
+    edit_lines(p, "shared.txt", {3: "x 3"}, "one", c)
+    tip = edit_lines(p, "shared.txt", {9: "x 9"}, "two", c)
+    squash_merge(c, branch)
+    edit_lines(c.main, "shared.txt", {2: "main 2", 4: "main 4", 8: "main 8", 10: "main 10"},
+               "touch the lines around", c)
+    c.push_main()
+    return p, tip
+
+
+def forget_forges() -> None:
+    for path in (GH_PRS, GH_CALLS, GLAB_MRS, GLAB_HOSTS, GLAB_CALLS):
+        path.unlink(missing_ok=True)
+
+
+@section
+def forges():
+    forget_forges()
+    c = Case("forge-gitlab", files={"shared.txt": LINES}, forge=None)
+    use_remote_url(c, "git@gitlab.example.com:group/app.git")
+    p, tip = squash_reworked(c, "feat/mr")
+    GLAB_HOSTS.write_text("gitlab.example.com\n")
+    GLAB_MRS.write_text(json.dumps([{"iid": 4, "source_branch": "feat/mr", "sha": tip}]))
+    r = c.list("-v")
+    line = row(r.out, p.name) or ""
+    check("a host glab is logged in to is GitLab, and a merged MR makes its branch [MERGED]",
+          "[MERGED]" in line and "merge request !4" in line, r.desc())
+    check("glab is asked about exactly origin's project",
+          any("https://gitlab.example.com/group/app" in call
+              for call in asked(GLAB_CALLS, "mr", "list")), str(calls(GLAB_CALLS)))
+    check("and gh is not asked for pull requests", asked(GH_CALLS, "pr") == [],
+          str(calls(GH_CALLS)))
+    GLAB_MRS.write_text(json.dumps([{"iid": 4, "source_branch": "feat/mr", "sha": "0" * 40}]))
+    ok, d = not_merged_in_list(c, p)
+    check("an MR merged at another commit does not make it [MERGED]", ok, d)
+
+    GLAB_HOSTS.unlink()
+    GLAB_MRS.write_text(json.dumps([{"iid": 5, "source_branch": "feat/mr", "sha": tip}]))
+    use_remote_url(c, "https://gitlab.com/group/app.git")
+    ok, d = merged_in_list(c, p)
+    check("gitlab.com is GitLab without asking glab about a login", ok, d)
+
+    forget_forges()
+    g = Case("forge-github", files={"shared.txt": LINES}, forge=None)
+    use_remote_url(g, "https://github.com/owner/app.git")
+    p, tip = squash_reworked(g, "feat/pr")
+    set_prs([{"number": 5, "headRefName": "feat/pr", "headRefOid": tip, "state": "MERGED"}])
+    r = g.list("-v")
+    line = row(r.out, p.name) or ""
+    check("github.com is GitHub, and a merged PR makes its branch [MERGED]",
+          "[MERGED]" in line and "pull request #5" in line, r.desc())
+    check("gh is asked about exactly origin's repository",
+          any("github.com/owner/app" in call for call in asked(GH_CALLS, "pr", "list")),
+          str(calls(GH_CALLS)))
+
+    forget_forges()
+    u = Case("forge-unknown", files={"shared.txt": LINES}, forge=None)
+    use_remote_url(u, "https://git.example.org/team/app.git")
+    p, tip = squash_reworked(u, "feat/x")
+    set_prs([{"number": 6, "headRefName": "feat/x", "headRefOid": tip, "state": "MERGED"}])
+    GLAB_MRS.write_text(json.dumps([{"iid": 6, "source_branch": "feat/x", "sha": tip}]))
+    ok, d = not_merged_in_list(u, p)
+    check("a host neither gh nor glab knows is no forge", ok, d)
+    check("and neither is asked for merged requests",
+          asked(GH_CALLS, "pr") == [] and asked(GLAB_CALLS, "mr") == [],
+          f"gh={calls(GH_CALLS)} glab={calls(GLAB_CALLS)}")
+    git(u.project, "config", "worktree.forge", "gitlab")
+    ok, d = merged_in_list(u, p)
+    check("worktree.forge=gitlab makes it GitLab", ok, d)
+    git(u.project, "config", "worktree.forge", "none")
+    GLAB_CALLS.unlink(missing_ok=True)
+    ok, d = not_merged_in_list(u, p)
+    check("worktree.forge=none asks no forge", ok and asked(GLAB_CALLS, "mr") == [], d)
+    forget_forges()
+
+
+@section
+def upstream_gone():
+    c = Case("upstream-gone")
+    clone = c.root / "clone"
+    git(c.root, "clone", "-q", str(c.origin), str(clone))
+    git(clone, "checkout", "-q", "-b", "feat/theirs")
+    c.commit(clone, "theirs.txt", "theirs\n")
+    git(clone, "push", "-q", "origin", "feat/theirs")
+    git(c.main, "fetch", "-q", "origin")
+    r = wt("add", "feat/theirs", cwd=c.main)
+    p = c.folder("feat/theirs")
+    git(clone, "checkout", "-q", "main")
+    git(clone, "merge", "-q", "--ff-only", "feat/theirs")
+    git(clone, "push", "-q", "origin", "main")
+    r = wt("list", cwd=c.main)
+    line = row(r.out, p.name) or ""
+    check("a branch taken from origin and fast-forwarded into main there is not [MERGED] "
+          "while its remote branch is there", r.code == 0 and "[MERGED]" not in line, r.desc())
+    git(clone, "push", "-q", "origin", "--delete", "feat/theirs")
+    r = wt("list", cwd=c.main)
+    line = row(r.out, p.name) or ""
+    check("once its remote branch is deleted, list's fetch prunes it and it is [MERGED]",
+          r.code == 0 and "[MERGED]" in line, r.desc())
+
+    q = c.add_wt("feat/abandoned")
+    c.commit(q, "abandoned.txt", "abandoned\n")
+    git(q, "push", "-q", "-u", "origin", "feat/abandoned")
+    git(clone, "push", "-q", "origin", "--delete", "feat/abandoned")
+    r = wt("list", cwd=c.main)
+    line = row(r.out, q.name) or ""
+    check("a branch with commits of its own is not [MERGED] because its remote branch is gone",
+          r.code == 0 and line and "[MERGED]" not in line, r.desc())
+
+    r = wt("prune", "-f", "-d", cwd=c.main)
+    check("prune -d removes the merged one and deletes its branch, and keeps the other",
+          r.code == 0 and not p.exists() and not c.has_branch("feat/theirs")
+          and q.exists() and c.has_branch("feat/abandoned"), r.desc())
+
+
+@section
+def all_projects():
+    home = SCRATCH / "all"
+    one = Case("all/one", repo="one")
+    two = Case("all/two", repo="two")
+    Case("all/empty", repo="empty")
+    plain_clone(home / "plain" / "projects" / "old")
+    done_one = one.add_wt("feat/done")
+    one.commit(done_one, "d.txt", "d\n")
+    ff_merge(one, "feat/done")
+    active = one.add_wt("feat/active")
+    one.commit(active, "a.txt", "a\n")
+    done_two = two.add_wt("feat/done")
+    two.commit(done_two, "d1.txt", "1\n")
+    two.commit(done_two, "d2.txt", "2\n")
+    squash_merge(two, "feat/done")
+    env = {"HOME": str(home)}
+
+    r = wt("list", "--all", "--no-fetch", cwd=home, env=env)
+    out = r.out
+    check("list --all lists every project with worktrees",
+          r.code == 0 and re.search(rf"^one\s+{re.escape(str(one.project))}$", out, re.M)
+          and re.search(rf"^two\s+{re.escape(str(two.project))}$", out, re.M)
+          and "feat/active" in out, r.desc())
+    check("with each one's merged state",
+          "[MERGED]" in (row(out, "feat-done") or "") and "[MERGED]" not in (row(out, "feat-active") or ""),
+          r.desc())
+    check("and leaves out projects with none, and plain clones",
+          r.code == 0 and "empty" not in out and "old" not in out.replace("fold", ""), r.desc())
+
+    r = wt("prune", "--all", "--dry-run", "--no-fetch", cwd=home, env=env)
+    check("prune --all --dry-run names the merged worktrees of every project",
+          r.code == 0 and "one" in r.out and "two" in r.out and r.out.count("feat/done") == 2
+          and done_one.exists() and done_two.exists(), r.desc())
+    r = wt("prune", "--all", "-d", "--no-fetch", cwd=home, env=env, stdin="y\n")
+    check("prune --all asks once and removes them in every project",
+          r.code == 0 and r.out.count("[y/N]") == 1 and not done_one.exists()
+          and not done_two.exists() and not one.has_branch("feat/done")
+          and not two.has_branch("feat/done"), r.desc())
+    check("and keeps what is not merged", active.exists(), r.desc())
+    r = wt("list", "--all", cwd=home, env=env)
+    check("list --all fetches every project and succeeds", r.code == 0 and "feat/active" in r.out,
+          r.desc())
+
+
+@section
+def clone():
+    c = Case("clone-src", files={"src/code.txt": "code\n"})
+    deep = c.add_wt("feat/deep")
+    deep_tip = c.commit(deep, "deep.txt", "deep\n")
+    git(deep, "push", "-q", "origin", "feat/deep")
+    where = c.root / "workspace"
+    where.mkdir()
+
+    r = wt("clone", str(c.origin), cwd=where)
+    proj = where / "origin"
+    main = proj / "main"
+    check("clone makes <name>/.bare with a .git file pointing at it",
+          r.code == 0 and (proj / ".bare").is_dir()
+          and (proj / ".git").is_file() and (proj / ".git").read_text() == "gitdir: ./.bare\n",
+          r.desc())
+    check("and a main worktree on main tracking origin/main",
+          (main / "README.md").exists()
+          and git(main, "symbolic-ref", "--short", "HEAD") == "main"
+          and git(main, "rev-parse", "--abbrev-ref", "@{upstream}") == "origin/main", r.desc())
+    check("origin's branches stay remote branches, and origin/HEAD is set",
+          git(proj, "for-each-ref", "--format=%(refname)", "refs/heads/") == "refs/heads/main"
+          and git_ok(proj, "show-ref", "--verify", "--quiet", "refs/remotes/origin/feat/deep")
+          and git(proj, "symbolic-ref", "refs/remotes/origin/HEAD") == "refs/remotes/origin/main",
+          git(proj, "for-each-ref"))
+    check("the project keeps reflogs",
+          git(proj, "config", "--get", "core.logAllRefUpdates") == "true", r.desc())
+    r = wt("add", "feat/c", cwd=proj)
+    mine = proj / "feat-c"
+    c.commit(mine, "c.txt", "c\n")
+    git(main, "merge", "-q", "--ff-only", "feat/c")
+    git(main, "push", "-q", "origin", "main")
+    r = wt("list", "--no-fetch", cwd=proj)
+    check("a fast-forward merged branch of a cloned project is [MERGED]",
+          r.code == 0 and "[MERGED]" in (row(r.out, "feat-c") or ""), r.desc())
+
+    gh = "https://github.com/owner/app"
+    gl = "https://gitlab.com/group/sub/app"
+    urls = {"GIT_CONFIG_COUNT": "2",
+            "GIT_CONFIG_KEY_0": f"url.{c.origin}.insteadOf", "GIT_CONFIG_VALUE_0": gh,
+            "GIT_CONFIG_KEY_1": f"url.{c.origin}.insteadOf", "GIT_CONFIG_VALUE_1": gl}
+    r = wt("clone", f"{gh}/tree/feat/deep/src", "from-github", cwd=where, env=urls)
+    proj = where / "from-github"
+    check("a GitHub tree URL clones the repository and adds its branch, "
+          "told apart from the path after it",
+          r.code == 0 and (proj / "main" / "README.md").exists()
+          and git(proj / "feat-deep", "rev-parse", "HEAD") == deep_tip
+          and git(proj / "feat-deep", "rev-parse", "--abbrev-ref", "@{upstream}")
+          == "origin/feat/deep", r.desc())
+    r = wt("clone", f"{gl}/-/tree/feat/deep?ref_type=heads", cwd=where, env=urls)
+    proj = where / "app"
+    check("a GitLab tree URL too, into a folder named after the repository",
+          r.code == 0 and (proj / "feat-deep" / "deep.txt").exists()
+          and (proj / "main").is_dir(), r.desc())
+
+    r = wt("clone", "-b", "feat/new", str(c.origin), "with-new", cwd=where)
+    proj = where / "with-new"
+    check("clone -b with a branch origin lacks makes it from main",
+          r.code == 0
+          and git(proj / "feat-new", "rev-parse", "HEAD") == git(c.origin, "rev-parse", "main"),
+          r.desc())
+
+    r = wt("clone", f"{gh}/tree/no/such", "missing-branch", cwd=where, env=urls)
+    check("a tree URL naming no branch of origin exits 1 and keeps the clone",
+          r.code == 1 and "no/such" in r.err and (where / "missing-branch" / "main").is_dir(),
+          r.desc())
+
+    write(where / "taken" / "keep.txt", "mine\n")
+    r = wt("clone", str(c.origin), "taken", cwd=where)
+    check("clone into a folder with files in it exits 1 and leaves it alone",
+          r.code == 1 and paths_under(where / "taken") == {"keep.txt"}, r.desc())
+    (where / "empty").mkdir()
+    r = wt("clone", str(c.origin), "empty", cwd=where)
+    check("clone into an empty folder works",
+          r.code == 0 and (where / "empty" / "main" / "README.md").exists(), r.desc())
+    r = wt("clone", str(c.root / "nothing-here.git"), "nothing", cwd=where)
+    check("a clone that cannot fetch exits 1 and leaves no folder",
+          r.code == 1 and not (where / "nothing").exists(), r.desc())
+
+
+def status(path: Path) -> str:
+    return git(path, "status", "--porcelain=v1", "--untracked-files=all")
+
+
+def listing(path: Path) -> set[str]:
+    return {entry.name for entry in path.iterdir()}
+
+
+@section
+def convert():
+    base = SCRATCH / "convert"
+    old = plain_clone(base / "projects" / "old", files={
+        ".gitignore": "data/\n.env\n.claude/worktrees/\n",
+        ".worktreelink": "data/\n",
+        "a.txt": "a\n",
+        "b.txt": "b\n",
+    })
+    origin = base / "origin.git"
+    git(base, "init", "-q", "--bare", "-b", "main", str(origin))
+    git(old, "remote", "add", "origin", str(origin))
+    git(old, "push", "-q", "-u", "origin", "main")
+    git(old, "remote", "set-head", "origin", "-a")
+    write(old / "data" / "big.csv", "rows\n")
+    write(old / ".env", "SECRET=1\n")
+    feat = base / "worktrees" / "old-feat-x"
+    git(old, "worktree", "add", "-q", "-b", "feat/x", str(feat))
+    write(feat / "wip.txt", "wip\n")
+    r = wt("bootstrap", str(feat), cwd=old)
+    nested = old / ".claude" / "worktrees" / "n"
+    git(old, "worktree", "add", "-q", "-b", "worktree-n", str(nested))
+    spike = base / "worktrees" / "old-spike"
+    git(old, "worktree", "add", "-q", "--detach", str(spike))
+    gone = base / "worktrees" / "old-gone"
+    git(old, "worktree", "add", "-q", "-b", "feat/gone", str(gone))
+    shutil.rmtree(gone)
+    write(old / "a.txt", "staged\n")
+    git(old, "add", "a.txt")
+    write(old / "b.txt", "unstaged\n")
+    write(old / "u.txt", "untracked\n")
+    before = {"main": status(old), "feat": status(feat), "nested": status(nested)}
+    top_before = listing(old)
+    check("the old worktree links data/ into the main checkout",
+          r.code == 0 and (feat / "data").is_symlink(), r.desc())
+
+    r = wt("convert", "--dry-run", cwd=old)
+    check("convert --dry-run shows where everything goes and moves nothing",
+          r.code == 0 and str(feat) in r.out and str(old / "feat-x") in r.out
+          and str(old / "main") in r.out and listing(old) == top_before
+          and (old / ".git").is_dir(), r.desc())
+    check("and prunes nothing, a worktree whose folder is gone included",
+          str(gone) in git(old, "worktree", "list"), git(old, "worktree", "list"))
+    r = wt("convert", cwd=old, stdin="n\n")
+    check("declining exits 1 and moves nothing",
+          r.code == 1 and listing(old) == top_before and feat.exists(), r.desc())
+
+    r = wt("convert", "-f", cwd=old)
+    main = old / "main"
+    check("convert turns .git into .bare with a .git file pointing at it",
+          r.code == 0 and (old / ".bare").is_dir() and (old / ".git").is_file()
+          and (old / ".git").read_text() == "gitdir: ./.bare\n"
+          and git(old, "config", "--get", "core.bare") == "true"
+          and git(old, "config", "--get", "core.logAllRefUpdates") == "true", r.desc())
+    check("the project folder holds only .bare, .git and the worktrees",
+          listing(old) == {".bare", ".git", "main", "feat-x", "worktree-n", "spike"},
+          str(listing(old)))
+    check("the main checkout is the main worktree, with staged, unstaged and untracked "
+          "files as they were",
+          git(main, "symbolic-ref", "--short", "HEAD") == "main"
+          and status(main) == before["main"]
+          and git(main, "diff", "--cached", "--name-only") == "a.txt",
+          f"{status(main)!r} vs {before['main']!r}")
+    check("its ignored files came along",
+          (main / ".env").read_text() == "SECRET=1\n" and (main / "data" / "big.csv").exists(),
+          str(paths_under(main)))
+    moved = old / "feat-x"
+    check("a worktree from outside moves in next to it, its work intact",
+          not feat.exists() and git(moved, "symbolic-ref", "--short", "HEAD") == "feat/x"
+          and status(moved) == before["feat"], f"{status(moved)!r}")
+    check("and its link now points into the main worktree",
+          (moved / "data").is_symlink() and (moved / "data").resolve() == main / "data",
+          os.readlink(moved / "data") if (moved / "data").is_symlink() else "not a link")
+    check("a worktree that was nested in the main checkout moves out",
+          not nested.exists() and status(old / "worktree-n") == before["nested"]
+          and git(old / "worktree-n", "symbolic-ref", "--short", "HEAD") == "worktree-n",
+          str(listing(old)))
+    check("a detached worktree keeps its folder name without the repository prefix",
+          (old / "spike").is_dir() and not spike.exists()
+          and not git_ok(old / "spike", "symbolic-ref", "-q", "HEAD"), str(listing(old)))
+    registered = git(old, "worktree", "list", "--porcelain")
+    check("git knows every worktree at its new place",
+          all(f"worktree {old / name}\n" in registered + "\n"
+              for name in ("main", "feat-x", "worktree-n", "spike"))
+          and "prunable" not in registered and str(gone) not in registered, registered)
+    r = wt("list", "--no-fetch", cwd=old)
+    check("list works on the converted project",
+          r.code == 0 and row(r.out, "feat-x") and row(r.out, "spike"), r.desc())
+    r = wt("add", "feat/after", cwd=main)
+    check("add works on it and links from the main worktree",
+          r.code == 0 and (old / "feat-after" / "data").resolve() == main / "data", r.desc())
+    r = wt("convert", "-f", cwd=old)
+    check("converting a project again exits 1", r.code == 1 and "already" in r.err, r.desc())
+
+    def refused(name: str, repo: Path, why: str) -> None:
+        top = listing(repo)
+        r = wt("convert", "-f", cwd=repo)
+        check(f"convert refuses {why} and moves nothing",
+              r.code == 1 and error_line(r.err) and listing(repo) == top
+              and (repo / ".git").is_dir(), r.desc())
+
+    repo = plain_clone(base / "refuse" / "feature")
+    git(repo, "checkout", "-q", "-b", "feat/here")
+    refused("feature", repo, "a main checkout on a feature branch")
+
+    repo = plain_clone(base / "refuse" / "merging", files={"f.txt": "base\n"})
+    git(repo, "checkout", "-q", "-b", "other")
+    write(repo / "f.txt", "other\n")
+    git(repo, "commit", "-qam", "other")
+    git(repo, "checkout", "-q", "main")
+    write(repo / "f.txt", "main\n")
+    git(repo, "commit", "-qam", "main")
+    git(repo, "merge", "-q", "other", check=False)
+    refused("merging", repo, "a merge in progress")
+
+    repo = plain_clone(base / "refuse" / "locked")
+    git(repo, "worktree", "add", "-q", "-b", "feat/l", str(base / "refuse" / "locked-l"))
+    git(repo, "worktree", "lock", str(base / "refuse" / "locked-l"))
+    refused("locked", repo, "a locked worktree")
+
+    repo = plain_clone(base / "refuse" / "collide")
+    git(repo, "worktree", "add", "-q", "-b", "feat/a-b", str(base / "refuse" / "c1"))
+    git(repo, "worktree", "add", "-q", "-b", "feat/a_b", str(base / "refuse" / "c2"))
+    refused("collide", repo, "two worktrees that would share a folder")
+
+
+@section
+def session():
+    c = Case("session", repo="my.app")
+    p = c.add_wt("feat/s")
+    OUTSIDE.mkdir(exist_ok=True)
+    for target, name in ((c.project, "the project folder"), (c.bare, "its .bare"),
+                         (c.main, "the main worktree")):
+        r = wt("session", str(target), cwd=OUTSIDE)
+        check(f"session for {name} is the project's, in the main worktree",
+              r.code == 0 and r.out == f"my_app\t{c.main}\n", r.desc())
+    write(p / "src" / "x.txt", "x\n")
+    r = wt("session", cwd=p / "src")
+    check("session in a worktree's subdirectory is <project>-<folder>, in the worktree",
+          r.code == 0 and r.out == f"my_app-feat-s\t{p}\n", r.desc())
+    old = plain_clone(SCRATCH / "session-plain")
+    for target, name in ((OUTSIDE, "outside a repository"), (old, "in a plain clone")):
+        r = wt("session", str(target), cwd=OUTSIDE)
+        check(f"session {name} exits 1", r.code == 1 and r.out == "" and error_line(r.err),
+              r.desc())
 
 
 # --- main ------------------------------------------------------------------------------------

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # End-to-end checks for git-wt-bootstrap, git-wt-add and the Claude Code
-# WorktreeCreate hook, on throwaway repos laid out the way the scripts expect:
-# <root>/projects/<repo> with worktrees landing in <root>/worktrees/.
+# WorktreeCreate hook, on throwaway projects laid out the way git-wt makes
+# them: <root>/projects/<repo>/.bare with the main worktree <repo>/main and
+# the others next to it.
 #
 # direnv and mise are stand-ins on PATH that log how they were called, so the
 # checks can tell "called only when relevant" apart from "not installed".
@@ -59,13 +60,18 @@ same() { [[ "$1" == "$2" ]]; }
 has_file() { [[ -f "$1" && ! -L "$1" ]]; }
 content_is() { [[ -f "$1" && "$(cat "$1")" == "$2" ]]; }
 
-# A fresh main checkout under <root>/projects/<name>, with one commit that
-# tracks whatever is passed as "path=content" pairs.
+# A fresh project <root>/projects/<name>, whose main worktree has one
+# commit tracking whatever is passed as "path=content" pairs. Prints the
+# main worktree's path.
 make_repo() {
-    local main="${scratch}/$1/projects/$2"
+    local project="${scratch}/$1/projects/$2"
+    local main="${project}/main"
     shift 2
-    mkdir -p "${main}"
-    git -C "${main}" init -q
+    mkdir -p "${project}"
+    git init -q --bare -b main "${project}/.bare"
+    echo 'gitdir: ./.bare' >"${project}/.git"
+    git -C "${project}" config core.logAllRefUpdates true
+    git -C "${project}" worktree add -q --orphan -b main "${main}"
     local pair
     for pair in "$@"; do
         mkdir -p "$(dirname "${main}/${pair%%=*}")"
@@ -97,8 +103,8 @@ put "${main}" .claude/settings.local.json '{"local": true}'
 put "${main}" vendor/lib/config.json '{"vendor": true}'
 put "${main}" vendor/lib/other.json '{}'
 put "${main}" cache/deep/settings.json '{}'
-git -C "${main}" worktree add -q -b one "${scratch}/copy/worktrees/app-one"
-wt="${scratch}/copy/worktrees/app-one"
+wt="${scratch}/copy/projects/app/one"
+git -C "${main}" worktree add -q -b one "${wt}"
 put "${wt}" .env.local "WORKTREE=1"
 git-wt-bootstrap "${wt}" >"${scratch}/out" 2>&1 || cat "${scratch}/out"
 
@@ -134,7 +140,7 @@ main="$(make_repo link app \
 put "${main}" data/big.csv "rows"
 put "${main}" .env "SECRET=1"
 put "${main}" models/weights.bin "weights"
-wt="${scratch}/link/worktrees/app-one"
+wt="${scratch}/link/projects/app/one"
 git -C "${main}" worktree add -q -b one "${wt}"
 put "${wt}" models/mine.bin "already here"
 git-wt-bootstrap "${wt}" >"${scratch}/link-out" 2>&1 || true
@@ -156,23 +162,23 @@ check "a linked path never shows up in git status" \
 # --- WORKTREE_INDEX -----------------------------------------------------------
 
 main="$(make_repo index app)"
-wts="${scratch}/index/worktrees"
+wts="${scratch}/index/projects/app"
 for name in a b c; do
-    git -C "${main}" worktree add -q -b "${name}" "${wts}/app-${name}"
+    git -C "${main}" worktree add -q -b "${name}" "${wts}/${name}"
 done
 index_of() { git-wt-bootstrap --index "$1"; }
 
-check "the main checkout is index 0" same "$(index_of "${main}")" 0
-quiet git-wt-bootstrap "${wts}/app-a"
-quiet git-wt-bootstrap "${wts}/app-b"
-check "the first worktree gets index 1" same "$(index_of "${wts}/app-a")" 1
-check "the next one gets index 2" same "$(index_of "${wts}/app-b")" 2
-quiet git-wt-bootstrap "${wts}/app-a"
-check "re-running keeps a worktree's index" same "$(index_of "${wts}/app-a")" 1
-git -C "${main}" worktree remove "${wts}/app-a"
-quiet git-wt-bootstrap "${wts}/app-c"
-check "a removed worktree's index is reused" same "$(index_of "${wts}/app-c")" 1
-check "without disturbing the others" same "$(index_of "${wts}/app-b")" 2
+check "the main worktree is index 0" same "$(index_of "${main}")" 0
+quiet git-wt-bootstrap "${wts}/a"
+quiet git-wt-bootstrap "${wts}/b"
+check "the first worktree gets index 1" same "$(index_of "${wts}/a")" 1
+check "the next one gets index 2" same "$(index_of "${wts}/b")" 2
+quiet git-wt-bootstrap "${wts}/a"
+check "re-running keeps a worktree's index" same "$(index_of "${wts}/a")" 1
+git -C "${main}" worktree remove "${wts}/a"
+quiet git-wt-bootstrap "${wts}/c"
+check "a removed worktree's index is reused" same "$(index_of "${wts}/c")" 1
+check "without disturbing the others" same "$(index_of "${wts}/b")" 2
 
 # --- direnv, mise and the worktree:setup task ---------------------------------
 
@@ -197,7 +203,7 @@ main="$(make_repo tools app \
     ".worktreeinclude=.envrc" \
     "mise.toml=$(printf '[tasks."worktree:setup"]\nrun = "true"\n')")"
 put "${main}" .envrc "use mise"
-wt="${scratch}/tools/worktrees/app-one"
+wt="${scratch}/tools/projects/app/one"
 git -C "${main}" worktree add -q -b one "${wt}"
 : >"${calls}"
 quiet git-wt-bootstrap "${wt}"
@@ -208,7 +214,7 @@ check "the worktree:setup task runs in the worktree" \
     called "mise run worktree:setup | index=1 main=${main} pwd=${wt}"
 
 main="$(make_repo plain app)"
-wt="${scratch}/plain/worktrees/app-one"
+wt="${scratch}/plain/projects/app/one"
 git -C "${main}" worktree add -q -b one "${wt}"
 : >"${calls}"
 quiet git-wt-bootstrap "${wt}"
@@ -216,7 +222,7 @@ check "without .envrc direnv is not called" not called_like "^direnv"
 check "without a mise config mise is not called" not called_like "^mise"
 
 main="$(make_repo notask app "mise.toml=$(printf '[tools]\n')")"
-wt="${scratch}/notask/worktrees/app-one"
+wt="${scratch}/notask/projects/app/one"
 git -C "${main}" worktree add -q -b one "${wt}"
 : >"${calls}"
 quiet git-wt-bootstrap "${wt}"
@@ -225,7 +231,7 @@ check "and no task is run" not called_like "^mise run"
 
 main="$(make_repo failing app \
     "mise.toml=$(printf '[tasks."worktree:setup"]\nrun = "false"\n')")"
-wt="${scratch}/failing/worktrees/app-one"
+wt="${scratch}/failing/projects/app/one"
 git -C "${main}" worktree add -q -b one "${wt}"
 cat >"${stubs}/mise" <<'EOF'
 #!/usr/bin/env bash
@@ -241,7 +247,7 @@ for tool in bash env uv readlink git realpath sed sort cp ln mkdir mktemp rm rmd
 done
 main="$(make_repo nomise app ".gitignore=.envrc" ".worktreeinclude=.envrc" "mise.toml=")"
 put "${main}" .envrc "use mise"
-wt="${scratch}/nomise/worktrees/app-one"
+wt="${scratch}/nomise/projects/app/one"
 git -C "${main}" worktree add -q -b one "${wt}"
 check "without direnv or mise installed it still succeeds" \
     quiet env PATH="${bare}" "${repo}/scripts/.local/bin/git-wt-bootstrap" "${wt}"
@@ -250,7 +256,7 @@ check "without direnv or mise installed it still succeeds" \
 
 main="$(make_repo wtadd app ".gitignore=.env" ".worktreeinclude=.env")"
 put "${main}" .env "SECRET=1"
-wt="${scratch}/wtadd/worktrees/app-feat-x"
+wt="${scratch}/wtadd/projects/app/feat-x"
 (cd "${main}" && git-wt-add feat/x) >"${scratch}/wtadd-out" 2>&1 || true
 check "git-wt-add bootstraps the worktree it creates" content_is "${wt}/.env" "SECRET=1"
 rm -f "${wt}/.env"
@@ -273,7 +279,7 @@ branch_of() { git -C "$1" rev-parse --abbrev-ref HEAD; }
 
 main="$(make_repo claude app ".gitignore=.env" ".worktreeinclude=.env" "src/main.txt=code")"
 put "${main}" .env "SECRET=1"
-wt="${scratch}/claude/worktrees/app-feat-auth"
+wt="${scratch}/claude/projects/app/feat-auth"
 check "the hook succeeds from a subdirectory of the checkout" hook "${main}/src" feat/auth
 check "it prints the git-wt-add worktree path" same "$(hook_path)" "${wt}"
 check "and nothing else on stdout" only_the_path "${wt}"
@@ -282,14 +288,18 @@ check "and bootstrapped" content_is "${wt}/.env" "SECRET=1"
 check "asking for the same name again succeeds" hook "${main}" feat/auth
 check "and prints the same path" only_the_path "${wt}"
 
-# Subagent worktrees come through the same hook, from repos anywhere.
+# Subagent worktrees come through the same hook, from repos anywhere,
+# plain clones included.
 main="${scratch}/elsewhere/app"
-mkdir -p "$(dirname "${main}")"
-make_repo elsewhere-tmp app ".gitignore=$(printf '.env\n.claude/worktrees/\n')" ".worktreeinclude=.env" >/dev/null
-mv "${scratch}/elsewhere-tmp/projects/app" "${main}"
+mkdir -p "${main}"
+git -C "${main}" init -q -b main
+put "${main}" .gitignore "$(printf '.env\n.claude/worktrees/\n')"
+put "${main}" .worktreeinclude .env
+git -C "${main}" add -A
+git -C "${main}" commit -qm init
 put "${main}" .env "SECRET=1"
 wt="${main}/.claude/worktrees/bold-oak-a3f2"
-check "outside a projects/ folder the hook still succeeds" hook "${main}" bold-oak-a3f2
+check "in a plain clone the hook still succeeds" hook "${main}" bold-oak-a3f2
 check "it uses Claude Code's own location" only_the_path "${wt}"
 check "and branch name" same "$(branch_of "${wt}")" worktree-bold-oak-a3f2
 check "and bootstraps that worktree too" content_is "${wt}/.env" "SECRET=1"
