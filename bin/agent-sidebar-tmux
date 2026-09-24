@@ -214,15 +214,21 @@ pane_path() {
     tmux display-message -p -t "$1" '#{pane_current_path}'
 }
 
-# The main checkout of the repository a directory is in, or nothing. Every
-# worktree shares its main checkout's common dir, which is `<main>/.git`.
-main_checkout() {
+# The project folder a directory is in, or nothing. Every worktree shares
+# its project's common dir, which is `<project>/.bare`.
+project_of() {
     local common
     common="$(git -C "$1" rev-parse --path-format=absolute \
         --git-common-dir 2>/dev/null)" || return 0
-    if [[ "$(basename "${common}")" == ".git" ]]; then
+    if [[ "$(basename "${common}")" == ".bare" ]]; then
         dirname "${common}"
     fi
+}
+
+# git-wt's tmux session name and folder for a directory, tab separated:
+# what it opens a worktree as, so opening it any way lands in one session.
+session_of() {
+    git-wt session "$1" 2>/dev/null
 }
 
 # The worktree that has a branch checked out, or nothing.
@@ -254,23 +260,24 @@ notify() {
 }
 
 new_worktree() {
-    local pane="$1" branch="$2" main path session
-    main="$(main_checkout "$(pane_path "${pane}")")"
-    if [[ -z "${main}" ]]; then
-        notify "no git checkout behind ${pane}"
+    local pane="$1" branch="$2" project path session
+    project="$(project_of "$(pane_path "${pane}")")"
+    if [[ -z "${project}" ]]; then
+        notify "no project behind ${pane}"
         return 0
     fi
-    # git-wt-add only runs from the main checkout, and it reports as it
-    # goes - setting the worktree up included - so it runs where you can
-    # read it.
-    popup "${main}" "$0" _worktree-add "${branch}"
-    path="$(worktree_for_branch "${main}" "${branch}")"
+    # git-wt-add reports as it goes - setting the worktree up included - so
+    # it runs where you can read it.
+    popup "${project}" "$0" _worktree-add "${branch}"
+    path="$(worktree_for_branch "${project}" "${branch}")"
     if [[ -z "${path}" ]]; then
         return 0
     fi
-    # Named the way tmux-sessionizer names a folder's session, so opening
-    # the worktree through it later (or `o`) lands in this one.
-    session="$(basename "${path}" | tr .: __)"
+    session="$(session_of "${path}" | cut -f1)"
+    if [[ -z "${session}" ]]; then
+        notify "no tmux session name for ${path}"
+        return 0
+    fi
     if ! tmux has-session -t "=${session}" 2>/dev/null; then
         tmux new-session -d -s "${session}" -c "${path}"
         # Typed into the shell rather than run as the session's command, so
@@ -317,15 +324,16 @@ pull_request() {
 }
 
 remove_worktree() {
-    local pane="$1" dir main top
+    local pane="$1" dir project main top
     dir="$(pane_path "${pane}")"
-    main="$(main_checkout "${dir}")"
+    project="$(project_of "${dir}")"
+    main="$(session_of "${project:-/nonexistent}" | cut -f2)"
     top="$(git -C "${dir}" rev-parse --show-toplevel 2>/dev/null || true)"
-    if [[ -z "${main}" || -z "${top}" || "${top}" == "${main}" ]]; then
-        notify "${pane} is not working in a worktree"
+    if [[ -z "${project}" || -z "${top}" || "${top}" == "${main}" ]]; then
+        notify "${pane} is not working in a project's worktree"
         return 0
     fi
-    popup "${main}" "$0" _worktree-remove "${top}"
+    popup "${project}" "$0" _worktree-remove "${top}"
     # git-wt-remove asks first, refuses to throw away uncommitted work, and
     # closes the worktree's own session. Only once the worktree is really
     # gone does the agent go too, if it lived in some other session.

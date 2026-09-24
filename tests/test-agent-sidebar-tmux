@@ -38,7 +38,7 @@ mkdir -p "${scratch}/bin"
 cat >"${scratch}/bin/git-wt-add" <<'EOF'
 #!/bin/sh
 set -e
-git worktree add -q -b "$1" "$(dirname "$PWD")/app-$(echo "$1" | tr / -)"
+git worktree add -q -b "$1" "$PWD/$(echo "$1" | tr / -)"
 EOF
 cat >"${scratch}/bin/git-wt-remove" <<'EOF'
 #!/bin/sh
@@ -58,9 +58,14 @@ chmod +x "${scratch}/bin/"*
 # A pre-commit hook hands down GIT_INDEX_FILE and friends, which would aim
 # the git calls below at this repository.
 while IFS= read -r var; do unset "${var}"; done < <(env | awk -F= '/^GIT_/ { print $1 }')
+# A project the way git-wt lays one out: .bare, a .git file pointing at it,
+# and the main worktree next to them.
 project="${scratch}/projects/app"
-git init -q -b main "${project}"
-git -C "${project}" -c user.name=t -c user.email=t@t -c commit.gpgsign=false \
+main="${project}/main"
+git init -q --bare -b main "${project}/.bare"
+echo 'gitdir: ./.bare' >"${project}/.git"
+git -C "${project}" worktree add -q --orphan -b main "${main}"
+git -C "${main}" -c user.name=t -c user.email=t@t -c commit.gpgsign=false \
     commit -q --allow-empty --no-verify -m init
 
 t() { tmux -L "${socket}" "$@"; }
@@ -205,12 +210,12 @@ exists() { [[ -e "$1" ]]; }
 pane_alive() { t display-message -p -t "$1" '#{pane_id}' | grep -qxF "$1"; }
 client_session() { t list-clients -F '#{client_pid} #{session_name}' | sort -n | head -1 | cut -d' ' -f2; }
 
-agent="$(t new-window -t main: -n agent -c "${project}" -P -F '#{pane_id}' \
+agent="$(t new-window -t main: -n agent -c "${main}" -P -F '#{pane_id}' \
     "cat >${scratch}/pasted")"
-worktree="${scratch}/projects/app-feat-x"
+worktree="${project}/feat-x"
 act new-worktree "${agent}" feat/x
-check "new-worktree makes the worktree from the main checkout" exists "${worktree}"
-check "gives it a session named after its folder" equals \
+check "new-worktree makes the worktree in the agent's project" exists "${worktree}"
+check "gives it the session git-wt names it" equals \
     "t display-message -p -t =app-feat-x: #{pane_current_path}" "${worktree}"
 check "starts the agent in it" exists "${worktree}/agent-started"
 check "and takes you there" equals client_session app-feat-x
@@ -220,9 +225,9 @@ check "review pastes tuicr's export into the agent" grep -qF 'rename B to b' \
     "${scratch}/pasted"
 check "and takes you to it" equals client_session main
 
-main_agent="$(t new-window -t main: -c "${project}" -P -F '#{pane_id}' 'sleep 3600')"
+main_agent="$(t new-window -t main: -c "${main}" -P -F '#{pane_id}' 'sleep 3600')"
 act remove-worktree "${main_agent}"
-check "remove-worktree leaves a main checkout alone" pane_alive "${main_agent}"
+check "remove-worktree leaves the main worktree alone" pane_alive "${main_agent}"
 wt_agent="$(t new-window -t main: -c "${worktree}" -P -F '#{pane_id}' 'sleep 3600')"
 act remove-worktree "${wt_agent}"
 check "remove-worktree removes the agent's worktree" not exists "${worktree}"
