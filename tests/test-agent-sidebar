@@ -165,18 +165,61 @@ async def app_cases(mod) -> list[tuple[str, bool, str]]:
         got = await act("x", "y")
         check("x then y kills it", got == (glue, "kill", "%3"), got)
 
+        from textual.widgets import Checkbox
         await pilot.press("n")
         await pilot.pause(0.1)
-        check("n asks for a branch",
-              isinstance(app.screen, mod.BranchPrompt), app.screen)
+        check("n shows single worktree+harness modal",
+              isinstance(app.screen, mod.NewWorktreePrompt), app.screen)
+        # yolo on by default, harness list present, agent hidden
+        yolo = app.screen.query_one("#yolo-check", Checkbox)
+        check("yolo is on by default", yolo.value is True, yolo.value)
+        hlist = app.screen.query_one("#harness-list", OptionList)
+        alist = app.screen.query_one("#agent-list", OptionList)
+        check("harness list has claude default", hlist.highlighted_option.id == "claude", hlist.highlighted_option.id)
+        check("agent list hidden until agent harness", not alist.display, alist.display)
+        # tab moves focus (Input -> harness -> yolo -> agent hidden -> back)
+        # branch input is focused initially
         app.screen.query_one(Input).value = "feat/x"
         got = await act("enter")
-        check("and makes a worktree on it",
-              got == (glue, "new-worktree", "%3", "feat/x"), got)
-        got = await act("n", "escape")
-        check("esc makes nothing", got is None, got)
-        check("and returns to the list", not isinstance(
-            app.screen, mod.BranchPrompt), app.screen)
+        check("enter creates worktree with yolo flag",
+              got == (glue, "new-worktree", "%3", "feat/x", "claude --dangerously-skip-permissions"), got)
+        # yolo off
+        await pilot.press("n")
+        await pilot.pause(0.1)
+        app.screen.query_one(Input).value = "feat/y"
+        app.screen.query_one("#yolo-check", Checkbox).toggle()
+        await pilot.pause(0.1)
+        got = await act("enter")
+        check("yolo off omits flag", got == (glue, "new-worktree", "%3", "feat/y", "claude"), got)
+        # agent harness reveals sub-list (last is agent)
+        await pilot.press("n")
+        await pilot.pause(0.1)
+        app.screen.query_one(Input).value = "feat/agent-test"
+        hlist = app.screen.query_one("#harness-list", OptionList)
+        # directly highlight agent (last) to avoid focus-tab flakiness
+        hlist.highlighted = hlist.get_option_index("agent")
+        await pilot.pause(0.1)
+        check("harness agent selected", hlist.highlighted_option.id == "agent", hlist.highlighted_option.id)
+        alist = app.screen.query_one("#agent-list", OptionList)
+        check("agent list shown for agent harness", alist.display, alist.display)
+        # pick second agent
+        alist.highlighted = alist.get_option_index("orchestrator")
+        await pilot.pause(0.1)
+        check("agent sub-selection moves", alist.highlighted_option.id == "orchestrator", alist.highlighted_option.id)
+        # focus back to input and create
+        app.screen.query_one(Input).focus()
+        await pilot.pause(0.1)
+        await pilot.press("enter")
+        await pilot.pause(0.1)
+        # harness is agent + orchestrator with yolo
+        check("agent harness builds agent command",
+              fake.ran[-1] == (glue, "new-worktree", "%3", "feat/agent-test", "agent orchestrator --yolo"), fake.ran[-1])
+        # esc cancels whole modal
+        await pilot.press("n")
+        await pilot.pause(0.1)
+        got = await act("escape")
+        check("esc cancels single modal", got is None, got)
+        check("and returns to list", not isinstance(app.screen, mod.NewWorktreePrompt), app.screen)
 
         await pilot.press("question_mark")
         await pilot.pause(0.1)

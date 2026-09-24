@@ -18,8 +18,11 @@
 #
 # The sidebar's actions, each on an agent's pane:
 #
-#   new-worktree PANE BRANCH create a worktree of PANE's project, give it a
-#                            session of its own and start an agent there
+#   new-worktree PANE BRANCH [HARNESS]
+#                            create a worktree of PANE's project, give it a
+#                            session of its own and start HARNESS there
+#                            (default: $AGENT_SIDEBAR_AGENT or claude; "none"
+#                            starts no harness)
 #   review PANE              review PANE's uncommitted changes in tuicr; its
 #                            export (y) is pasted into PANE's input
 #   git PANE                 lazygit in PANE's directory
@@ -260,7 +263,7 @@ notify() {
 }
 
 new_worktree() {
-    local pane="$1" branch="$2" project path session
+    local pane="$1" branch="$2" harness="${3:-}" project path session chosen
     project="$(project_of "$(pane_path "${pane}")")"
     if [[ -z "${project}" ]]; then
         notify "no project behind ${pane}"
@@ -282,7 +285,10 @@ new_worktree() {
         tmux new-session -d -s "${session}" -c "${path}"
         # Typed into the shell rather than run as the session's command, so
         # the session outlives the agent.
-        tmux send-keys -t "=${session}:" "${agent_command}" Enter
+        chosen="${harness:-${agent_command}}"
+        if [[ -n "${chosen}" && "${chosen}" != "none" ]]; then
+            tmux send-keys -t "=${session}:" "${chosen}" Enter
+        fi
     fi
     tmux switch-client -t "=${session}"
 }
@@ -383,8 +389,11 @@ main() {
         prune_resurrect "$2"
         ;;
     new-worktree)
-        need 3 "$@"
-        new_worktree "$2" "$3"
+        if [[ $# -lt 3 || $# -gt 4 ]]; then
+            usage >&2
+            exit 2
+        fi
+        new_worktree "$2" "$3" "${4:-}"
         ;;
     review)
         need 2 "$@"
