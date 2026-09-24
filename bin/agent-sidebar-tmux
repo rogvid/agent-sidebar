@@ -301,7 +301,7 @@ review() {
     # exporting ends the review; the review itself still draws on the
     # terminal. The $1 belongs to the inner sh, hence the single quotes.
     # shellcheck disable=SC2016
-    popup "${dir}" sh -c 'tuicr -w --stdout --no-update-check >"$1"' sh "${out}"
+    popup "${dir}" sh -c 'tuicr -w --stdout --no-update-check --appearance dark >"$1"' sh "${out}"
     if [[ -s "${out}" ]]; then
         tmux load-buffer -b agent-sidebar-review "${out}"
         # Bracketed and without Enter: the comments land in the agent's
