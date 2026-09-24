@@ -47,6 +47,12 @@ git worktree remove --force "$1"
 EOF
 cat >"${scratch}/bin/tuicr" <<'EOF'
 #!/bin/sh
+# Verify contrast fix: review() must pass --appearance dark to avoid
+# white-on-light-green in tuicr's light theme.
+case "$*" in
+*--appearance\ dark*) ;;
+*) echo "tuicr called without --appearance dark: $*" >&2; exit 1 ;;
+esac
 echo "1. f.txt:~2 - rename B to b"
 EOF
 cat >"${scratch}/bin/tv" <<EOF
