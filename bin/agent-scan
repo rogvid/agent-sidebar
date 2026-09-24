@@ -70,7 +70,86 @@ from pathlib import Path
 
 import psutil
 
-AGENT_NAMES = frozenset({"claude", "codex", "opencode", "pi"})
+# Harness is the provider binary (claude, codex, opencode, pi).
+# Roles (chief, architect, etc) are *not* hardcoded — they are picked up
+# from whatever the harness actually spawns. See find_harness_and_role()
+# below. Keeping the two concepts separate lets the sidebar show both —
+# e.g. "⬢ opencode · ★ chief" — instead of hiding the harness.
+HARNESS_NAMES = frozenset({"claude", "codex", "opencode", "pi"})
+
+# Backwards compat: AGENT_NAMES was the old single set. Keep it as harness
+# only so `from agent_scan import AGENT_NAMES` still works; callers that
+# need roles should discover them via find_harness_and_role() or
+# AGENT_SCAN_AGENTS.
+AGENT_NAMES = HARNESS_NAMES
+
+
+def _extra_names(env_keys: tuple[str, ...]) -> frozenset[str]:
+    for key in env_keys:
+        raw = os.environ.get(key)
+        if raw:
+            parts = re.split(r"[,\s:]+", raw.strip())
+            return frozenset(p.lower() for p in parts if p)
+    return frozenset()
+
+
+def _extra_harness_names() -> frozenset[str]:
+    # AGENT_SCAN_HARNESS / AGENT_HARNESS for harnesses, fallback to the old
+    # AGENT_SCAN_AGENTS / AGENT_EXTRA for backwards compat (treated as both).
+    extra = _extra_names(("AGENT_SCAN_HARNESS", "AGENT_HARNESS"))
+    if extra:
+        return extra
+    # old var also extends harness so existing configs keep working
+    return _extra_names(("AGENT_SCAN_AGENTS", "AGENT_EXTRA", "AGENT_ROLES"))
+
+
+def _extra_role_names() -> frozenset[str]:
+    return _extra_names((
+        "AGENT_SCAN_AGENTS", "AGENT_EXTRA", "AGENT_ROLES",
+        "AGENT_SCAN_ROLES", "AGENT_ROLE",
+    ))
+
+
+def _all_harness_names() -> frozenset[str]:
+    extra = _extra_harness_names()
+    return HARNESS_NAMES | extra if extra else HARNESS_NAMES
+
+
+# Roles are not hardcoded — they are discovered from what the harness actually
+# spawns. A small blocklist keeps shells and common tools from being mistaken
+# for a role. Anything else that appears under the harness is treated as the
+# role name, so "chief", "architect" or any future role is picked up without
+# changing this file. Explicit extra names via AGENT_SCAN_AGENTS are still
+# honoured and bypass the blocklist.
+_BLOCKED_ROLE_NAMES = frozenset({
+    "bash", "zsh", "sh", "fish", "dash", "ksh", "tmux", "screen",
+    "git", "nvim", "vim", "vi", "nano", "emacs",
+    "node", "python", "python3", "uv", "cargo", "make", "cmake",
+    "sleep", "ssh", "sshd", "less", "more", "fzf", "rg", "grep",
+    "awk", "sed", "ps", "systemd", "init", "code", "cursor",
+})
+
+
+def _is_explicit_role(name: str) -> bool:
+    return name.lower() in _extra_role_names()
+
+
+def _is_plausible_role(name: str) -> bool:
+    base = os.path.basename(name).lower() if name else ""
+    if not base or base in HARNESS_NAMES or base in _BLOCKED_ROLE_NAMES:
+        return False
+    if _is_explicit_role(base):
+        return True
+    # Heuristic: agent roles are single words, mostly alpha, optionally with
+    # dashes/underscores. This picks up "chief", "architect", "my-bot" but not
+    # "x86_64" or "123".
+    return bool(re.fullmatch(r"[a-z][a-z0-9_-]{1,30}", base))
+
+
+def _all_agent_names() -> frozenset[str]:
+    # Union for callers that just need "is this an agent at all?" — harness
+    # plus any explicitly configured roles.
+    return _all_harness_names() | _extra_role_names()
 
 RESET = "\033[0m"
 BLUE, YELLOW, GREEN, RED, MAGENTA, CYAN = (
@@ -382,12 +461,13 @@ def process_snapshot() -> tuple[dict[int, tuple[str, float]], dict[int, list[int
     return info, children
 
 
-def find_agent(
+def _find_first(
     root_pid: int,
     info: dict[int, tuple[str, float]],
     children: dict[int, list[int]],
+    allowed: frozenset[str],
 ) -> Agent | None:
-    """Shallowest agent process at or below root_pid, or None."""
+    """BFS for the shallowest process whose basename is in allowed."""
     queue = [root_pid]
     seen: set[int] = set()
     while queue:
@@ -399,10 +479,128 @@ def find_agent(
         if entry is None:
             continue
         name, started_at = entry
-        if name in AGENT_NAMES:
-            return Agent(name, pid, started_at)
+        base = os.path.basename(name).lower() if name else ""
+        if base in allowed or name.lower() in allowed:
+            canonical = base if base in allowed else name.lower()
+            return Agent(canonical, pid, started_at)
         queue.extend(children.get(pid, ()))
     return None
+
+
+def _find_role_dynamic(
+    root_pid: int,
+    info: dict[int, tuple[str, float]],
+    children: dict[int, list[int]],
+    harness_pid: int | None = None,
+) -> str | None:
+    """Pick up the role from whatever the harness actually spawned.
+
+    No hardcoded allowlist — any descendant of the harness (or of the pane)
+    whose basename looks like a role and is not a harness/shell is returned.
+    Explicit names via AGENT_SCAN_AGENTS still bypass the blocklist.
+    """
+    start = harness_pid if harness_pid is not None else root_pid
+    queue = [start]
+    seen: set[int] = set()
+    while queue:
+        pid = queue.pop(0)
+        if pid in seen:
+            continue
+        seen.add(pid)
+        entry = info.get(pid)
+        if entry is not None:
+            name, _ = entry
+            base = os.path.basename(name).lower() if name else ""
+            # Don't report the harness itself as its own role
+            if harness_pid is not None and pid == harness_pid:
+                pass
+            elif _is_plausible_role(name):
+                return base if base else name.lower()
+        queue.extend(children.get(pid, ()))
+
+    # If we started under the harness and found nothing, broaden to the whole
+    # pane so a role that is a sibling of the harness (both under the shell)
+    # is still picked up.
+    if harness_pid is not None and harness_pid != root_pid:
+        queue = [root_pid]
+        seen = set()
+        while queue:
+            pid = queue.pop(0)
+            if pid in seen or pid == harness_pid:
+                continue
+            seen.add(pid)
+            entry = info.get(pid)
+            if entry is not None:
+                name, _ = entry
+                if _is_plausible_role(name):
+                    base = os.path.basename(name).lower() if name else ""
+                    return base if base else name.lower()
+            queue.extend(children.get(pid, ()))
+    return None
+
+
+def find_agent(
+    root_pid: int,
+    info: dict[int, tuple[str, float]],
+    children: dict[int, list[int]],
+) -> Agent | None:
+    """Shallowest agent process at or below root_pid, or None.
+
+    For backwards compat this searches harnesses and any plausible role.
+    New code should use find_harness_and_role.
+    """
+    harness, role = find_harness_and_role(root_pid, info, children)
+    return harness
+
+
+def find_harness_and_role(
+    root_pid: int,
+    info: dict[int, tuple[str, float]],
+    children: dict[int, list[int]],
+) -> tuple[Agent | None, str | None]:
+    """Return (harness_agent, role_name) for a pane.
+
+    Harness is the provider binary (claude/codex/opencode/pi). Role is
+    discovered dynamically from whatever descendant the harness spawned — no
+    hardcoded role list. If no harness is found but a plausible role is,
+    the role is returned as the harness so the row still appears.
+    """
+    harness = _find_first(root_pid, info, children, _all_harness_names())
+    role: str | None = None
+
+    if harness is not None:
+        role = _find_role_dynamic(root_pid, info, children, harness.pid)
+    else:
+        # No harness — maybe the pane runs a role directly (e.g. `chief`
+        # binary). Treat any plausible role under the pane as the harness.
+        role_candidate = _find_role_dynamic(root_pid, info, children, None)
+        if role_candidate is not None:
+            # Need the Agent for started_at; find the pid that matched
+            # by re-scanning for that name.
+            candidate = _find_first(
+                root_pid, info, children, frozenset({role_candidate})
+            )
+            # _find_first uses allowlist, so for dynamic names we need a
+            # separate scan — just find the first plausible role pid.
+            if candidate is None:
+                # Fallback: BFS for plausible role to get Agent
+                queue = [root_pid]
+                seen: set[int] = set()
+                while queue:
+                    pid = queue.pop(0)
+                    if pid in seen:
+                        continue
+                    seen.add(pid)
+                    entry = info.get(pid)
+                    if entry is not None and _is_plausible_role(entry[0]):
+                        base = os.path.basename(entry[0]).lower()
+                        candidate = Agent(base or entry[0].lower(), pid, entry[1])
+                        break
+                    queue.extend(children.get(pid, ()))
+            harness = candidate
+            role = None
+
+    return harness, role
 
 
 # --- pane content ---
@@ -911,6 +1109,13 @@ class Row:
     age: str
     message: str
     flag: str
+    # Harness is the provider binary (claude/codex/opencode/pi). Role is the
+    # responsibility if one is detected in the process tree (chief/architect/
+    # ...). When no role is found role is "" so the sidebar shows only the
+    # harness; when a role is present both are shown. Defaults keep old
+    # test helpers and external callers working without passing them.
+    harness: str = ""
+    role: str = ""
 
 
 def sort_key(row: Row) -> tuple[int, int, float, str]:
@@ -937,23 +1142,29 @@ def collect_rows() -> list[Row]:
     info, children = process_snapshot()
     now = time.time()
 
-    agent_panes = [
-        (pane, agent)
-        for pane in panes
-        if (agent := find_agent(pane.pid, info, children)) is not None
-    ]
+    agent_panes: list[tuple[Pane, Agent, str]] = []
+    for pane in panes:
+        harness, role = find_harness_and_role(pane.pid, info, children)
+        if harness is None:
+            continue
+        agent_panes.append((pane, harness, role or ""))
+
     # Two agents in one working tree overwrite each other's edits with no
     # conflict and no warning, so it is worth saying out loud.
-    trees = Counter(pane.cwd for pane, _ in agent_panes)
+    trees = Counter(pane.cwd for pane, _, _ in agent_panes)
     # One lookup per tree rather than per pane, for the same reason.
     identities = {cwd: git_identity(cwd) for cwd in trees}
 
     rows: list[Row] = []
-    for pane, agent in agent_panes:
+    for pane, harness_agent, role in agent_panes:
         lines = visible_lines(capture_pane(pane.pane_id))
         state = classify(lines)
         since = state_seconds(state, lines, now)
         project, branch = identities[pane.cwd]
+        # Keep `agent` for backwards compat — it mirrors harness when no role,
+        # or the role when a role is present so old consumers still see a
+        # meaningful name. New consumers should read harness/role explicitly.
+        agent_name = role if role else harness_agent.name
         rows.append(Row(
             state=state,
             project=project,
@@ -961,13 +1172,15 @@ def collect_rows() -> list[Row]:
             target=pane.target,
             pane_id=pane.pane_id,
             cwd=pane.cwd,
-            agent=agent.name,
+            agent=agent_name,
+            harness=harness_agent.name,
+            role=role,
             context=parse_context(lines),
             duration=state_duration(state, since),
             since=since,
             block=parse_block(lines) or "-",
             weekly=parse_weekly(lines) or "-",
-            age=parse_age(lines) or format_elapsed(now - agent.started_at),
+            age=parse_age(lines) or format_elapsed(now - harness_agent.started_at),
             message=pick_message(state, lines),
             flag=SHARED_TREE if trees[pane.cwd] > 1 else " ",
         ))

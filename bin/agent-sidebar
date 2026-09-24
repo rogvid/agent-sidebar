@@ -78,6 +78,60 @@ CONTEXT_COLOR = {"warn": "yellow", "rot": "red"}
 MUTED = "color(245)"
 HERE = "▌"
 
+# Harness colours/icons are fixed; roles are picked up from the agent
+# at runtime (chief/architect/any future name) and get a stable colour
+# via hashing so no hardcoded role list is needed.
+HARNESS_COLOR = {
+    "claude": "cyan",
+    "codex": "green",
+    "opencode": "blue",
+    "pi": "magenta",
+}
+HARNESS_ICON = {
+    "claude": "◆",
+    "codex": "◇",
+    "opencode": "⬢",
+    "pi": "○",
+}
+ROLE_PALETTE = ["yellow", "bright_magenta", "bright_cyan", "bright_yellow", "red"]
+ROLE_ICON = "★"
+class _DynamicDict(dict):
+    """dict that returns a stable colour/icon for any role without hardcoding."""
+    def __getitem__(self, key: str) -> str:
+        if key in self:
+            return super().__getitem__(key)
+        # fall through to dynamic lookup
+        if self is AGENT_COLOR:
+            return agent_color(key)
+        return agent_icon(key)
+    def get(self, key: str, default=None):
+        if key in self:
+            return super().get(key, default)
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+# Keep old names for backwards compat — callers importing AGENT_COLOR still work.
+AGENT_COLOR: dict[str, str] = _DynamicDict(HARNESS_COLOR)
+AGENT_ICON: dict[str, str] = _DynamicDict(HARNESS_ICON)
+
+
+def agent_color(agent: str) -> str:
+    name = agent.lower()
+    if name in HARNESS_COLOR:
+        return HARNESS_COLOR[name]
+    # Roles — stable hash so "chief" always looks the same without hardcoding
+    h = sum(ord(c) for c in name)  # simple stable hash, no random
+    return ROLE_PALETTE[h % len(ROLE_PALETTE)] if name else MUTED
+
+
+def agent_icon(agent: str) -> str:
+    name = agent.lower()
+    if name in HARNESS_ICON:
+        return HARNESS_ICON[name]
+    return ROLE_ICON if name else "●"
+
 PROJECT_PREFIX = "project:"
 GLUE = "agent-sidebar-tmux"
 
@@ -146,6 +200,34 @@ def badges(row: Row, pr: dict[str, Any] | None) -> Text:
     return text
 
 
+def _harness_and_role(row: Row) -> tuple[str, str]:
+    """Return (harness, role) with backwards compat for old rows."""
+    harness = row.get("harness") or row.get("agent") or ""
+    role = row.get("role") or ""
+    # Old rows where agent is already the role but harness missing handled above.
+    # If role equals harness (e.g. no role, or role-as-harness fallback), hide role.
+    if role and role.lower() == harness.lower():
+        role = ""
+    return harness, role
+
+
+def _agent_display(row: Row) -> Text:
+    harness, role = _harness_and_role(row)
+    if not harness:
+        return Text("")
+    h_color = agent_color(harness)
+    h_icon = agent_icon(harness)
+    if role:
+        r_color = agent_color(role)
+        r_icon = agent_icon(role)
+        return Text.assemble(
+            (f"{h_icon} {harness}", h_color),
+            (" · ", MUTED),
+            (f"{r_icon} {role}", r_color),
+        )
+    return Text(f"{h_icon} {harness}", style=h_color)
+
+
 def agent_prompt(
     row: Row, here: bool, pr: dict[str, Any] | None = None,
 ) -> Group:
@@ -166,7 +248,7 @@ def agent_prompt(
         gutter,
         Text("●", style=color),
         branch,
-        Text.assemble(" ", (row["agent"], MUTED), duration),
+        Text.assemble(" ", _agent_display(row), duration),
     )
 
     bottom = grid()
@@ -352,7 +434,14 @@ class Help(ModalScreen[None]):
             ("100k", CONTEXT_COLOR["warn"]), " ",
             ("400k", CONTEXT_COLOR["rot"]), " tokens\n",
             ("▌", "bold"), "    in this window\n",
-            ("!", "bold red"), "    shares a working tree",
+            ("!", "bold red"), "    shares a working tree\n",
+            ("◆ claude", agent_color("claude")), " ",
+            ("◇ codex", agent_color("codex")), " ",
+            ("⬢ opencode", agent_color("opencode")), " ",
+            ("○ pi", agent_color("pi")), "  harness\n",
+            ("★ chief", agent_color("chief")), " ",
+            ("⬣ architect", agent_color("architect")), "  role · ",
+            ("◆ claude · ★ chief", "default"), " both",
         )
         with Vertical(classes="dialog"):
             yield Static(Text("Keys", style="bold"))
@@ -654,8 +743,10 @@ class AgentSidebar(App[None]):
             def kill(yes: bool | None) -> None:
                 if yes:
                     self.glue("kill", row["pane_id"])
+            harness, role = _harness_and_role(row)
+            who = f"{harness} · {role}" if role else harness
             question = Text.assemble(
-                "Kill ", (row["agent"], "bold"), " in ",
+                "Kill ", (who or row["agent"], "bold"), " in ",
                 (f"{row['project']}/{row['branch']}", "bold"), "?",
             )
             self.push_screen(Confirm(question), kill)
