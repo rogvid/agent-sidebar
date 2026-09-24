@@ -137,16 +137,13 @@ GLUE = "agent-sidebar-tmux"
 
 # Harnesses that can be started in a new worktree's session.
 # Overridable with AGENT_SIDEBAR_HARNESSES (space or comma separated).
-# Last harness is `agent` — picking it lets you choose a sub-agent.
-_DEFAULT_HARNESSES = ("claude", "codex", "opencode", "pi", "none", "agent")
-_AGENT_CHOICES = ("implementer", "orchestrator", "debugger", "verifier", "Explore")
+_DEFAULT_HARNESSES = ("claude", "codex", "opencode", "pi")
 # YOLO flag per harness when the checkbox is on (on by default).
 _HARNESS_YOLO: dict[str, str] = {
     "claude": "--dangerously-skip-permissions",
     "codex": "--yolo",
     "opencode": "--yolo",
     "pi": "--yolo",
-    "agent": "--yolo",
 }
 
 
@@ -204,10 +201,8 @@ def harnesses_for_project(cwd: str | None) -> list[str]:
             else:
                 # ensure the per-project default is present in list
                 if val not in base:
-                    # insert before the last `agent`/`none` block so agent stays last
-                    # keep agent/none at end
-                    tail = [h for h in base if h in ("agent", "none")]
-                    head = [h for h in base if h not in ("agent", "none")]
+                    tail = [h for h in base if h == "none"]
+                    head = [h for h in base if h != "none"]
                     if val not in head:
                         head.append(val)
                     return head + tail
@@ -235,18 +230,10 @@ def yolo_default_for_project(cwd: str | None) -> bool:
     return True
 
 
-def build_harness_command(harness: str, yolo: bool, agent: str | None = None) -> str:
+def build_harness_command(harness: str, yolo: bool) -> str:
     """Final command typed into the new session."""
     if harness == "none":
         return "none"
-    if harness == "agent" and agent:
-        base = f"agent {agent}"
-        flag = _HARNESS_YOLO.get("agent", "")
-        return f"{base} {flag}".strip() if yolo and flag else base
-    if harness == "agent" and not agent:
-        # fallback to agent harness itself
-        flag = _HARNESS_YOLO.get("agent", "")
-        return f"agent {flag}".strip() if yolo and flag else "agent"
     flag = _HARNESS_YOLO.get(harness, "")
     if yolo and flag:
         # harness may already be a full command (e.g. "touch agent-started")
@@ -254,6 +241,18 @@ def build_harness_command(harness: str, yolo: bool, agent: str | None = None) ->
         if harness in _HARNESS_YOLO:
             return f"{harness} {flag}"
     return harness
+
+
+def harness_prompt(harness: str) -> Text:
+    if harness == "none":
+        label = "no harness"
+        icon = "·"
+        style = MUTED
+    else:
+        label = harness
+        icon = agent_icon(harness)
+        style = agent_color(harness)
+    return Text.assemble((f"{icon} ", style), (label, style))
 
 
 @dataclass(frozen=True)
@@ -606,17 +605,19 @@ class HarnessPrompt(ModalScreen[str | None]):
 
 
 class NewWorktreePrompt(ModalScreen[dict | None]):
-    """Single modal: branch + harness + yolo + optional agent.
+    """Single modal: branch + harness + yolo.
 
-    Tab moves focus (Input → harness → yolo → agent).  ⏎ creates,
+    Tab moves focus (Input → harness → yolo).  ⏎ creates,
     esc cancels.  YOLO is on by default; per-project default harness
     comes from `git config agent-sidebar.harness` (or worktree.harness).
-    Last harness `agent` reveals the sub-agent list.
     """
 
     BINDINGS = [
         Binding("escape", "cancel", "cancel"),
         Binding("enter", "create", "create"),
+        Binding("j", "cursor_down", "down", show=False),
+        Binding("k", "cursor_up", "up", show=False),
+        Binding("space", "toggle_yolo", "toggle yolo", show=False),
     ]
 
     def __init__(
@@ -632,35 +633,26 @@ class NewWorktreePrompt(ModalScreen[dict | None]):
     def compose(self) -> ComposeResult:
         with Vertical(classes="dialog"):
             yield Static(Text.assemble(
-                "New worktree of ", (self.project, "bold"),
-            ))
+                "New worktree  ", (self.project, "bold"),
+            ), classes="dialog-title")
             yield Input(placeholder="feat/branch-name", id="branch-input")
-            yield Static("Harness", classes="field-label")
+            yield Static("", id="harness-meta", classes="field-meta")
             yield OptionList(
-                *(Option(h, id=h) for h in self._harnesses),
+                *(Option(harness_prompt(h), id=h) for h in self._harnesses),
                 id="harness-list",
             )
-            yield Checkbox(
-                "YOLO  —  --dangerously-skip-permissions / --yolo",
-                value=self._yolo_default,
-                id="yolo-check",
-            )
-            yield Static("Agent", id="agent-label", classes="field-label")
-            yield OptionList(
-                *(Option(a, id=a) for a in _AGENT_CHOICES),
-                id="agent-list",
-            )
-            yield Static("tab next  ⏎ create  esc cancel", classes="hint")
+            yield Checkbox("yolo", value=self._yolo_default, id="yolo-check")
+            yield Static("j/k move  tab next  ⏎ create  esc cancel", classes="hint")
 
     def on_mount(self) -> None:
-        # harness default
         hlist = self.query_one("#harness-list", OptionList)
         if self._default_harness in self._harnesses:
             try:
                 hlist.highlighted = self._harnesses.index(self._default_harness)
             except ValueError:
                 pass
-        self._sync_agent_visibility()
+        self._sync_harness_meta()
+        self._sync_yolo()
         self.query_one("#branch-input", Input).focus()
 
     def _selected_harness(self) -> str:
@@ -670,41 +662,52 @@ class NewWorktreePrompt(ModalScreen[dict | None]):
             return opt.id
         return self._default_harness
 
-    def _selected_agent(self) -> str | None:
-        alist = self.query_one("#agent-list", OptionList)
-        opt = alist.highlighted_option
-        return opt.id if opt and opt.id else None
+    def _sync_harness_meta(self) -> None:
+        hlist = self.query_one("#harness-list", OptionList)
+        selected = hlist.highlighted or 0
+        self.query_one("#harness-meta", Static).update(
+            f"harness  {selected + 1}/{len(self._harnesses)}"
+        )
 
-    def _sync_agent_visibility(self) -> None:
+    def _sync_yolo(self) -> None:
         harness = self._selected_harness()
-        is_agent = harness == "agent"
-        self.query_one("#agent-label", Static).display = is_agent
-        self.query_one("#agent-list", OptionList).display = is_agent
+        yolo = self.query_one("#yolo-check", Checkbox)
+        yolo.disabled = _HARNESS_YOLO.get(harness) is None
 
     def on_option_list_option_highlighted(
         self, event: OptionList.OptionHighlighted,
     ) -> None:
         if getattr(event.control, "id", None) == "harness-list":
-            self._sync_agent_visibility()
+            self._sync_harness_meta()
+            self._sync_yolo()
 
     def on_option_list_option_selected(
         self, event: OptionList.OptionSelected,
     ) -> None:
-        # harness selection is highlight-driven; don't dismiss — just sync.
-        # Keep global ⏎ as the create action.
         if getattr(event.control, "id", None) == "harness-list":
-            self._sync_agent_visibility()
-            return
-        if getattr(event.control, "id", None) == "agent-list":
+            self._sync_harness_meta()
+            self._sync_yolo()
             return
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        # ⏎ in the Input should create, not just blur.
         if event.control.id == "branch-input":
             self.action_create()
 
     def action_cancel(self) -> None:
         self.dismiss(None)
+
+    def action_cursor_down(self) -> None:
+        if self.query_one("#harness-list", OptionList).has_focus:
+            self.query_one("#harness-list", OptionList).action_cursor_down()
+
+    def action_cursor_up(self) -> None:
+        if self.query_one("#harness-list", OptionList).has_focus:
+            self.query_one("#harness-list", OptionList).action_cursor_up()
+
+    def action_toggle_yolo(self) -> None:
+        yolo = self.query_one("#yolo-check", Checkbox)
+        if yolo.has_focus and not yolo.disabled:
+            yolo.toggle()
 
     def action_create(self) -> None:
         branch = self.query_one("#branch-input", Input).value.strip()
@@ -714,15 +717,11 @@ class NewWorktreePrompt(ModalScreen[dict | None]):
             return
         harness = self._selected_harness()
         yolo = self.query_one("#yolo-check", Checkbox).value
-        agent = self._selected_agent() if harness == "agent" else None
-        final = build_harness_command(harness, yolo, agent)
-        # keep original harness/agent for callers that need them
+        final = build_harness_command(harness, yolo)
         self.dismiss({
             "branch": branch,
             "harness": final,
-            "raw_harness": harness,
             "yolo": yolo,
-            "agent": agent,
         })
 
 
@@ -836,48 +835,80 @@ class AgentSidebar(App[None]):
         color: ansi_bright_black;
     }
     ModalScreen {
-        background: ansi_default;
-        align: left top;
+        background: #181825;
+        align: center middle;
     }
     .dialog {
+        width: 100%;
         height: auto;
-        padding: 0 1;
+        padding: 1 2;
+        background: #181825;
+        border: round #45475a;
     }
     .dialog > Static {
+        margin-bottom: 0;
+    }
+    .dialog-title {
+        color: #cdd6f4;
         margin-bottom: 1;
     }
     .dialog > .hint {
-        color: ansi_bright_black;
-    }
-    .field-label {
-        color: ansi_bright_black;
-        text-style: bold;
+        color: #a6adc8;
         margin-top: 1;
     }
+    .field-label,
+    .field-meta {
+        height: 1;
+        color: #a6adc8;
+        text-style: bold;
+    }
+    .field-label {
+        margin-top: 1;
+    }
+    .field-meta {
+        color: #89b4fa;
+        text-align: right;
+    }
     #harness-list {
-        height: 7;
-        max-height: 7;
+        height: 6;
+        max-height: 6;
         margin-bottom: 1;
     }
-    #agent-list {
-        height: 5;
-        max-height: 5;
-        margin-bottom: 1;
+    #harness-list:focus {
+        border-left: thick #89b4fa;
+        padding-left: 1;
+        background: #313244;
+    }
+    #harness-list > .option-list--option-highlighted {
+        color: #cdd6f4;
+        background: #585b70;
+        text-style: bold;
     }
     Checkbox {
+        height: 3;
+        margin-top: 1;
         margin-bottom: 1;
-        background: ansi_default;
+        background: #181825;
+        border: round #45475a;
+        color: #f9e2af;
+        padding: 0 1;
         &:focus {
-            background-tint: transparent;
+            border: round #89b4fa;
+            background: #313244;
+        }
+        &:disabled {
+            color: #6c7086;
         }
     }
     Input {
-        margin-bottom: 1;
-        background: ansi_default;
-        border: tall ansi_bright_black;
+        height: 3;
+        margin-bottom: 0;
+        background: #181825;
+        border: round #45475a;
+        color: #cdd6f4;
         &:focus {
-            border: tall ansi_blue;
-            background-tint: transparent;
+            border: round #89b4fa;
+            background: #181825;
         }
     }
     """
