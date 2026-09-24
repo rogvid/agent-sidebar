@@ -228,38 +228,82 @@ def _agent_display(row: Row) -> Text:
     return Text(f"{h_icon} {harness}", style=h_color)
 
 
+def _changes_display(changes: str) -> Text:
+    """`+5 -2` with colours, `∅` muted when clean, empty when unknown."""
+    if not changes or changes == "-":
+        return Text("")
+    if changes == "∅":
+        return Text("∅", style=MUTED)
+    # `+5 -2` or `+3 untracked`
+    text = Text()
+    parts = changes.split()
+    for i, part in enumerate(parts):
+        if i:
+            text.append(" ")
+        if part.startswith("+"):
+            text.append(part, style="green")
+        elif part.startswith("-"):
+            text.append(part, style="red")
+        else:
+            text.append(part, style=MUTED)
+    return text
+
+
 def agent_prompt(
     row: Row, here: bool, pr: dict[str, Any] | None = None,
 ) -> Group:
-    """Two lines: where the agent is and for how long, then what it said."""
+    """Three lines: branch/changes, agent/harness with duration/context, state/message."""
     color = STATE_COLOR.get(row["state"], "default")
     gutter = Text(HERE if here else " ", style="bold")
 
+    # Row 1: state dot + branch on the left, +- changes on the right
     top = grid()
     branch = Text(row["branch"])
     # Two agents in one working tree overwrite each other's edits.
     if row.get("flag", " ").strip():
         branch = Text.assemble(("! ", "bold red"), branch)
-    # agent-scan writes `-` for what the screen does not say; a column can
-    # hold the dash, but here it would read as part of the sentence.
-    duration = "" if row["duration"] == "-" else " " + row["duration"]
-    message = "" if row["message"] == "-" else " · " + row["message"]
+    changes = _changes_display(row.get("changes", "-"))
     top.add_row(
         gutter,
         Text("●", style=color),
         branch,
-        Text.assemble(" ", _agent_display(row), duration),
+        changes,
     )
 
-    bottom = grid()
+    # Row 2: agent + harness on the left, duration + context on the right
+    middle = grid()
+    agent = _agent_display(row)
+    duration = "" if row.get("duration") == "-" else row.get("duration", "")
     extra = badges(row, pr)
+    right = Text()
+    if duration:
+        right.append(duration)
+    if extra.plain:
+        if right.plain:
+            right.append(" ")
+        right.append(extra)
+    middle.add_row(
+        gutter,
+        Text(""),
+        agent,
+        right,
+    )
+
+    # Row 3: state on the left, message on the right (message takes most)
+    bottom = Table.grid(expand=True)
+    bottom.add_column(width=1, no_wrap=True)
+    bottom.add_column(width=2, no_wrap=True)
+    bottom.add_column(no_wrap=True)
+    bottom.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
+    message = "" if row.get("message") == "-" else row.get("message", "")
+    message_text = Text(" " + message, style=MUTED) if message else Text("")
     bottom.add_row(
         gutter,
         Text(""),
-        Text.assemble((row["state"], color), (message, MUTED)),
-        Text.assemble(" ", extra) if extra else Text(""),
+        Text(row.get("state", ""), style=color),
+        message_text,
     )
-    return Group(top, bottom)
+    return Group(top, middle, bottom)
 
 
 def project_prompt(project: str, count: int) -> Table:

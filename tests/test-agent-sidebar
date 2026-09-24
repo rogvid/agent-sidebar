@@ -285,7 +285,8 @@ def main() -> int:
     unknown = plain(mod.agent_prompt(
         row("koyr", "%1", duration="-", message="-"), here=False))
     lines = [line.rstrip() for line in unknown.splitlines()]
-    ok = lines[0].endswith("claude") and lines[1].endswith("done")
+    ok = (len(lines) == 3 and lines[1].endswith("claude")
+          and lines[2].endswith("done") and "-" not in unknown)
     report("prompt", "nothing to say leaves no stray dash", ok,
            "" if ok else f"got={unknown!r}")
 

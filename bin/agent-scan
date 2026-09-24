@@ -127,6 +127,24 @@ _BLOCKED_ROLE_NAMES = frozenset({
     "node", "python", "python3", "uv", "cargo", "make", "cmake",
     "sleep", "ssh", "sshd", "less", "more", "fzf", "rg", "grep",
     "awk", "sed", "ps", "systemd", "init", "code", "cursor",
+    # Thread/runtime names that appear as `comm` for node/mcp children
+    # (e.g. graft mcp shows as `MainThread`) — never a real role.
+    "mainthread", "main_thread", "main-thread", "graft",
+    # Common dev/lsp/tools that an agent or editor spawns — never roles
+    "ruff", "pyright", "pylsp", "typescript", "tsserver", "eslint",
+    "jq", "yq", "yazi", "bat", "curl", "wget", "docker", "kubectl",
+    "helm", "terraform", "npm", "yarn", "pnpm", "bun", "deno",
+    "go", "rustc", "gcc", "clang", "java", "gradle", "mvn",
+    "ruby", "perl", "php", "lua", "gh", "glab", "git-wt",
+    # Coreutils and common one-shot Unix tools — never roles
+    "ls", "cat", "head", "tail", "wc", "cut", "tr", "xargs", "find",
+    "fd", "sort", "uniq", "tee", "touch", "mkdir", "cp", "mv", "rm",
+    "chmod", "chown", "ln", "tar", "gzip", "unzip", "zip", "diff",
+    "patch", "head", "tail", "column", "paste", "join", "comm",
+    "sh", "env", "printenv",
+    # LSPs and editors' helpers — never roles
+    "marksman", "copilot", "language-server", "esbuild", "tsserver",
+    "pyright", "pylsp",
 })
 
 
@@ -140,6 +158,10 @@ def _is_plausible_role(name: str) -> bool:
         return False
     if _is_explicit_role(base):
         return True
+    # Thread/runtime artefacts (e.g. `MainThread` from node graft mcp) are
+    # never roles — they appear as `comm` for the node process.
+    if "thread" in base:
+        return False
     # Heuristic: agent roles are single words, mostly alpha, optionally with
     # dashes/underscores. This picks up "chief", "architect", "my-bot" but not
     # "x86_64" or "123".
@@ -317,6 +339,9 @@ WEEKLY_RE = re.compile(r"used\s+(\d+)%\s+of your weekly limit", re.IGNORECASE)
 # Weekly headroom. Past the second one you are budgeting, not working.
 WEEKLY_WARN, WEEKLY_HIGH = 60, 85
 
+# git diff stats in claude's statusline: `⎇ main | (+441,-17)`
+CHANGES_RE = re.compile(r"\(\+(\d+),-(\d+)\)")
+
 # How much of a message to carry into the row. Long enough to be a sentence,
 # short enough that a runaway line cannot bloat the output.
 MESSAGE_MAX = 160
@@ -447,14 +472,14 @@ class Agent:
     started_at: float
 
 
-def process_snapshot() -> tuple[dict[int, tuple[str, float]], dict[int, list[int]]]:
-    """One pass over the process table: pid -> (name, start), pid -> children."""
-    info: dict[int, tuple[str, float]] = {}
+def process_snapshot() -> tuple[dict[int, tuple[str, list[str], float]], dict[int, list[int]]]:
+    """One pass over the process table: pid -> (name, cmdline, start), pid -> children."""
+    info: dict[int, tuple[str, list[str], float]] = {}
     children: dict[int, list[int]] = {}
-    for proc in psutil.process_iter(["pid", "ppid", "name", "create_time"]):
+    for proc in psutil.process_iter(["pid", "ppid", "name", "cmdline", "create_time"]):
         try:
             d = proc.info
-            info[d["pid"]] = (d["name"] or "", d["create_time"] or 0.0)
+            info[d["pid"]] = (d["name"] or "", d["cmdline"] or [], d["create_time"] or 0.0)
             children.setdefault(d["ppid"], []).append(d["pid"])
         except psutil.Error:
             continue
@@ -463,7 +488,7 @@ def process_snapshot() -> tuple[dict[int, tuple[str, float]], dict[int, list[int
 
 def _find_first(
     root_pid: int,
-    info: dict[int, tuple[str, float]],
+    info: dict[int, tuple[str, list[str], float]],
     children: dict[int, list[int]],
     allowed: frozenset[str],
 ) -> Agent | None:
@@ -478,7 +503,7 @@ def _find_first(
         entry = info.get(pid)
         if entry is None:
             continue
-        name, started_at = entry
+        name, _cmdline, started_at = entry
         base = os.path.basename(name).lower() if name else ""
         if base in allowed or name.lower() in allowed:
             canonical = base if base in allowed else name.lower()
@@ -489,7 +514,7 @@ def _find_first(
 
 def _find_role_dynamic(
     root_pid: int,
-    info: dict[int, tuple[str, float]],
+    info: dict[int, tuple[str, list[str], float]],
     children: dict[int, list[int]],
     harness_pid: int | None = None,
 ) -> str | None:
@@ -509,7 +534,7 @@ def _find_role_dynamic(
         seen.add(pid)
         entry = info.get(pid)
         if entry is not None:
-            name, _ = entry
+            name, _cmdline, _ = entry
             base = os.path.basename(name).lower() if name else ""
             # Don't report the harness itself as its own role
             if harness_pid is not None and pid == harness_pid:
@@ -531,7 +556,7 @@ def _find_role_dynamic(
             seen.add(pid)
             entry = info.get(pid)
             if entry is not None:
-                name, _ = entry
+                name, _cmdline, _ = entry
                 if _is_plausible_role(name):
                     base = os.path.basename(name).lower() if name else ""
                     return base if base else name.lower()
@@ -539,9 +564,23 @@ def _find_role_dynamic(
     return None
 
 
+def _agent_from_cmdline(cmdline: list[str]) -> str | None:
+    """Extract --agent value from a harness cmdline, if present."""
+    for i, arg in enumerate(cmdline):
+        if arg == "--agent" and i + 1 < len(cmdline):
+            cand = cmdline[i + 1].strip().lower()
+            if cand:
+                return cand
+        if arg.startswith("--agent="):
+            cand = arg.split("=", 1)[1].strip().lower()
+            if cand:
+                return cand
+    return None
+
+
 def find_agent(
     root_pid: int,
-    info: dict[int, tuple[str, float]],
+    info: dict[int, tuple[str, list[str], float]],
     children: dict[int, list[int]],
 ) -> Agent | None:
     """Shallowest agent process at or below root_pid, or None.
@@ -555,7 +594,7 @@ def find_agent(
 
 def find_harness_and_role(
     root_pid: int,
-    info: dict[int, tuple[str, float]],
+    info: dict[int, tuple[str, list[str], float]],
     children: dict[int, list[int]],
 ) -> tuple[Agent | None, str | None]:
     """Return (harness_agent, role_name) for a pane.
@@ -569,7 +608,25 @@ def find_harness_and_role(
     role: str | None = None
 
     if harness is not None:
-        role = _find_role_dynamic(root_pid, info, children, harness.pid)
+        # First, check harness's own cmdline for --agent (opencode --agent plan/build)
+        h_entry = info.get(harness.pid)
+        if h_entry is not None:
+            _, h_cmdline, _ = h_entry
+            cmd_role = _agent_from_cmdline(h_cmdline)
+            if cmd_role is not None:
+                # Explicit agent via flag bypasses blocklist, but still validate shape
+                if _is_plausible_role(cmd_role) or _is_explicit_role(cmd_role) or cmd_role in {"build", "plan", "compaction", "explore", "general", "summary", "title", "cli-agent", "code-review", "ui-designer"}:
+                    role = cmd_role
+                else:
+                    role = cmd_role
+            elif harness.name == "opencode":
+                # Default opencode agent is Build when no flag is given
+                role = "build"
+        if role is None:
+            role = _find_role_dynamic(root_pid, info, children, harness.pid)
+            # If harness is opencode and still no role found, default to build
+            if role is None and harness.name == "opencode":
+                role = "build"
     else:
         # No harness — maybe the pane runs a role directly (e.g. `chief`
         # binary). Treat any plausible role under the pane as the harness.
@@ -594,7 +651,8 @@ def find_harness_and_role(
                     entry = info.get(pid)
                     if entry is not None and _is_plausible_role(entry[0]):
                         base = os.path.basename(entry[0]).lower()
-                        candidate = Agent(base or entry[0].lower(), pid, entry[1])
+                        _, _cmd, started_at = entry
+                        candidate = Agent(base or entry[0].lower(), pid, started_at)
                         break
                     queue.extend(children.get(pid, ()))
             harness = candidate
@@ -971,6 +1029,44 @@ def weekly_color(text: str) -> str:
     return YELLOW if percent >= WEEKLY_WARN else GREEN
 
 
+def parse_changes(lines: list[str]) -> str | None:
+    """`(+441,-17)` from claude's statusline -> `+441 -17`, `∅` when zero."""
+    body, _ = split_tray(lines)
+    for line in reversed(body[-FOOTER_LINES:]):
+        m = CHANGES_RE.search(line)
+        if m:
+            added, deleted = m.group(1), m.group(2)
+            if added == "0" and deleted == "0":
+                return "∅"
+            return f"+{added} -{deleted}"
+    return None
+
+
+def git_changes(cwd: str) -> str | None:
+    """Fallback when pane doesn't show `(+X,-Y)`: sum `git diff --numstat`."""
+    # Not a git repo -> nothing to show
+    if git(cwd, "rev-parse", "--is-inside-work-tree") != "true":
+        return None
+    added = deleted = 0
+    for args in (("diff", "--numstat"), ("diff", "--cached", "--numstat")):
+        out = git(cwd, *args)
+        if out:
+            for line in out.splitlines():
+                parts = line.split("\t")
+                if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+                    added += int(parts[0])
+                    deleted += int(parts[1])
+    if added == 0 and deleted == 0:
+        # Check for untracked files — they have no diff but are still changes
+        untracked = git(cwd, "ls-files", "--others", "--exclude-standard")
+        if untracked:
+            # Number of untracked files as a hint; line count unknown
+            count = len([l for l in untracked.splitlines() if l.strip()])
+            return f"+{count} untracked" if count else "∅"
+        return "∅"
+    return f"+{added} -{deleted}"
+
+
 def parse_done(lines: list[str], now: float) -> float | None:
     """Seconds since the last finished turn, from its `· done H:MM` stamp.
 
@@ -1116,6 +1212,10 @@ class Row:
     # test helpers and external callers working without passing them.
     harness: str = ""
     role: str = ""
+    # +- line changes for the branch's working tree, parsed from the pane's
+    # statusline `(+X,-Y)` or via `git diff --numstat` fallback. `∅` when
+    # clean, `-` outside a repo.
+    changes: str = "-"
 
 
 def sort_key(row: Row) -> tuple[int, int, float, str]:
@@ -1165,6 +1265,7 @@ def collect_rows() -> list[Row]:
         # or the role when a role is present so old consumers still see a
         # meaningful name. New consumers should read harness/role explicitly.
         agent_name = role if role else harness_agent.name
+        changes = parse_changes(lines) or git_changes(pane.cwd) or "-"
         rows.append(Row(
             state=state,
             project=project,
@@ -1183,6 +1284,7 @@ def collect_rows() -> list[Row]:
             age=parse_age(lines) or format_elapsed(now - harness_agent.started_at),
             message=pick_message(state, lines),
             flag=SHARED_TREE if trees[pane.cwd] > 1 else " ",
+            changes=changes,
         ))
 
     rows.sort(key=sort_key)
