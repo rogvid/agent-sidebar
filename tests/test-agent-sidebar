@@ -222,6 +222,33 @@ async def app_cases(mod) -> list[tuple[str, bool, str]]:
         check("enter in the branch input creates with yolo",
               got == (glue, "new-worktree", "%3", "feat/x",
                       mod.build_harness_command("claude", True)), got)
+
+        # each harness's own yolo flag, picked and toggled with keys;
+        # pi has no permission gate, so its checkbox is disabled
+        for down, harness, yolo_on, want in (
+            (1, "codex", True, "codex --yolo"),
+            (1, "codex", False, "codex"),
+            (2, "opencode", True, "opencode --auto"),
+            (2, "opencode", False, "opencode"),
+            (3, "pi", None, "pi"),
+        ):
+            await pilot.press("n")
+            await pilot.pause(0.1)
+            await type_text("feat/h")
+            await pilot.press("tab", *["j"] * down, "tab")
+            yolo = app.screen.query_one("#yolo-check", Checkbox)
+            if yolo_on is None:
+                check(f"{harness} disables yolo", yolo.disabled, yolo.disabled)
+                check(f"tab skips {harness}'s yolo", not yolo.has_focus,
+                      app.screen.focused)
+            else:
+                check(f"tab reaches {harness}'s yolo", yolo.has_focus,
+                      app.screen.focused)
+                if not yolo_on:
+                    await pilot.press("space")
+            got = await act("enter")
+            check(f"{harness} runs {want!r}",
+                  got == (glue, "new-worktree", "%3", "feat/h", want), got)
         # esc cancels whole modal
         await pilot.press("n")
         await pilot.pause(0.1)

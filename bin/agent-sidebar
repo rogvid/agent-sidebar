@@ -119,11 +119,11 @@ GLUE = "agent-sidebar-tmux"
 # Overridable with AGENT_SIDEBAR_HARNESSES (space or comma separated).
 _DEFAULT_HARNESSES = ("claude", "codex", "opencode", "pi")
 # YOLO flag per harness when the checkbox is on (on by default).
+# pi has no permission gate, so no flag and the checkbox is disabled.
 _HARNESS_YOLO: dict[str, str] = {
     "claude": "--dangerously-skip-permissions",
     "codex": "--yolo",
-    "opencode": "--yolo",
-    "pi": "--yolo",
+    "opencode": "--auto",
 }
 
 
