@@ -166,43 +166,24 @@ def _git_config_get(cwd: str | None, key: str) -> str | None:
 
 
 def harnesses_for_project(cwd: str | None) -> list[str]:
-    base = harnesses()
-    # Per-project env var via git config takes precedence over global env.
-    # Supported keys: agent-sidebar.harness, worktree.harness
-    for key in ("agent-sidebar.harness", "worktree.harness"):
-        val = _git_config_get(cwd, key)
-        if val:
-            # allow single harness or list? treat as single default, not replacement
-            # but if it contains spaces/commas, treat as list override
-            if "," in val or " " in val:
-                parts = [p.strip() for p in val.replace(",", " ").split() if p.strip()]
-                if parts:
-                    return parts
-            else:
-                # ensure the per-project default is present in list
-                if val not in base:
-                    tail = [h for h in base if h == "none"]
-                    head = [h for h in base if h != "none"]
-                    if val not in head:
-                        head.append(val)
-                    return head + tail
-            break
-    return base
+    """The harnesses offered, the project's default among them and
+    "none" (a worktree with no harness started) last."""
+    options = harnesses()
+    for harness in (default_harness_for_project(cwd), "none"):
+        if harness not in options:
+            options.append(harness)
+    return options
 
 
 def default_harness_for_project(cwd: str | None) -> str:
-    for key in ("agent-sidebar.harness", "worktree.harness"):
-        val = _git_config_get(cwd, key)
-        if val and "," not in val and " " not in val:
-            return val
-    return default_harness()
+    # `git config agent-sidebar.harness` overrides the global default.
+    return _git_config_get(cwd, "agent-sidebar.harness") or default_harness()
 
 
 def yolo_default_for_project(cwd: str | None) -> bool:
-    for key in ("agent-sidebar.yolo", "worktree.yolo"):
-        val = _git_config_get(cwd, key)
-        if val is not None:
-            return val.lower() not in ("0", "false", "no", "off")
+    val = _git_config_get(cwd, "agent-sidebar.yolo")
+    if val is not None:
+        return val.lower() not in ("0", "false", "no", "off")
     # Global env var AGENT_SIDEBAR_YOLO or default on
     env = os.environ.get("AGENT_SIDEBAR_YOLO")
     if env is not None:
@@ -520,7 +501,7 @@ class NewWorktreePrompt(ModalScreen[dict | None]):
 
     Tab moves focus (Input → harness → yolo).  ⏎ creates from any
     field, esc cancels.  YOLO is on by default; per-project default harness
-    comes from `git config agent-sidebar.harness` (or worktree.harness).
+    comes from `git config agent-sidebar.harness`.
     """
 
     BINDINGS = [
@@ -548,22 +529,18 @@ class NewWorktreePrompt(ModalScreen[dict | None]):
                 "New worktree  ", (self.project, "bold"),
             ), classes="dialog-title")
             yield Input(placeholder="feat/branch-name", id="branch-input")
-            yield Static("", id="harness-meta", classes="field-meta")
             yield OptionList(
                 *(Option(harness_prompt(h), id=h) for h in self._harnesses),
                 id="harness-list",
             )
             yield Checkbox("yolo", value=self._yolo_default, id="yolo-check")
-            yield Static("j/k move  tab next  ⏎ create  esc cancel", classes="hint")
+            # Two lines on purpose: one would wrap mid-hint in the sidebar.
+            yield Static("j/k move  tab next\n⏎ create  esc cancel",
+                         classes="hint")
 
     def on_mount(self) -> None:
         hlist = self.query_one("#harness-list", OptionList)
-        if self._default_harness in self._harnesses:
-            try:
-                hlist.highlighted = self._harnesses.index(self._default_harness)
-            except ValueError:
-                pass
-        self._sync_harness_meta()
+        hlist.highlighted = self._harnesses.index(self._default_harness)
         self._sync_yolo()
         self.query_one("#branch-input", Input).focus()
 
@@ -574,13 +551,6 @@ class NewWorktreePrompt(ModalScreen[dict | None]):
             return opt.id
         return self._default_harness
 
-    def _sync_harness_meta(self) -> None:
-        hlist = self.query_one("#harness-list", OptionList)
-        selected = hlist.highlighted or 0
-        self.query_one("#harness-meta", Static).update(
-            f"harness  {selected + 1}/{len(self._harnesses)}"
-        )
-
     def _sync_yolo(self) -> None:
         harness = self._selected_harness()
         yolo = self.query_one("#yolo-check", Checkbox)
@@ -590,14 +560,12 @@ class NewWorktreePrompt(ModalScreen[dict | None]):
         self, event: OptionList.OptionHighlighted,
     ) -> None:
         if getattr(event.control, "id", None) == "harness-list":
-            self._sync_harness_meta()
             self._sync_yolo()
 
     def on_option_list_option_selected(
         self, event: OptionList.OptionSelected,
     ) -> None:
         if getattr(event.control, "id", None) == "harness-list":
-            self._sync_harness_meta()
             self._sync_yolo()
             return
 
@@ -762,17 +730,8 @@ class AgentSidebar(App[None]):
         color: #a6adc8;
         margin-top: 1;
     }
-    .field-meta {
-        height: 1;
-        color: #a6adc8;
-        text-style: bold;
-    }
-    .field-meta {
-        color: #89b4fa;
-        text-align: right;
-    }
     #harness-list {
-        height: 6;
+        height: auto;
         max-height: 6;
         margin-bottom: 1;
     }
