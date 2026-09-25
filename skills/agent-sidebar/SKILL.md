@@ -158,36 +158,50 @@ Rules:
 - Read before you write: `tmux capture-pane -p -t "%42" | tail -n 40` and `agent-scan --json | jq '.[] | select(.pane_id=="%42")'`. Interrupting a `running` pane is expensive.
 - To interrupt: `tmux send-keys -t "%42" Escape` (or `C-c`) first, then paste.
 - After sending, poll `agent-scan` once after 1-2s to confirm the state changed.
+- **A harness you just started is not listening yet.** For its first seconds, keys sent to it are lost - text can land in its input with the Enter dropped. Give a new agent its task on its launch command line (section 4), not as a message after it.
+- Type a harness command into a pane only when its shell is in front: `tmux display-message -p -t "%42" '#{pane_current_command}'`. Typed into a running harness, it is just a message to that agent.
 
 ## 4. Orchestrator pattern - one main session spawning workers
 
-### Option A: `agent-sidebar-tmux new-worktree`
+A worker gets its task the moment it starts: as the launch command's prompt argument, never as a message sent after launch (see section 3).
+
+| Harness | Start with a task | Yolo flag |
+|---------|-------------------|-----------|
+| `claude` | `claude "TASK"` | `--dangerously-skip-permissions` |
+| `codex` | `codex "TASK"` | `--yolo` |
+| `opencode` | `opencode --prompt "TASK"` | `--auto` |
+| `pi` | `pi "TASK"` | none |
+
+Write the task to a file first and let the new shell read it, so no quoting or length limit gets in the way:
 
 ```bash
-agent-sidebar-tmux new-worktree "$TMUX_PANE" "feat/my-feature" "codex --yolo"
+brief=$(mktemp)
+cat >"$brief" <<'EOF'
+Fix the typo in README.md, then commit it.
+EOF
+launch="claude --dangerously-skip-permissions \"\$(cat $brief)\""   # typed as-is into the new shell
 ```
 
-`new-worktree PANE BRANCH [HARNESS]`:
-- Creates the worktree of PANE's project with `git-wt-add` (an existing branch or existing worktree is reused).
-- `git-wt-add` runs in a `display-popup` over the attached client, so it shows on the user's screen. With no client attached the popup fails and no worktree is created.
-- Creates the worktree's session if missing and types HARNESS into its shell (the session outlives the harness). HARNESS is any command; `none` starts nothing; default `$AGENT_SIDEBAR_AGENT` or `claude`. An already existing session gets nothing typed.
-- Then `switch-client`s the attached client to the new session - it moves the user away from where they were.
-
-### Option B: `git-wt` + tmux (quiet, no popup, no focus change)
+### Start it: `agent-sidebar-tmux spawn`
 
 ```bash
-branch="feat/my-feature"
-cd "<project-dir>" && git-wt add "$branch"      # any worktree of the project works as cwd
-# Not "path": in zsh that is tied to PATH
-wt_dir=$(git worktree list --porcelain | awk -v ref="refs/heads/$branch" '/^worktree /{p=substr($0,10)} $0=="branch " ref{print p; exit}')
-session=$(git-wt session "$wt_dir" | cut -f1)
-tmux new-session -d -s "$session" -c "$wt_dir"
-tmux send-keys -t "=$session:" -l "claude --dangerously-skip-permissions"
-tmux send-keys -t "=$session:" Enter
-tmux switch-client -t "=$session"               # optional: moves the user there
+worker=$(agent-sidebar-tmux spawn "$TMUX_PANE" "feat/my-feature" "$launch")
 ```
 
-Yolo flags per harness: `claude --dangerously-skip-permissions`, `codex --yolo`, `opencode --auto`, `pi` has none.
+`spawn PANE BRANCH [HARNESS]`:
+- Creates the worktree for BRANCH in PANE's project with `git-wt-add` (an existing branch or worktree is reused); its report goes to stderr.
+- Creates the worktree's own session, types HARNESS into its shell and prints that pane's id. The session outlives the harness.
+- HARNESS is any command, the task included (`$launch` above); `none` starts nothing; default `$AGENT_SIDEBAR_AGENT` or `claude`.
+- Nothing appears on the user's screen and they stay where they are.
+- Fails with a message and a non-zero exit when PANE is not in a `git-wt` project, or when the worktree's session already exists - it never types into a session it did not create.
+
+When it fails, stop and tell the user what it said.
+Do not rebuild its steps by hand, and do not delete a session or worktree to make room.
+
+After it succeeds, check once with `agent-scan` that the worker is listed. Do not type the launch command again - see section 3.
+To bring the user to the worker only when they ask: `tmux switch-client -t "$worker"`.
+
+`agent-sidebar-tmux new-worktree PANE BRANCH [HARNESS]` is the sidebar's version for the human: `git-wt-add` runs in a popup on their screen, an existing session is reused as it is, and it switches their client to the new session.
 
 ### Tracking and reviewing workers
 
@@ -219,10 +233,11 @@ tmux kill-pane -t "%42"   # only if the worker's pane lived in another session
 ## 5. Sidebar actions
 
 `agent-sidebar-tmux` actions take a `pane_id`.
-All but `kill` open a `display-popup` on the attached client - they are for the human and fail with `no current client` when none is attached.
+All but `kill` and `spawn` open a `display-popup` on the attached client - they are for the human and fail with `no current client` when none is attached.
 
 ```bash
 agent-sidebar-tmux new-worktree <pane_id> <branch> [harness]  # see section 4
+agent-sidebar-tmux spawn <pane_id> <branch> [harness]         # section 4; no popup, prints the new pane id
 agent-sidebar-tmux review <pane_id>           # tuicr on its uncommitted changes; export (y) is pasted into the pane unsubmitted
 agent-sidebar-tmux git <pane_id>              # lazygit in the pane's cwd
 agent-sidebar-tmux pr <pane_id>               # gh pr view, or offer gh pr create
@@ -262,12 +277,14 @@ The git config keys only affect the dialog; `agent-sidebar-tmux new-worktree` wi
 
 - Outside tmux, `tmux` commands (and `agent-scan`) talk to the default server. A server on another socket (`-L`/`-S`) is only reached with `TMUX` set to it: `TMUX="$(tmux -L name display-message -p '#{socket_path},#{pid},0')"`.
 - `$TMUX_PANE` is your own pane id.
+- `claude` in a folder that neither it nor a parent was trusted in first asks whether to trust it, and Enter picks "No, exit". Worktrees inside a project folder that was trusted inherit that trust.
 - `tmux display-message -p -t "%42" '#{pane_current_path}'` gives a pane's cwd.
 - `agent-sidebar-tmux follow` is lock-guarded because hooks fire in bursts. Do not call it in a loop.
 - A popup that attaches a nested client is a second client; the sidebar ignores server-spawned clients when deciding which window you are viewing.
 
 ## 7. Anti-patterns
 
+- Never kill a session, window or pane you did not create for this task, and never the one holding `$TMUX_PANE` - that is the user's. When a `tmux` or `git-wt` command fails, stop and report; do not clean up by killing.
 - Do not parse the `agent-scan` table - use `--json`.
 - Do not address panes by `target` - it renumbers.
 - Do not `send-keys` text without `-l`, or multiline or `;`-ending text without a paste.
