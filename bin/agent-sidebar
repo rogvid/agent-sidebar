@@ -192,16 +192,10 @@ def yolo_default_for_project(cwd: str | None) -> bool:
 
 
 def build_harness_command(harness: str, yolo: bool) -> str:
-    """Final command typed into the new session."""
-    if harness == "none":
-        return "none"
-    flag = _HARNESS_YOLO.get(harness, "")
-    if yolo and flag:
-        # harness may already be a full command (e.g. "touch agent-started")
-        # only append flag for known single-word harnesses
-        if harness in _HARNESS_YOLO:
-            return f"{harness} {flag}"
-    return harness
+    """Final command typed into the new session. "none" and full commands
+    (e.g. "touch agent-started") have no yolo flag and pass through."""
+    flag = _HARNESS_YOLO.get(harness)
+    return f"{harness} {flag}" if yolo and flag else harness
 
 
 def harness_prompt(harness: str) -> Text:
