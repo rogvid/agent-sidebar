@@ -165,47 +165,73 @@ async def app_cases(mod) -> list[tuple[str, bool, str]]:
         got = await act("x", "y")
         check("x then y kills it", got == (glue, "kill", "%3"), got)
 
-        from textual.widgets import Checkbox
+        async def type_text(text: str) -> None:
+            await pilot.press(*("space" if c == " " else c for c in text))
+
         await pilot.press("n")
         await pilot.pause(0.1)
         check("n shows single worktree+harness modal",
               isinstance(app.screen, mod.NewWorktreePrompt), app.screen)
-        # yolo on by default, harness list present, agent hidden
         yolo = app.screen.query_one("#yolo-check", Checkbox)
         check("yolo is on by default", yolo.value is True, yolo.value)
-        yolo.focus()
-        await pilot.press("space")
-        check("space toggles yolo", yolo.value is False, yolo.value)
-        yolo.toggle()
         hlist = app.screen.query_one("#harness-list", OptionList)
         check("harness list has claude default", hlist.highlighted_option.id == "claude", hlist.highlighted_option.id)
         check("harness list has no sub-agent mode",
               all(hlist.get_option_at_index(i).id != "agent"
                   for i in range(hlist.option_count)),
               [hlist.get_option_at_index(i).id for i in range(hlist.option_count)])
-        hlist.focus()
+        branch = app.screen.query_one("#branch-input", Input)
+        check("the branch input starts focused", branch.has_focus,
+              app.screen.focused)
+        await type_text("feat/jk x")
+        check("j, k and space type into the branch input",
+              branch.value == "feat/jk x", branch.value)
+        check("and leave the harness list alone",
+              hlist.highlighted_option.id == "claude",
+              hlist.highlighted_option.id)
+        await pilot.press("tab")
+        check("tab moves to the harness list", hlist.has_focus,
+              app.screen.focused)
         await pilot.press("j")
         check("j moves down the harness list", hlist.highlighted_option.id == "codex", hlist.highlighted_option.id)
-        await pilot.press("k")
-        check("k moves up the harness list", hlist.highlighted_option.id == "claude", hlist.highlighted_option.id)
-        # tab moves focus (Input -> harness -> yolo -> agent hidden -> back)
-        # branch input is focused initially
-        app.screen.query_one(Input).value = "feat/x"
-        app.screen.query_one(Input).focus()
+        await pilot.press("k", "j")
+        check("k moves up the harness list", hlist.highlighted_option.id == "codex", hlist.highlighted_option.id)
         got = await act("enter")
-        check("enter creates worktree with yolo flag",
-              got == (glue, "new-worktree", "%3", "feat/x", "claude --dangerously-skip-permissions"), got)
-        # yolo off
+        check("enter on the harness list creates with that harness",
+              got == (glue, "new-worktree", "%3", "feat/jk x",
+                      mod.build_harness_command("codex", True)), got)
+        check("and closes the modal",
+              not isinstance(app.screen, mod.NewWorktreePrompt), app.screen)
+
         await pilot.press("n")
         await pilot.pause(0.1)
-        app.screen.query_one(Input).value = "feat/y"
-        app.screen.query_one("#yolo-check", Checkbox).toggle()
-        await pilot.pause(0.1)
+        await type_text("feat/y")
+        await pilot.press("tab", "tab")
+        yolo = app.screen.query_one("#yolo-check", Checkbox)
+        check("tab again moves to yolo", yolo.has_focus, app.screen.focused)
+        await pilot.press("space")
+        check("space toggles yolo", yolo.value is False, yolo.value)
         got = await act("enter")
-        check("yolo off omits flag", got == (glue, "new-worktree", "%3", "feat/y", "claude"), got)
+        check("enter on yolo creates instead of toggling",
+              got == (glue, "new-worktree", "%3", "feat/y", "claude"), got)
+
+        await pilot.press("n")
+        await pilot.pause(0.1)
+        await type_text("feat/x")
+        got = await act("enter")
+        check("enter in the branch input creates with yolo",
+              got == (glue, "new-worktree", "%3", "feat/x",
+                      mod.build_harness_command("claude", True)), got)
         # esc cancels whole modal
         await pilot.press("n")
         await pilot.pause(0.1)
+        await pilot.press("tab")
+        got = await act("enter")
+        check("enter with no branch creates nothing", got is None, got)
+        check("and goes back to the branch input",
+              isinstance(app.screen, mod.NewWorktreePrompt)
+              and app.screen.query_one("#branch-input", Input).has_focus,
+              app.screen.focused)
         got = await act("escape")
         check("esc cancels single modal", got is None, got)
         check("and returns to list", not isinstance(app.screen, mod.NewWorktreePrompt), app.screen)

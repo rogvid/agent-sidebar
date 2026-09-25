@@ -607,17 +607,18 @@ class HarnessPrompt(ModalScreen[str | None]):
 class NewWorktreePrompt(ModalScreen[dict | None]):
     """Single modal: branch + harness + yolo.
 
-    Tab moves focus (Input → harness → yolo).  ⏎ creates,
-    esc cancels.  YOLO is on by default; per-project default harness
+    Tab moves focus (Input → harness → yolo).  ⏎ creates from any
+    field, esc cancels.  YOLO is on by default; per-project default harness
     comes from `git config agent-sidebar.harness` (or worktree.harness).
     """
 
     BINDINGS = [
         Binding("escape", "cancel", "cancel"),
-        Binding("enter", "create", "create"),
+        # priority, so the list's select and the checkbox's toggle
+        # don't take it first
+        Binding("enter", "create", "create", priority=True),
         Binding("j", "cursor_down", "down", show=False),
         Binding("k", "cursor_up", "up", show=False),
-        Binding("space", "toggle_yolo", "toggle yolo", show=False),
     ]
 
     def __init__(
@@ -689,10 +690,6 @@ class NewWorktreePrompt(ModalScreen[dict | None]):
             self._sync_yolo()
             return
 
-    def on_input_submitted(self, event: Input.Submitted) -> None:
-        if event.control.id == "branch-input":
-            self.action_create()
-
     def action_cancel(self) -> None:
         self.dismiss(None)
 
@@ -704,16 +701,11 @@ class NewWorktreePrompt(ModalScreen[dict | None]):
         if self.query_one("#harness-list", OptionList).has_focus:
             self.query_one("#harness-list", OptionList).action_cursor_up()
 
-    def action_toggle_yolo(self) -> None:
-        yolo = self.query_one("#yolo-check", Checkbox)
-        if yolo.has_focus and not yolo.disabled:
-            yolo.toggle()
-
     def action_create(self) -> None:
         branch = self.query_one("#branch-input", Input).value.strip()
         if not branch:
             self.query_one("#branch-input", Input).focus()
-            self.bell()
+            self.app.bell()
             return
         harness = self._selected_harness()
         yolo = self.query_one("#yolo-check", Checkbox).value
