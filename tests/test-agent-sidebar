@@ -240,6 +240,22 @@ async def app_cases(mod) -> list[tuple[str, bool, str]]:
         await pilot.pause(0.1)
         check("? shows the keys", isinstance(app.screen, mod.Help),
               app.screen)
+        legend = app.screen.query_one(".legend", Static)
+        shown = legend.content.plain
+        drawn = [plain(mod.agent_prompt(row("koyr", "%1", harness=harness),
+                                        here=False)).splitlines()[1]
+                 for harness in mod.HARNESS_ICON]
+        drawn.append(plain(mod.agent_prompt(
+            row("koyr", "%1", harness="opencode", role="build"),
+            here=False)).splitlines()[1])
+        # Row 2 is the agent, then the duration after a gap.
+        names = [line.strip().split("  ")[0] for line in drawn]
+        missing = [name for name in names if name not in shown]
+        check("the legend draws agents the way rows do", not missing,
+              (missing, shown))
+        check("and no legend line wraps at sidebar width",
+              legend.size.height == len(shown.splitlines()),
+              (legend.size, shown))
         await pilot.press("escape")
         await pilot.pause(0.1)
         check("esc closes them", not isinstance(app.screen, mod.Help),

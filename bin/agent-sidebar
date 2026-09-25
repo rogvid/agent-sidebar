@@ -78,8 +78,8 @@ CONTEXT_COLOR = {"warn": "yellow", "rot": "red"}
 MUTED = "color(245)"
 HERE = "▌"
 
-# Harness colours/icons are fixed; roles are picked up from the agent
-# at runtime (chief/architect/any future name) and get a stable colour
+# Harness colours/icons are fixed; roles are the harness's --agent
+# (opencode's build/plan or any custom one) and get a stable colour
 # via hashing so no hardcoded role list is needed.
 HARNESS_COLOR = {
     "claude": "cyan",
@@ -101,7 +101,7 @@ def agent_color(agent: str) -> str:
     name = agent.lower()
     if name in HARNESS_COLOR:
         return HARNESS_COLOR[name]
-    # Roles — stable hash so "chief" always looks the same without hardcoding
+    # Roles - stable hash so "build" always looks the same without hardcoding
     h = sum(ord(c) for c in name)  # simple stable hash, no random
     return ROLE_PALETTE[h % len(ROLE_PALETTE)] if name else MUTED
 
@@ -669,14 +669,17 @@ class Help(ModalScreen[None]):
             ("400k", CONTEXT_COLOR["rot"]), " tokens\n",
             ("▌", "bold"), "    in this window\n",
             ("!", "bold red"), "    shares a working tree\n",
-            ("◆ claude", agent_color("claude")), " ",
-            ("◇ codex", agent_color("codex")), " ",
-            ("⬢ opencode", agent_color("opencode")), " ",
-            ("○ pi", agent_color("pi")), "  harness\n",
-            ("★ chief", agent_color("chief")), " ",
-            ("⬣ architect", agent_color("architect")), "  role · ",
-            ("◆ claude · ★ chief", "default"), " both",
         )
+        # Drawn the way rows draw them so the legend cannot drift.
+        first, *others = HARNESS_ICON
+        legend.append_text(_agent_display({"harness": first}))
+        legend.append("  harness\n    ")
+        for harness in others:
+            legend.append(" ")
+            legend.append_text(_agent_display({"harness": harness}))
+        legend.append("\n")
+        legend.append_text(_agent_display({"harness": "opencode", "role": "build"}))
+        legend.append("  agent")
         with Vertical(classes="dialog"):
             yield Static(Text("Keys", style="bold"))
             yield Static(keys)
