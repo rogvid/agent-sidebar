@@ -1,68 +1,89 @@
 ---
 name: agent-sidebar
-description: Operate the tmux agent-sidebar ecosystem - discover agents with agent-scan, find sessions working on specific projects/branches, and send messages between tmux panes. Use whenever you need to locate agents, check what they are doing, message another session, spawn worktrees/sessions from an orchestrator, or keep work visible in tmux worktrees. Triggers on agent-sidebar, agent-scan, tmux pane/session, worktree orchestration, or inter-agent messaging.
+description: Operate the tmux agent-sidebar ecosystem - discover agents with agent-scan, find sessions working on specific projects/branches, and send messages between tmux panes. Use whenever you need to locate agents, check what they are doing, message another session, spawn worktrees/sessions with a harness from an orchestrator, or keep work visible in tmux worktrees. Triggers on agent-sidebar, agent-scan, tmux pane/session, worktree orchestration, or inter-agent messaging.
 ---
 
 # Agent Sidebar
 
-You have a sidebar, a scanner and plain tmux around them. The sidebar is for humans - you use `agent-scan` and `tmux` directly.
+You have a sidebar, a scanner and plain tmux around them.
+The sidebar is for humans - you use `agent-scan`, `git-wt` and `tmux` directly.
 
 ## The pieces
 
 | Tool | What it is | You use it for |
 |------|------------|----------------|
-| `agent-scan` | Scans every tmux pane for an agent process | Discovery - who exists, what state they are in |
-| `agent-sidebar` | Textual TUI shown left of the current window (M-2) | Not for you - the user sees it. You drive the same data via `agent-scan --json` |
-| `agent-sidebar-tmux` | Keeps the sidebar pane following the viewed window + actions on panes | Spawn/review/git/pr actions - call via `agent-sidebar-tmux <cmd>` |
-| `tmux send-keys / capture-pane / list-panes` | tmux itself | Messaging and inspection |
+| `agent-scan` | Scans every tmux pane for a harness process | Discovery - who exists, what state they are in |
+| `agent-sidebar` | Textual TUI down the left of the viewed window (M-2) | Not for you - the user sees it. You get the same data from `agent-scan --json` |
+| `agent-sidebar-tmux` | Moves the sidebar pane with the viewed window, and runs the sidebar's actions on panes | Spawning worktrees, killing panes; the rest are interactive popups for the human |
+| `git-wt` | Worktree and session naming | Creating/removing worktrees, finding a worktree's session |
+| `tmux send-keys / paste-buffer / capture-pane / list-panes` | tmux itself | Messaging and inspection |
 
-`git-wt` names worktrees/sessions: `<project>/main` is the main worktree, `feat-x` lives at `<project>/feat-x` with tmux session `<project>-feat-x`. Every worktree of a project shares its `.bare` dir.
+`git-wt` layout: a project folder holds `.bare` (shared by every worktree) and one folder per branch, folded to lowercase letters, digits and dashes.
+Branch `feat/x` lives at `<project-dir>/feat-x` with tmux session `<project>-feat-x`.
+The main branch's worktree is `<project-dir>/main` (or whatever the main branch is called) with session `<project>`.
+Projects are not all under one root, so never hardcode a path like `~/projects/<project>` - take it from `cwd` or `git-wt session`.
 
 ## 1. Discover agents
 
-Always prefer `--json` - stable fields, no truncation.
+Always use `--json` - stable fields, project and branch never cut short.
 
 ```bash
 agent-scan --json | jq .
 ```
 
-Each row:
+Only harness processes make a pane an agent: `claude`, `codex`, `opencode`, `pi`.
+A pane with none of them in its process tree is not listed.
+
+Each row (real output):
 
 ```json
 {
-  "pane_id": "%42",
-  "target": "dotfiles:1.0",
-  "project": "dotfiles",
-  "branch": "feat/foo",
-  "cwd": "/home/kvist/projects/dotfiles/feat-foo",
-  "agent": "claude",
   "state": "done",
-  "context": "12.3k",
-  "context_level": "ok",
+  "project": "dotfiles",
+  "branch": "fix/sidebar-worktree-dialog",
+  "target": "dotfiles-fix-sidebar-worktree-dialog:1.0",
+  "pane_id": "%119",
+  "cwd": "/home/kvist/personal/projects/dotfiles/fix-sidebar-worktree-dialog",
+  "agent": "claude",
+  "context": "91.6k",
   "duration": "2m",
-  "since": 120.0,
-  "message": "Fixed the sidebar toggle",
-  "flag": " ",
-  "block": "1h",
+  "since": 174.55,
+  "block": "18m",
   "weekly": "-",
-  "age": "3h"
+  "age": "9m",
+  "message": "WORKER READY",
+  "flag": " ",
+  "harness": "claude",
+  "role": "",
+  "changes": "∅",
+  "context_level": "ok"
 }
 ```
 
-Other outputs (human-oriented, avoid for automation):
-- `agent-scan` (no flags) - pretty table
-- `agent-scan --tmux` - `#[fg=...]● 2` for the tmux status bar, empty when no agents
+Other outputs (human-oriented, do not parse):
+- `agent-scan` (or `--no-color`) - aligned table
+- `agent-scan --tmux` - `#[fg=green]● 14 #[fg=blue]● 1#[default] ` for the tmux status bar, empty when no agents
 
-Fields you filter on:
-- `project` - repo name (worktrees of one project share this)
-- `branch` - git branch or `@<sha>` / `no git`
-- `state` - queue order: `blocked > interrupted > done > running > delegated`. `blocked/interrupted/done` need you; `running/delegated` do not.
-- `cwd` - real working directory
-- `pane_id` - stable tmux id (`%12`). Use this to address a pane, not `target` (window indices shift).
-- `flag` - `"▲"` when two agents share one working tree (danger - they overwrite each other)
-- `message` - last thing the pane said (spinner text while running, question while blocked, summary while done)
+Fields:
+- `pane_id` - stable tmux id (`%12`). Address panes with this, never `target` (window indices shift).
+- `target` - `session:window.pane`, for reading only.
+- `project` - repo name; every worktree of a project shares it.
+- `branch` - checked-out branch, `@<sha>` when detached, `no git` outside a repository.
+- `cwd` - the pane's working directory.
+- `state` - `blocked > interrupted > done > running > delegated`. `blocked`/`interrupted`/`done` need you; `running`/`delegated` do not.
+- `agent` and `harness` - both the harness name: `claude`, `codex`, `opencode` or `pi`.
+- `role` - only the harness's `--agent NAME` (lowercased), `""` when started without one. `opencode` without `--agent` reports `build`.
+- `changes` - `+A -D` lines from the pane's statusline `(+A,-D)`, else from `git diff` (staged + unstaged); `+N untracked` when only untracked files; `∅` when clean; `-` when unknown (not a git repo).
+- `context` - context size from the statusline (`91.6k`, `250.1K`), `-` when unknown. `context_level` is `ok`, `warn` (>= 100k), `rot` (>= 400k) or `unknown`.
+- `duration` - how long in the current state, `-` when the screen does not show it. `since` is the same in seconds, or `null`.
+- `block` - the 5h usage block from the statusline (account-wide), `-` when not shown.
+- `weekly` - `NN%` of the weekly limit when the harness shows that notice, else `-`.
+- `age` - session age from the statusline, else since the harness process started.
+- `message` - first line of the last thing the pane said, max 160 chars (spinner text while running, the question while blocked, the summary while done).
+- `flag` - `"▲"` when two agents share one working directory (danger - they overwrite each other), else `" "`.
 
-Rows arrive already sorted as a queue - most urgent first, freshest within each state.
+Rows arrive sorted as a queue - most urgent state first, freshest within each state.
+`agent-scan --json` prints `[]` when there are no agent panes.
 
 ### Useful filters
 
@@ -70,174 +91,186 @@ Rows arrive already sorted as a queue - most urgent first, freshest within each 
 # All agents for a project
 agent-scan --json | jq '[.[] | select(.project == "dotfiles")]'
 
-# Who is blocked or done (needs attention)
-agent-scan --json | jq '[.[] | select(.state == "blocked" or .state == "done")]'
+# Who needs attention
+agent-scan --json | jq '[.[] | select(.state == "blocked" or .state == "interrupted" or .state == "done")]'
 
-# Find the pane working on a branch
+# The pane working on a branch
 agent-scan --json | jq -r '.[] | select(.branch == "feat/foo") | .pane_id'
 
-# Find by message content
+# By message content
 agent-scan --json | jq '[.[] | select(.message | contains("PR #"))]'
 
-# Just pane ids + what they do (for picking a target)
+# By harness or role
+agent-scan --json | jq -r '.[] | select(.harness == "opencode" and .role == "build") | .pane_id'
+
+# Panes with uncommitted work
+agent-scan --json | jq -r '.[] | select(.changes != "∅" and .changes != "-") | "\(.pane_id) \(.changes)"'
+
+# One line per agent, for picking a target
 agent-scan --json | jq -r '.[] | "\(.pane_id) \(.project)/\(.branch) \(.state): \(.message)"'
 ```
 
-If `agent-scan --json` returns `[]`, there are no agent panes.
-
 ## 2. Find sessions working on specific things
-
-Combine `agent-scan --json` with `jq` and tmux:
 
 ```bash
 # Is there an agent on feat/foo? What state?
 agent-scan --json | jq -r '.[] | select(.branch == "feat/foo") | "\(.pane_id) \(.state) \(.message)"'
 
-# Working directories for all dotfiles worktrees
+# Working directories of a project's agents
 agent-scan --json | jq -r '.[] | select(.project == "dotfiles") | .cwd' | sort -u
 
-# Outside agent-scan: list all worktrees and their sessions (even idle ones)
-git -C ~/projects/dotfiles worktree list --porcelain
-git-wt list          # merge + work state per worktree
-git-wt session ~/projects/dotfiles/feat-foo   # -> "dotfiles-feat-foo<TAB>/path"
+# Worktrees and sessions, even without an agent (run inside the project)
+git worktree list --porcelain
+git-wt list --no-fetch                  # merge + work state per worktree; -a for every project
+git-wt session "<worktree-dir>"         # -> "dotfiles-feat-foo<TAB>/abs/path"; for the project dir, the main worktree's
 tmux list-sessions -F '#{session_name} #{session_windows}w #{session_attached}'
 tmux list-panes -a -F '#{pane_id} #{session_name}:#{window_index}.#{pane_index} #{pane_current_path} #{pane_current_command}'
 ```
 
-Prefer `agent-scan` when you care about *agent* state; use `git-wt`/`tmux list-*` when you care about *worktree/session existence* even without an agent.
+Use `agent-scan` for *agent* state, `git-wt`/`tmux list-*` for *worktree/session existence*.
 
-## 3. Send messages to another session
+## 3. Send messages to another pane
 
-You are in a tmux pane. The target is another pane's `pane_id`.
-
-### Basic send
+The target is another pane's `pane_id`.
 
 ```bash
-# Type into the pane and press Enter (like a human)
-tmux send-keys -t "%42" "hello, continue with the fix" Enter
+# Short single-line message, submitted
+tmux send-keys -t "%42" -l "hello, continue with the fix"
+tmux send-keys -t "%42" Enter
 
-# Multiline via heredoc-style paste (bracketed paste, no Enter until you send it)
-tmux load-buffer -b agent-msg "Fix the failing test in scripts/tests/test-agent-scan
+# Multiline: bracketed paste from stdin, not submitted until you send Enter
+tmux load-buffer -b agent-msg - <<'EOF'
+Fix the failing test in scripts/tests/test-agent-scan
 
 Details:
-- file: scripts/tests/test-agent-scan line 120
-- expected: blocked state"
-
+- expected: blocked state
+EOF
 tmux paste-buffer -p -d -b agent-msg -t "%42"
-# Optionally press Enter after pasting if you want it submitted:
 tmux send-keys -t "%42" Enter
 ```
 
-### Rules for messaging
-
+Rules:
 - **Use `pane_id` (`%12`)**, never `session:window.pane` - indices move.
-- **Bracketed paste** (`load-buffer` + `paste-buffer -p`) is safer than `send-keys` for anything with newlines, quotes, or `#`/`{}` (tmux formats expand `#`).
-- **`-p` means bracketed** - the target app receives it as a paste, not keystrokes.
-- **`-d` deletes the buffer** after pasting.
-- Check before you spam: `tmux capture-pane -p -t "%42" | tail -n 30` shows if the agent is `blocked` waiting for input vs `running` mid-turn. Interrupting a `running` pane is expensive.
-- If you need to interrupt, `tmux send-keys -t "%42" C-c` (or `Escape`) first, then paste.
-- After messaging, verify: `agent-scan --json | jq '.[] | select(.pane_id=="%42")'` should show state change within 1-2s. Poll once.
-
-### Read first, then write
-
-```bash
-# What is pane %42 actually showing right now?
-tmux capture-pane -p -t "%42" | tail -n 40
-
-# What does agent-scan think?
-agent-scan --json | jq '.[] | select(.pane_id=="%42")'
-
-# Only then decide to send.
-```
+- **Use `send-keys -l` for text.** Without `-l`, an argument that is a key name (`Enter`, `C-c`, `Escape`) is sent as that key.
+- **A trailing `;` is a tmux command separator**, even with `-l`: `send-keys -l "done;"` sends `done`, and without `-l` the call fails. Write `\;` or use a paste.
+- **Newlines need a paste.** `send-keys` turns each newline into Enter and submits early. `load-buffer -b NAME -` reads the text from stdin (`load-buffer` takes a file, not text); `set-buffer -b NAME "text"` also works.
+- `paste-buffer -p` pastes bracketed, so the target treats it as a paste, not keystrokes; `-d` deletes the buffer afterwards.
+- Read before you write: `tmux capture-pane -p -t "%42" | tail -n 40` and `agent-scan --json | jq '.[] | select(.pane_id=="%42")'`. Interrupting a `running` pane is expensive.
+- To interrupt: `tmux send-keys -t "%42" Escape` (or `C-c`) first, then paste.
+- After sending, poll `agent-scan` once after 1-2s to confirm the state changed.
 
 ## 4. Orchestrator pattern - one main session spawning workers
 
-This is the main reason the sidebar exists: a single control session visible alongside worker worktrees.
+### Option A: `agent-sidebar-tmux new-worktree`
 
 ```bash
-# From the main session, create a worktree + session and start an agent in it.
-# Uses the same path/session naming as everywhere else, so it lands in the sidebar.
-
-# Option A: via agent-sidebar-tmux (preferred - handles naming + tmux)
-agent-sidebar-tmux new-worktree "%current_pane_id" "feat/my-feature"
-
-# Option B: direct git-wt + tmux (when you need control)
-git-wt add "feat/my-feature"          # creates ~/projects/<project>/feat-my-feature
-path=$(git -C ~/projects/<project> worktree list --porcelain | awk '/^worktree /{p=$2} /^branch refs\/heads\/feat\/my-feature/{print p}')
-session=$(git-wt session "$path" | cut -f1)
-tmux new-session -d -s "$session" -c "$path"
-tmux send-keys -t "=$session:" "claude" Enter
-tmux switch-client -t "=$session"     # optional: jump there
+agent-sidebar-tmux new-worktree "$TMUX_PANE" "feat/my-feature" "codex --yolo"
 ```
 
-Tracking workers from the orchestrator:
+`new-worktree PANE BRANCH [HARNESS]`:
+- Creates the worktree of PANE's project with `git-wt-add` (an existing branch or existing worktree is reused).
+- `git-wt-add` runs in a `display-popup` over the attached client, so it shows on the user's screen. With no client attached the popup fails and no worktree is created.
+- Creates the worktree's session if missing and types HARNESS into its shell (the session outlives the harness). HARNESS is any command; `none` starts nothing; default `$AGENT_SIDEBAR_AGENT` or `claude`. An already existing session gets nothing typed.
+- Then `switch-client`s the attached client to the new session - it moves the user away from where they were.
+
+### Option B: `git-wt` + tmux (quiet, no popup, no focus change)
 
 ```bash
-# Poll loop - who needs me?
-while true; do
-  agent-scan --json | jq -r '.[] | "\(.state) \(.project)/\(.branch) \(.pane_id): \(.message)"'
-  sleep 2
-done
+branch="feat/my-feature"
+cd "<project-dir>" && git-wt add "$branch"      # any worktree of the project works as cwd
+# Not "path": in zsh that is tied to PATH
+wt_dir=$(git worktree list --porcelain | awk -v ref="refs/heads/$branch" '/^worktree /{p=substr($0,10)} $0=="branch " ref{print p; exit}')
+session=$(git-wt session "$wt_dir" | cut -f1)
+tmux new-session -d -s "$session" -c "$wt_dir"
+tmux send-keys -t "=$session:" -l "claude --dangerously-skip-permissions"
+tmux send-keys -t "=$session:" Enter
+tmux switch-client -t "=$session"               # optional: moves the user there
+```
 
-# Act on the queue top (blocked first)
+Yolo flags per harness: `claude --dangerously-skip-permissions`, `codex --yolo`, `opencode --auto`, `pi` has none.
+
+### Tracking and reviewing workers
+
+```bash
+# Who needs me?
+agent-scan --json | jq -r '.[] | "\(.state) \(.project)/\(.branch) \(.pane_id): \(.message)"'
+
+# Queue top (most urgent first)
 next=$(agent-scan --json | jq -r '.[0].pane_id // empty')
 [ -n "$next" ] && tmux capture-pane -p -t "$next" | tail -n 20
+
+# A worker's changes
+dir=$(tmux display-message -p -t "%42" '#{pane_current_path}')
+git -C "$dir" status --short
+git -C "$dir" diff
+git -C "$dir" log --oneline -5
 ```
 
-When a worker finishes (`state == "done"`), send it the next instruction or review its changes:
+### Cleaning up
 
 ```bash
-# Review uncommitted changes of a worker (same as sidebar's `d`)
-agent-sidebar-tmux review "%42"
-
-# Or plain git
-git -C "$(tmux display-message -p -t "%42" '#{pane_current_path}')" diff
-git -C "$(tmux display-message -p -t "%42" '#{pane_current_path}')" log --oneline -5
+# Run inside the project. TARGET is a branch, folder name or path.
+# Asks y/N on stdin (-f skips that), refuses uncommitted/untracked work unless --discard,
+# -d also deletes the branch if merged, and it closes the worktree's own session.
+git-wt remove -f -d "feat/my-feature"
+tmux kill-pane -t "%42"   # only if the worker's pane lived in another session
 ```
 
-Cleaning up:
+## 5. Sidebar actions
+
+`agent-sidebar-tmux` actions take a `pane_id`.
+All but `kill` open a `display-popup` on the attached client - they are for the human and fail with `no current client` when none is attached.
 
 ```bash
-# Remove a worker's worktree when merged/done (asks, refuses if dirty)
-agent-sidebar-tmux remove-worktree "%42"
-# Direct:
-git-wt remove --discard ~/projects/<project>/feat-my-feature  # only with --discard if dirty
-tmux kill-pane -t "%42"  # or kill-session if it was the last pane
-```
+agent-sidebar-tmux new-worktree <pane_id> <branch> [harness]  # see section 4
+agent-sidebar-tmux review <pane_id>           # tuicr on its uncommitted changes; export (y) is pasted into the pane unsubmitted
+agent-sidebar-tmux git <pane_id>              # lazygit in the pane's cwd
+agent-sidebar-tmux pr <pane_id>               # gh pr view, or offer gh pr create
+agent-sidebar-tmux kill <pane_id>             # kill-pane, no popup
+agent-sidebar-tmux remove-worktree <pane_id>  # git-wt-remove -d (asks), then kills the pane if the worktree is gone
+agent-sidebar-tmux open                       # tv projects picker
 
-## 5. Sidebar actions you can call headless
-
-These all take a `pane_id` and were built for the sidebar but work from any pane. They run in a tmux popup when a human triggers them; headless they still work.
-
-```bash
-agent-sidebar-tmux new-worktree <pane_id> <branch>   # branch must be new
-agent-sidebar-tmux review <pane_id>                  # tuicr review, y pastes comments
-agent-sidebar-tmux git <pane_id>                     # lazygit in pane's cwd
-agent-sidebar-tmux pr <pane_id>                      # gh pr view / create
-agent-sidebar-tmux kill <pane_id>                    # kill-pane
-agent-sidebar-tmux remove-worktree <pane_id>         # git-wt-remove + kill
-agent-sidebar-tmux open                              # tv projects picker
-
-# Sidebar pane itself
+# The sidebar pane itself
 agent-sidebar-tmux toggle    # M-2
 agent-sidebar-tmux close
-agent-sidebar-tmux follow    # hook - moves sidebar to viewed window
+agent-sidebar-tmux follow    # tmux hooks run this
 ```
 
-Env overrides: `AGENT_SIDEBAR_WIDTH` (default 36), `AGENT_SIDEBAR_COMMAND` (default `agent-sidebar`), `AGENT_SIDEBAR_AGENT` (default `claude`).
+Sidebar keys (for the human): `⏎` jump, `n` new worktree, `o` open project, `d` review, `g` git, `p` pr, `x` kill, `X` remove worktree, `r` rescan, `esc` back, `q` close, `?` help.
+
+New-worktree dialog (`n`):
+- Branch name input, a harness list and a `yolo` checkbox. Tab moves between them, j/k move in the list, ⏎ creates from any field, esc cancels.
+- The list is `claude codex opencode pi` (or `AGENT_SIDEBAR_HARNESSES`), plus the project's default if missing, plus `no harness` (`none`) last.
+- `yolo` appends the harness's flag (see section 4). It is disabled for harnesses without one (`pi`, `none`, custom commands).
+- It runs `agent-sidebar-tmux new-worktree <pane> <branch> "<harness> [flag]"`.
+
+### Configuration
+
+| Setting | Read by | Effect |
+|---------|---------|--------|
+| `AGENT_SIDEBAR_HARNESSES` | sidebar | Harnesses in the dialog, space or comma separated (default `claude codex opencode pi`) |
+| `AGENT_SIDEBAR_AGENT` | sidebar, `agent-sidebar-tmux` | Default harness (default `claude`); added to the dialog list when not in it |
+| `AGENT_SIDEBAR_YOLO` | sidebar | Default of the yolo checkbox; `0`/`false`/`no`/`off` turn it off (default on) |
+| `git config agent-sidebar.harness` | sidebar | Per-project default harness, overrides `AGENT_SIDEBAR_AGENT` |
+| `git config agent-sidebar.yolo` | sidebar | Per-project yolo default, overrides `AGENT_SIDEBAR_YOLO` |
+| `AGENT_SIDEBAR_WIDTH` | `agent-sidebar-tmux` | Sidebar width in columns (default `36`) |
+| `AGENT_SIDEBAR_COMMAND` | `agent-sidebar-tmux` | Command run in the sidebar pane (default `agent-sidebar`) |
+
+The git config keys only affect the dialog; `agent-sidebar-tmux new-worktree` without HARNESS uses `AGENT_SIDEBAR_AGENT`.
 
 ## 6. tmux gotchas
 
-- `TMUX` and `TMUX_PANE` are set inside tmux. Outside (e.g. a test harness) they are empty; `agent-scan` then finds zero panes and `send-keys` fails. Always run inside tmux or set `TMUX` to the socket from `tmux display-message -p '#{socket_path},#{pid},0'`.
-- `pane_id` is `%` + number. Quote it: `tmux send-keys -t "%42"` not `-t %42` alone if your shell does job control.
-- `tmux display-message -p -t "%42" '#{pane_current_path}'` gives the cwd of that pane.
-- Hooks fire in bursts - `agent-sidebar-tmux follow` is already idempotent and lock-guarded. Do not call it in a tight loop.
-- No nested clients: a popup that does `tmux attach` is a second client; `viewed_window` logic ignores server-spawned clients.
+- Outside tmux, `tmux` commands (and `agent-scan`) talk to the default server. A server on another socket (`-L`/`-S`) is only reached with `TMUX` set to it: `TMUX="$(tmux -L name display-message -p '#{socket_path},#{pid},0')"`.
+- `$TMUX_PANE` is your own pane id.
+- `tmux display-message -p -t "%42" '#{pane_current_path}'` gives a pane's cwd.
+- `agent-sidebar-tmux follow` is lock-guarded because hooks fire in bursts. Do not call it in a loop.
+- A popup that attaches a nested client is a second client; the sidebar ignores server-spawned clients when deciding which window you are viewing.
 
 ## 7. Anti-patterns
 
-- Do not parse `agent-scan` human table - use `--json`.
-- Do not use `target` (`session:window.pane`) to address panes in scripts - it renumbers.
-- Do not `send-keys` a large prompt without bracketed paste - `#` and `#{}` will be expanded as tmux formats.
-- Do not poll `agent-scan` faster than 1s - it walks the process tree and captures panes.
-- Do not assume a pane is idle because `message` is short - check `state`. `running` means do not interrupt unless you must.
+- Do not parse the `agent-scan` table - use `--json`.
+- Do not address panes by `target` - it renumbers.
+- Do not `send-keys` text without `-l`, or multiline or `;`-ending text without a paste.
+- Do not poll `agent-scan` faster than 1s - it walks the process tree and captures every pane.
+- Do not judge a pane by its `message` - check `state`. Do not interrupt `running` unless you must.
+- Do not call popup actions (`new-worktree`, `review`, `git`, `pr`, `remove-worktree`, `open`) expecting silence - they take over the user's screen.
