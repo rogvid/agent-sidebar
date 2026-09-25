@@ -22,6 +22,7 @@ import asyncio
 import importlib.machinery
 import importlib.util
 import io
+import os
 import subprocess
 import sys
 import tempfile
@@ -382,7 +383,13 @@ async def project_default_cases(mod) -> list[tuple[str, bool, str]]:
     def check(name: str, ok: bool, detail: object) -> None:
         results.append((name, ok, "" if ok else f"got={detail!r}"))
 
+    # Run as a pre-commit hook, git hands down GIT_DIR and friends, which
+    # would aim the git calls below, and the sidebar's own, at this
+    # repository instead: init would unbare it and config would land in it.
+    for var in [v for v in os.environ if v.startswith("GIT_")]:
+        del os.environ[var]
     with tempfile.TemporaryDirectory() as project:
+        os.environ["GIT_CEILING_DIRECTORIES"] = str(Path(project).parent)
         subprocess.run(["git", "init", "-q", project], check=True)
         subprocess.run(["git", "-C", project, "config",
                         "agent-sidebar.harness", "codex"], check=True)
