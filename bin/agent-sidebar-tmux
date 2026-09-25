@@ -23,6 +23,11 @@
 #                            session of its own and start HARNESS there
 #                            (default: $AGENT_SIDEBAR_AGENT or claude; "none"
 #                            starts no harness)
+#   spawn PANE BRANCH [HARNESS]
+#                            new-worktree for an agent starting workers: no
+#                            popup, you stay where you are, an existing
+#                            session is refused, failures exit non-zero;
+#                            prints the new session's pane id
 #   review PANE              review PANE's uncommitted changes in tuicr; its
 #                            export (y) is pasted into PANE's input
 #   git PANE                 lazygit in PANE's directory
@@ -293,6 +298,40 @@ new_worktree() {
     tmux switch-client -t "=${session}"
 }
 
+# new-worktree for an agent starting workers. Nothing takes over the screen,
+# and a session that already exists is refused rather than typed into: it
+# may be anyone's, and the harness command would reach whoever is in it.
+spawn() {
+    local pane="$1" branch="$2" harness="${3:-}" project path session new chosen
+    project="$(project_of "$(pane_path "${pane}")")"
+    if [[ -z "${project}" ]]; then
+        echo "agent-sidebar-tmux: no git-wt project behind ${pane}" >&2
+        return 1
+    fi
+    (cd "${project}" && git-wt-add "${branch}" </dev/null) >&2
+    path="$(worktree_for_branch "${project}" "${branch}")"
+    if [[ -z "${path}" ]]; then
+        echo "agent-sidebar-tmux: no worktree has ${branch} checked out" >&2
+        return 1
+    fi
+    session="$(session_of "${path}" | cut -f1)"
+    if [[ -z "${session}" ]]; then
+        echo "agent-sidebar-tmux: no tmux session name for ${path}" >&2
+        return 1
+    fi
+    if tmux has-session -t "=${session}" 2>/dev/null; then
+        echo "agent-sidebar-tmux: session ${session} already exists, started nothing" >&2
+        return 1
+    fi
+    new="$(tmux new-session -d -P -F '#{pane_id}' -s "${session}" -c "${path}")"
+    chosen="${harness:-${agent_command}}"
+    if [[ "${chosen}" != "none" ]]; then
+        tmux send-keys -t "${new}" -l "${chosen}"
+        tmux send-keys -t "${new}" Enter
+    fi
+    echo "${new}"
+}
+
 worktree_add() {
     if ! git-wt-add "$1"; then
         hold "git-wt-add failed. Press any key to close"
@@ -394,6 +433,13 @@ main() {
             exit 2
         fi
         new_worktree "$2" "$3" "${4:-}"
+        ;;
+    spawn)
+        if [[ $# -lt 3 || $# -gt 4 ]]; then
+            usage >&2
+            exit 2
+        fi
+        spawn "$2" "$3" "${4:-}"
         ;;
     review)
         need 2 "$@"

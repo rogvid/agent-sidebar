@@ -226,6 +226,18 @@ check "gives it the session git-wt names it" equals \
 check "starts the agent in it" exists "${worktree}/agent-started"
 check "and takes you there" equals client_session app-feat-x
 
+# spawn is new-worktree for an agent starting workers: no popup, no move.
+spawned="$(act spawn "${agent}" feat/y "touch agent-y" || true)"
+check "spawn makes the worktree without a popup" exists "${project}/feat-y"
+check "prints the new agent's pane, in the session git-wt names" equals \
+    "t display-message -p -t ${spawned} #{session_name}" app-feat-y
+check "starts the harness it is given there" exists "${project}/feat-y/agent-y"
+check "and leaves you where you were" equals client_session app-feat-x
+check "spawn refuses a session that already exists" not act spawn "${agent}" feat/y
+check "and types nothing into it" equals "t list-panes -t =app-feat-y: -F #{pane_id}" "${spawned}"
+outsider="$(t new-window -d -t main: -c "${scratch}" -P -F '#{pane_id}' 'sleep 3600')"
+check "spawn from a pane outside a project fails" not act spawn "${outsider}" feat/z
+
 act review "${agent}"
 check "review pastes tuicr's export into the agent" grep -qF 'rename B to b' \
     "${scratch}/pasted"
