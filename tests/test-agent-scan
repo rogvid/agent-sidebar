@@ -37,6 +37,8 @@ import time
 import tomllib
 from pathlib import Path
 
+import psutil
+
 SCRIPT = Path(__file__).resolve().parents[1] / ".local" / "bin" / "agent-scan"
 CHANNEL = (SCRIPT.parents[3] / "television" / ".config" / "television"
            / "cable" / "agents.toml")
@@ -540,6 +542,105 @@ TARGET_CASES = (
 )
 
 
+# Real panes on a throwaway tmux server, scanned the way the status bar and
+# the sidebar scan them. Only a harness makes a pane an agent: programs left
+# open next to one are not agents, and the tool a harness is running is not
+# its role. Stand-in harnesses carry the real names and run a tool the way a
+# Bash tool call does. (name, working tree, command, (agent, role, flag) or
+# None for no row.)
+PANE_CASES = (
+    ("top is not an agent", "shared", "top", None),
+    ("lazygit is not an agent", "shared", "lazygit", None),
+    ("man is not an agent", "shared", "man ls", None),
+    ("tool run is not the role", "shared", "claude",
+     ("claude", "", " ")),
+    ("opencode --agent plan", "plan", "opencode --agent plan",
+     ("opencode", "plan", " ")),
+    ("claude --agent reviewer shares tree", "pair",
+     "claude --agent reviewer", ("claude", "reviewer", "▲")),
+    ("opencode runs build by default", "pair", "opencode",
+     ("opencode", "build", "▲")),
+)
+
+# What a stand-in harness runs: a tool that outlives the scan.
+HARNESS_STAND_IN = "#!/bin/bash\ntimeout 3600 sleep 3600\n"
+
+
+def scan_real_panes(root: Path) -> dict[str, dict | None]:
+    """Run PANE_CASES in real panes; return each case's agent-scan row."""
+    socket = f"agent-scan-test-{os.getpid()}"
+    bin_dir = root / "bin"
+    bin_dir.mkdir()
+    for harness in ("claude", "opencode"):
+        stand_in = bin_dir / harness
+        stand_in.write_text(HARNESS_STAND_IN)
+        stand_in.chmod(0o755)
+    env = os.environ | {
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "SHELL": "/bin/sh",
+        # lazygit keeps its state out of the user's config.
+        "XDG_CONFIG_HOME": str(root / "config"),
+        "XDG_STATE_HOME": str(root / "state"),
+    }
+    env.pop("TMUX", None)
+    env.pop("TMUX_PANE", None)
+
+    def tmux(*args: str) -> str:
+        return subprocess.run(
+            ["tmux", "-L", socket, *args], env=env, check=True,
+            capture_output=True, text=True,
+        ).stdout.strip()
+
+    tmux("-f", "/dev/null", "new-session", "-d", "-s", "scan",
+         "-x", "160", "-y", "45")
+    try:
+        panes: dict[str, str] = {}
+        for name, tree, command, _want in PANE_CASES:
+            (root / tree).mkdir(exist_ok=True)
+            panes[name] = tmux(
+                "new-window", "-d", "-P", "-F", "#{pane_id}", "-t", "scan:",
+                "-c", str(root / tree), command,
+            )
+        # Every pane is running its program, and every harness its tool.
+        pids = {
+            pane_id: int(pid) for pane_id, pid in (
+                line.split() for line in tmux(
+                    "list-panes", "-a", "-F", "#{pane_id} #{pane_pid}",
+                ).splitlines()
+            )
+        }
+
+        def running(name: str) -> set[str]:
+            try:
+                root = psutil.Process(pids[panes[name]])
+                return {p.name() for p in [root, *root.children(True)]}
+            except (KeyError, psutil.Error):
+                return set()
+
+        deadline = time.time() + 10
+        while not all(
+            {command.split()[0], *(("timeout",) if want else ())}
+            <= running(name)
+            for name, _tree, command, want in PANE_CASES
+        ):
+            if time.time() > deadline:
+                raise RuntimeError("panes never settled: " + ", ".join(
+                    f"{name}: {sorted(running(name))}"
+                    for name, *_ in PANE_CASES
+                ))
+            time.sleep(0.1)
+        socket_path = tmux("display-message", "-p", "#{socket_path}")
+        out = subprocess.run(
+            [str(SCRIPT), "--json"], env=env | {"TMUX": f"{socket_path},0,0"},
+            check=True, capture_output=True, text=True,
+        ).stdout
+    finally:
+        subprocess.run(["tmux", "-L", socket, "kill-server"], env=env,
+                       capture_output=True)
+    rows = {r["pane_id"]: r for r in json.loads(out)}
+    return {name: rows.get(pane) for name, pane in panes.items()}
+
+
 def git(cwd: Path, *args: str) -> str:
     """Run git with an identity and none of the user's hooks or signing."""
     return subprocess.run(
@@ -761,6 +862,16 @@ def main() -> int:
     print(f"{'ok  ' if ok else 'FAIL'}  tv       {'one target template':36} "
           f"{'ok' if ok else f'got={sorted(templates)}'}")
 
+    with tempfile.TemporaryDirectory() as tmp:
+        scanned = scan_real_panes(Path(tmp))
+    for name, _tree, _command, want in PANE_CASES:
+        r = scanned[name]
+        got = r and (r["agent"], r["role"], r["flag"])
+        ok = got == want and (r is None or r["harness"] == r["agent"])
+        failures += not ok
+        print(f"{'ok  ' if ok else 'FAIL'}  pane     {name:36} "
+              f"want={want} got={got}")
+
     total = (len(STATE_CASES) + len(CONTEXT_CASES) + len(AGE_CASES)
              + len(BLOCK_CASES) + len(COLOR_CASES) + len(DURATION_CASES)
              + len(MESSAGE_CASES) + len(WEEKLY_CASES)
@@ -768,7 +879,7 @@ def main() -> int:
              + len(COLLAPSE_CASES) + len(PROJECT_CASES)
              + len(IDENTITY_CASES) + len(FIT_CASES) + 1
              + len(TARGET_CASES) + 1 + 4 + len(CONTEXT_LEVEL_CASES)
-             + len(TMUX_CASES))
+             + len(TMUX_CASES) + len(PANE_CASES))
     print(f"\n{total - failures}/{total} passed")
     return 1 if failures else 0
 
