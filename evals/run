@@ -1,0 +1,208 @@
+#!/usr/bin/env bash
+# Checks how an agent uses the agent-sidebar, end to end: tasks worded the way
+# the user would say them, given to opencode on a free model in a sandbox
+# (sandbox.sh), then graded on what actually happened - which pane got which
+# keys, which worktrees and sessions exist, what the agent answered.
+#
+# Unit tests cover the scripts; this covers whether an agent following
+# ~/.agents/AGENTS.md and the agent-sidebar skill picks the right path. Run it
+# after changing either, or agent-sidebar-tmux. Free, but slow: about a
+# minute a task. Models vary, so a single failure is a reason to look at the
+# run, and repeats say more than one pass.
+#
+# Usage: run [TASK...]     (or `mise run eval-agents [TASK...]`)
+#
+#   message       tell the feat/login agent something
+#   multiline     send it three review notes as one message
+#   spawn         start a yolo claude worker in a new worktree with a task
+#   status        who is working on the project
+#   parallel      three independent features: offer workers, build nothing
+#   parallel-yes  the same, then "Yes, start the workers."
+#   small         one small fix: do it in place
+#   tiny2         two tiny edits: do them in place
+#
+# EVAL_MODEL picks the free OpenCode model (default big-pickle). Each run's
+# sandbox and transcript stay under ~/.cache/agent-sidebar-eval.
+set -uo pipefail
+
+here="$(cd "$(dirname "$0")" && pwd)"
+readonly here
+readonly model="${EVAL_MODEL:-big-pickle}"
+readonly all=(message multiline spawn status parallel parallel-yes small tiny2)
+out_root="${XDG_CACHE_HOME:-${HOME}/.cache}/agent-sidebar-eval/$(date +%Y%m%d-%H%M%S)"
+readonly out_root
+
+declare -A prompt
+prompt[message]="Tell the agent that's working on the login feature to also add a logout button. Don't disturb anyone else."
+prompt[multiline]="Send the agent on the login branch these review notes, as one message:
+- rename LoginForm to SignInForm
+- the password field needs autocomplete=current-password
+- add a test for the lockout after 5 attempts"
+prompt[spawn]="Start a new claude agent in yolo mode, in its own worktree on a new branch fix/readme-typo in this project, and tell it to fix the typo in README.md. Keep my screen where it is."
+prompt[status]="Who else is working on the shop project right now, and what state are they in?"
+prompt[parallel]="Add three things to this app: a product search box, a CSV export command for orders, and a dark mode theme toggle. They don't depend on each other."
+prompt[parallel-yes]="${prompt[parallel]}"
+prompt[small]="Fix the typo in README.md."
+prompt[tiny2]="Fix the typo in README.md and change the server port to 8080."
+
+failed_checks=0
+failed_tasks=0
+
+expect() {
+    local name="$1"
+    shift
+    if "$@" 2>/dev/null; then
+        printf '    ok    %s\n' "${name}"
+    else
+        printf '    FAIL  %s\n' "${name}"
+        bad=1
+        failed_checks=$((failed_checks + 1))
+    fi
+}
+not() { ! "$@"; }
+has() { grep -qaF -- "$2" "$1" 2>/dev/null; }
+empty() { [[ ! -s "$1" ]]; }
+same() { [[ "$1" == "$2" ]]; }
+# The pane's input ends in Enter.
+submitted() { [[ "$(tail -c1 "$1" 2>/dev/null | od -An -c | tr -d ' ')" == '\r' ]]; }
+# One bracketed paste then one Enter, and no Enter before it.
+one_paste() {
+    python3 - "$1" <<'EOF'
+import sys
+b = open(sys.argv[1], "rb").read()
+s, e = b.find(b"\x1b[200~"), b.find(b"\x1b[201~")
+sys.exit(0 if s == 0 and e > s and b[e + 6:] == b"\r" and b"\r" not in b[:s] else 1)
+EOF
+}
+# opencode's JSON events as "TOOL name input" lines, then "RESULT" and the
+# text the agent ended on: what it said after its last tool call.
+trace() {
+    python3 - "$1" <<'EOF'
+import json, sys
+events = []
+for line in open(sys.argv[1], errors="replace"):
+    try:
+        events.append(json.loads(line))
+    except ValueError:
+        continue
+last_text = []
+for e in events:
+    part = e.get("part", {})
+    if e.get("type") == "tool_use":
+        print("TOOL", part.get("tool"), json.dumps(part.get("state", {}).get("input")))
+        last_text = []
+    elif e.get("type") == "text":
+        last_text.append(part.get("text", ""))
+print("RESULT")
+print("\n".join(last_text))
+EOF
+}
+result() { sed -n '/^RESULT$/,$p' "$1"; }
+worktrees() { git -C "$1/projects/shop/main" worktree list | wc -l | tr -d ' '; }
+sessions() { tmux -S "$1/tmux/tmux-$(id -u)/default" list-sessions | wc -l | tr -d ' '; }
+built_nothing() {
+    [[ -z "$(git -C "$1/projects/shop/main" status --porcelain -- . ':!graft')" &&
+        "$(git -C "$1/projects/shop/main" rev-list --count HEAD)" == 1 ]]
+}
+offers_workers() {
+    result "$1" | grep -qiE 'worktree|worker' &&
+        result "$1" | grep -qiE '\?|want me|shall i|should i|go ahead'
+}
+
+tasks=("$@")
+((${#tasks[@]})) || tasks=("${all[@]}")
+for task in "${tasks[@]}"; do
+    if [[ -z "${prompt[${task}]:-}" ]]; then
+        echo "unknown task: ${task} (one of: ${all[*]})" >&2
+        exit 2
+    fi
+done
+
+echo "model opencode/${model}, runs in ${out_root}"
+for task in "${tasks[@]}"; do
+    n=1
+    while [[ -e "${out_root}/${task}-${n}" ]]; do n=$((n + 1)); done
+    d="${out_root}/${task}-${n}"
+    L="${d}/logs"
+    sock="${d}/tmux/tmux-$(id -u)/default"
+    bad=0
+    "${here}/sandbox.sh" up "${d}"
+    start=$(date +%s)
+    "${here}/sandbox.sh" ask "${d}" "${model}" "${prompt[${task}]}"
+    if [[ "${task}" == parallel-yes ]]; then
+        "${here}/sandbox.sh" again "${d}" "${model}" "Yes, start the workers."
+    fi
+    trace "${d}/out.jsonl" >"${d}/trace.txt"
+    printf '%s (%ss)\n' "${task}" "$(($(date +%s) - start))"
+
+    case "${task}" in
+    message | multiline | spawn | status | parallel-yes)
+        expect "used the agent-sidebar skill" \
+            grep -qE '^TOOL skill .*agent-sidebar|agent-sidebar/SKILL\.md' "${d}/trace.txt"
+        ;;
+    esac
+    case "${task}" in
+    message)
+        expect "the feat/login agent got it" has "${L}/1.in" "logout"
+        expect "and it was submitted" submitted "${L}/1.in"
+        expect "the blog agent was left alone" empty "${L}/2.in"
+        ;;
+    multiline)
+        expect "one bracketed paste, then one Enter" one_paste "${L}/1.in"
+        expect "all three notes arrived" \
+            bash -c "grep -qa SignInForm '${L}/1.in' && grep -qa current-password '${L}/1.in' && grep -qa lockout '${L}/1.in'"
+        expect "the blog agent was left alone" empty "${L}/2.in"
+        ;;
+    spawn)
+        wt="${d}/projects/shop/fix-readme-typo"
+        new="$(grep -l -- '--dangerously-skip-permissions' "${L}"/*.args 2>/dev/null | head -1)"
+        expect "worktree created" test -d "${wt}"
+        expect "on branch fix/readme-typo" same "$(git -C "${wt}" branch --show-current 2>/dev/null)" fix/readme-typo
+        expect "its session exists" tmux -S "${sock}" has-session -t =shop-fix-readme-typo
+        expect "claude started with the yolo flag" test -n "${new}"
+        expect "task given on the launch command" has "${new}" "typo"
+        expect "no launch command typed into a running agent" \
+            not grep -qaE 'claude|--dangerously' "${new%.args}.in"
+        expect "the user's session is untouched" tmux -S "${sock}" has-session -t =shop
+        expect "the user's screen stayed on shop" \
+            same "$(tmux -S "${sock}" list-clients -F '#{session_name}' | head -1)" shop
+        ;;
+    status)
+        expect "names the feat/login agent" bash -c "sed -n '/^RESULT\$/,\$p' '${d}/trace.txt' | grep -q feat/login"
+        expect "and sent nothing to anyone" bash -c "[[ ! -s '${L}/1.in' && ! -s '${L}/2.in' ]]"
+        ;;
+    parallel)
+        expect "offers workers" offers_workers "${d}/trace.txt"
+        expect "and waits: no worktree created" same "$(worktrees "${d}")" 3
+        expect "no session started" same "$(sessions "${d}")" 3
+        expect "nothing built yet" built_nothing "${d}"
+        ;;
+    parallel-yes)
+        expect "three worktrees" same "$(worktrees "${d}")" 6
+        expect "three new sessions" same "$(sessions "${d}")" 6
+        expect "three workers, each started with its task" \
+            bash -c "(( \$(grep -l -iE 'search|csv|dark' '${L}'/*.args 2>/dev/null | wc -l) >= 3 ))"
+        expect "started with spawn" has "${d}/out.jsonl" "agent-sidebar-tmux spawn"
+        expect "the user's session is untouched" tmux -S "${sock}" has-session -t =shop
+        expect "nothing built in the user's worktree" \
+            bash -c "[[ -z \$(git -C '${d}/projects/shop/main' status --porcelain -- . ':!graft') ]]"
+        ;;
+    small)
+        expect "fixed in place" grep -q 'The shop app' "${d}/projects/shop/main/README.md"
+        expect "no worktree created" same "$(worktrees "${d}")" 3
+        expect "no workers offered" not bash -c "sed -n '/^RESULT\$/,\$p' '${d}/trace.txt' | grep -qiE 'worktree|worker'"
+        ;;
+    tiny2)
+        expect "both done in place" \
+            bash -c "grep -q 'The shop app' '${d}/projects/shop/main/README.md' && grep -q 8080 '${d}/projects/shop/main/app.py'"
+        expect "no worktree created" same "$(worktrees "${d}")" 3
+        expect "no workers offered" not bash -c "sed -n '/^RESULT\$/,\$p' '${d}/trace.txt' | grep -qiE 'worktree|worker'"
+        ;;
+    esac
+    "${here}/sandbox.sh" down "${d}"
+    ((bad)) && failed_tasks=$((failed_tasks + 1))
+done
+
+printf '\n%s/%s tasks passed (%s failed checks) - runs in %s\n' \
+    "$((${#tasks[@]} - failed_tasks))" "${#tasks[@]}" "${failed_checks}" "${out_root}"
+((failed_tasks == 0))
