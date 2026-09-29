@@ -323,7 +323,7 @@ STATE_CASES = (
 CONTEXT_CASES = (
     ("claude statusline", CLAUDE_IDLE, "145.3k"),
     ("statusline under an agent tray", CLAUDE_DELEGATED_PAIR, "75.5k"),
-    ("opencode footer", OPENCODE_IDLE, "12.4K"),
+    ("opencode footer, lowercase k", OPENCODE_IDLE, "12.4k"),
     ("no statusline visible", OPENCODE_WAITING, "-"),
 )
 

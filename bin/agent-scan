@@ -768,12 +768,21 @@ def parse_context(lines: list[str]) -> str:
     for line in reversed(body[-FOOTER_LINES:]):
         m = CTX_RE.search(line)
         if m:
-            if m.group(1):
-                return m.group(1)
             if m.group(2):
                 return f"{m.group(2)}%"
-            return m.group(3)
+            return spell_tokens(m.group(1) or m.group(3))
     return "-"
+
+
+def spell_tokens(text: str) -> str:
+    """`12.4K` -> `12.4k`, `1.2m` -> `1.2M`: opencode's `K` beside claude's
+    `k` reads as a different unit."""
+    suffix = text[-1:].lower()
+    if suffix == "k":
+        return text[:-1] + "k"
+    if suffix == "m":
+        return text[:-1] + "M"
+    return text
 
 
 def _statusline_duration(lines: list[str], pattern: re.Pattern[str]) -> str | None:
