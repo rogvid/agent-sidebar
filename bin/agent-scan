@@ -47,10 +47,11 @@ The warning flag marks a pane sharing a working directory with another
 agent pane: two agents editing one tree overwrite each other silently.
 
 --json prints the same rows, in the same order, as a JSON list of objects
-for tools that lay them out themselves (agent-sidebar). Nothing is cut
+for tools that lay them out themselves (agent-sidebar). Names are not cut
 short there, and each row also carries the pane's tmux id, its working
-directory, and how far into context rot it is (`context_level`: ok, warn,
-rot, or unknown).
+directory, how far into context rot it is (`context_level`: ok, warn, rot,
+or unknown), and `message_full`: the whole of what the pane last said, where
+`message` is the first line of it, cut short, such as all of a recap.
 
 --tmux prints one coloured count per state in tmux's own style syntax, for
 the status bar, and nothing at all when no agent is running.
@@ -245,7 +246,8 @@ WEEKLY_WARN, WEEKLY_HIGH = 60, 85
 CHANGES_RE = re.compile(r"\(\+(\d+),-(\d+)\)")
 
 # How much of a message to carry into the row. Long enough to be a sentence,
-# short enough that a runaway line cannot bloat the output.
+# short enough that a runaway line cannot bloat the output. message_full is
+# not cut: it is bounded by the screen it was read from.
 MESSAGE_MAX = 160
 
 
@@ -555,12 +557,12 @@ def is_chrome(line: str) -> bool:
 def clean(line: str) -> str:
     """Strip an agent's line markers and squeeze the whitespace out."""
     text = re.sub(r"^\s*(?:[●○◉]|⎿|❯|>|│|┃|┃?\s*→)\s*", "", line)
-    text = " ".join(text.split())
-    return text[:MESSAGE_MAX]
+    return " ".join(text.split())
 
 
-def last_paragraph(region: list[str]) -> str:
-    """The opening line of the last thing the agent actually said.
+def last_paragraph(region: list[str], whole: bool = False) -> str:
+    """The opening line of the last thing the agent actually said, or with
+    WHOLE all of it.
 
     Walking back to the *start* of the block rather than taking the final
     line matters: a wrapped answer's last line is a sentence fragment, and
@@ -575,7 +577,8 @@ def last_paragraph(region: list[str]) -> str:
     start = end - 1
     while start > 0 and not is_chrome(region[start - 1]):
         start -= 1
-    return clean(region[start]) or "-"
+    block = region[start:end] if whole else region[start:start + 1]
+    return clean(" ".join(block)) or "-"
 
 
 def is_delegated(region: list[str]) -> bool:
@@ -673,12 +676,14 @@ def dialog_message(lines: list[str]) -> str:
     return "-"
 
 
-def delegated_message(tray: list[str], region: list[str]) -> str:
+def delegated_message(
+    tray: list[str], region: list[str], whole: bool = False,
+) -> str:
     """What the delegates are doing, else the session's parting words."""
     doing = [activity for activity, _ in tray_delegates(tray) if activity]
     if doing:
         return clean(" · ".join(doing))
-    return last_paragraph(region)
+    return last_paragraph(region, whole)
 
 
 def input_draft(lines: list[str]) -> str:
@@ -690,7 +695,9 @@ def input_draft(lines: list[str]) -> str:
     return clean(" ".join(line.strip() for line in box)).strip()
 
 
-def pick_message(state: str, lines: list[str]) -> str:
+def pick_message(state: str, lines: list[str], whole: bool = False) -> str:
+    """What the pane is saying: the opening line of its last words, or with
+    WHOLE all of them."""
     body, tray = split_tray(lines)
     if state == "blocked":
         return dialog_message(body)
@@ -698,7 +705,7 @@ def pick_message(state: str, lines: list[str]) -> str:
     if state == "running":
         return running_message(region)
     if state == "delegated":
-        return delegated_message(tray, region)
+        return delegated_message(tray, region, whole)
     if state == "interrupted":
         # An interrupted turn was cut off mid-word, so its last line is
         # usually a fragment. claude puts the prompt back in the input box
@@ -707,7 +714,13 @@ def pick_message(state: str, lines: list[str]) -> str:
         draft = input_draft(body)
         if draft:
             return f"❯ {draft}"
-    return last_paragraph(region)
+    return last_paragraph(region, whole)
+
+
+def messages(state: str, lines: list[str]) -> tuple[str, str]:
+    """A row's message, cut to a status line, and message_full."""
+    return (pick_message(state, lines)[:MESSAGE_MAX],
+            pick_message(state, lines, whole=True))
 
 
 def classify(lines: list[str]) -> str:
@@ -1009,6 +1022,9 @@ class Row:
     # statusline `(+X,-Y)` or via `git diff --numstat` fallback. `∅` when
     # clean, `-` outside a repo.
     changes: str = "-"
+    # All of what the pane last said, where message is its first line cut
+    # short: a whole recap, for the tools that read one.
+    message_full: str = ""
 
 
 def sort_key(row: Row) -> tuple[int, int, float, str]:
@@ -1055,6 +1071,7 @@ def collect_rows() -> list[Row]:
         since = state_seconds(state, lines, now)
         project, branch = identities[pane.cwd]
         changes = parse_changes(lines) or git_changes(pane.cwd) or "-"
+        message, message_full = messages(state, lines)
         rows.append(Row(
             state=state,
             project=project,
@@ -1071,7 +1088,8 @@ def collect_rows() -> list[Row]:
             block=parse_block(lines) or "-",
             weekly=parse_weekly(lines) or "-",
             age=parse_age(lines) or format_elapsed(now - harness_agent.started_at),
-            message=pick_message(state, lines),
+            message=message,
+            message_full=message_full,
             flag=SHARED_TREE if trees[pane.cwd] > 1 else " ",
             changes=changes,
         ))

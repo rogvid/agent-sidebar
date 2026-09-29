@@ -436,6 +436,49 @@ MESSAGE_CASES = (
 )
 
 
+# claude's recap wraps onto indented lines under its first.
+CLAUDE_RECAP = """● Committed on feat/tofu-proxmox.
+✻ Worked for 16m 24s · done 9:18 AM
+※ recap: The Proxmox OpenTofu module and VM module are committed on
+  feat/tofu-proxmox, but nothing is applied because the node does not
+  answer. Next, check the node, then plan. (disable recaps in /config)
+
+────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────
+  ⎇ main | (+0,-0)                       Model: Opus 5 | Ctx: 145.3k
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"""
+
+CLAUDE_LONG_LINE = ("● " + "word " * 50).rstrip() + """
+✻ Worked for 15s · done 7:58 PM
+────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"""
+
+RECAP_WHOLE = (
+    "※ recap: The Proxmox OpenTofu module and VM module are committed on "
+    "feat/tofu-proxmox, but nothing is applied because the node does not "
+    "answer. Next, check the node, then plan. (disable recaps in /config)"
+)
+
+# A row's message is one line cut short for the status views; message_full
+# is the whole of what the pane said, for tools that read it.
+FULL_MESSAGE_CASES = (
+    ("a recap's message is its first line", "done", CLAUDE_RECAP,
+     ("※ recap: The Proxmox OpenTofu module and VM module are committed on",
+      RECAP_WHOLE)),
+    ("a long line is cut, and whole in full", "done", CLAUDE_LONG_LINE,
+     (("word " * 32)[:160], ("word " * 50).rstrip())),
+    ("a question is the same either way", "blocked", CLAUDE_WAITING_EDIT,
+     ("Do you want to make this edit to file.txt?",
+      "Do you want to make this edit to file.txt?")),
+    ("so is the restored prompt", "interrupted", CLAUDE_INTERRUPTED,
+     ("❯ Run this bash command in the foreground: ping -c 40 127.0.0.1",
+      "❯ Run this bash command in the foreground: ping -c 40 127.0.0.1")),
+)
+
+
 # The order rows come out in is the whole point of the list, so it is worth
 # pinning. Each case is (target, state, seconds in that state).
 SORT_CASES = (
@@ -720,6 +763,13 @@ def main() -> int:
         print(f"{'ok  ' if ok else 'FAIL'}  message  {name:36} "
               f"{'ok' if ok else f'want={want!r} got={got!r}'}")
 
+    for name, state, sample, want in FULL_MESSAGE_CASES:
+        got = mod.messages(state, mod.visible_lines(sample))
+        ok = got == want
+        failures += not ok
+        print(f"{'ok  ' if ok else 'FAIL'}  full     {name:36} "
+              f"{'ok' if ok else f'want={want!r} got={got!r}'}")
+
     for name, state, sample, want in DURATION_CASES:
         seconds = mod.state_seconds(state, mod.visible_lines(sample), NOW)
         got = mod.state_duration(state, seconds)
@@ -821,9 +871,10 @@ def main() -> int:
           f"{'ok' if ok else f'got={decoded!r}'}")
 
     ok = (decoded[0]["cwd"] == "/tmp/koyr"
-          and decoded[0]["context_level"] == "ok")
+          and decoded[0]["context_level"] == "ok"
+          and "message_full" in decoded[0])
     failures += not ok
-    print(f"{'ok  ' if ok else 'FAIL'}  json     {'cwd and context level':36} "
+    print(f"{'ok  ' if ok else 'FAIL'}  json     {'cwd, context level and full message':36} "
           f"{'ok' if ok else f'got={decoded[0]!r}'}")
 
     for name, context, want in CONTEXT_LEVEL_CASES:
@@ -874,7 +925,8 @@ def main() -> int:
 
     total = (len(STATE_CASES) + len(CONTEXT_CASES) + len(AGE_CASES)
              + len(BLOCK_CASES) + len(COLOR_CASES) + len(DURATION_CASES)
-             + len(MESSAGE_CASES) + len(WEEKLY_CASES)
+             + len(MESSAGE_CASES) + len(FULL_MESSAGE_CASES)
+             + len(WEEKLY_CASES)
              + len(WEEKLY_COLOR_CASES) + len(SORT_CASES)
              + len(COLLAPSE_CASES) + len(PROJECT_CASES)
              + len(IDENTITY_CASES) + len(FIT_CASES) + 1

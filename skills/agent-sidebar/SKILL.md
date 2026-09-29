@@ -74,12 +74,13 @@ Fields:
 - `agent` and `harness` - both the harness name: `claude`, `codex`, `opencode` or `pi`.
 - `role` - only the harness's `--agent NAME` (lowercased), `""` when started without one. `opencode` without `--agent` reports `build`.
 - `changes` - `+A -D` lines from the pane's statusline `(+A,-D)`, else from `git diff` (staged + unstaged); `+N untracked` when only untracked files; `∅` when clean; `-` when unknown (not a git repo).
-- `context` - context size from the statusline (`91.6k`, `250.1K`), `-` when unknown. `context_level` is `ok`, `warn` (>= 100k), `rot` (>= 400k) or `unknown`.
+- `context` - context size from the statusline (`91.6k`, `1.2M`), `-` when unknown. `context_level` is `ok`, `warn` (>= 100k), `rot` (>= 400k) or `unknown`.
 - `duration` - how long in the current state, `-` when the screen does not show it. `since` is the same in seconds, or `null`.
 - `block` - the 5h usage block from the statusline (account-wide), `-` when not shown.
 - `weekly` - `NN%` of the weekly limit when the harness shows that notice, else `-`.
 - `age` - session age from the statusline, else since the harness process started.
 - `message` - first line of the last thing the pane said, max 160 chars (spinner text while running, the question while blocked, the summary while done).
+- `message_full` - all of the last thing the pane said, uncut, as one line: a whole `※ recap:` or answer block. Read this instead of `tmux capture-pane` when you need what an agent reported.
 - `flag` - `"▲"` when two agents share one working directory (danger - they overwrite each other), else `" "`.
 
 Rows arrive sorted as a queue - most urgent state first, freshest within each state.
