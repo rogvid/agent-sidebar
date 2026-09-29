@@ -65,6 +65,7 @@ import re
 import subprocess
 import sys
 import time
+import unicodedata
 from collections import Counter
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -224,6 +225,12 @@ TRAY_ELAPSED_RE = re.compile(r"(?:(\d+)h)?\s*(?:(\d+)m)?\s*(?:(\d+)s)?")
 # The input box's own rules. Long enough not to catch `─ Worked for 17m ──`,
 # which claude draws as a transcript separator.
 BORDER_RE = re.compile(r"^\s*[─═]{10,}")
+# opencode's input box: a column of `┃` rows closed by a `╹▀▀▀` rule, with
+# only the hint bar under it. The rule is as wide as the transcript column,
+# which is how the sidebar opencode draws down the right of a wide pane gets
+# cut away: it starts past the rule's end.
+OPENCODE_BOX_RE = re.compile(r"^\s*┃")
+OPENCODE_BOX_END_RE = re.compile(r"^\s*╹▀{4,}")
 # opencode names the action it wants approved on its own line: `→ Edit x`.
 ARROW_RE = re.compile(r"^\s*[│┃|]?\s*→\s*(\S.*)")
 # The line closing a finished turn, with or without the `· done` stamp that
@@ -236,12 +243,14 @@ SUMMARY_RE = re.compile(
 # Lines that are furniture rather than something the agent said. Anything
 # matching is skipped when walking back for the pane's last message. The
 # second row is opencode's: its status bar, its splash, and its block-art
-# wordmark, none of which sit inside a box we could cut away.
+# wordmark, none of which sit inside a box we could cut away, and the
+# `▣  Build · model · 46.6s` stamp it closes a turn with.
 CHROME_RE = re.compile(
     r"new task\?|⎿\s+Tip:|Update installed|tmux detected|"
     r"^\s*[❯>]\s*$|^\s*/rc\s*$|^\s*⧉|Total:|Session:|Model:|"
     r"⊙|/status\b|Ask anything|^\s*[│┃|]?\s*[█▀▄]{3,}|"
-    r"^\s*[│┃|]\s*Build\s+·|You've used \d+%|Approaching your"
+    r"^\s*[│┃|]\s*Build\s+·|You've used \d+%|Approaching your|"
+    r"^\s*▣\s"
 )
 # claude's transient limit notices, drawn right-aligned just above the input
 # box. Both are account-wide, like the block clock.
@@ -543,13 +552,42 @@ def waiting_dialog(dialog: list[str]) -> bool:
                    for line in dialog[last_marker + 1:])
 
 
+def cells(text: str) -> int:
+    """How many terminal columns TEXT takes up."""
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1
+               for c in text)
+
+
+def cut_cells(line: str, width: int) -> str:
+    """The part of LINE that fits in its first WIDTH columns."""
+    used = 0
+    for i, c in enumerate(line):
+        used += cells(c)
+        if used > width:
+            return line[:i]
+    return line
+
+
 def transcript_region(lines: list[str]) -> list[str]:
     """Everything above the agent's input box.
 
     claude draws the box as two full-width rules; the transcript ends at the
-    first of them. Agents that draw no box (opencode) fall through to the
-    whole pane, and the chrome filter below sorts out their footer.
+    first of them. opencode's ends at the `┃` rows above its `╹▀▀▀` rule,
+    and it is cut to the rule's width to leave the sidebar out. The rule is
+    only taken from the last rows, where nothing but the hint bar sits below
+    it, so a claude transcript quoting one cannot pass for it. Agents that
+    draw neither fall through to the whole pane, and the chrome filter below
+    sorts out their footer.
     """
+    tail = range(max(len(lines) - 3, 0), len(lines))
+    end = next((i for i in reversed(tail)
+                if OPENCODE_BOX_END_RE.match(lines[i])), None)
+    if end is not None:
+        top = end
+        while top > 0 and OPENCODE_BOX_RE.match(lines[top - 1]):
+            top -= 1
+        width = cells(lines[end])
+        return [cut_cells(line, width) for line in lines[:top]]
     borders = [i for i, line in enumerate(lines) if BORDER_RE.match(line)]
     if len(borders) >= 2:
         return lines[:borders[-2]]

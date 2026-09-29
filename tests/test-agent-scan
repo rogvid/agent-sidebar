@@ -11,8 +11,8 @@
 """Checks for agent-scan's pane-content state classifier.
 
 Every sample below is a real `tmux capture-pane` tail, trimmed to the live
-UI region: claude 2.1.247/2.1.248/2.1.250/2.1.270 and opencode 1.18.23 across the
-five states.
+UI region: claude 2.1.247/2.1.248/2.1.250/2.1.270 and opencode
+1.18.23/1.18.31 across the five states.
 They are the regression net for the patterns in agent-scan, which are the
 only thing standing between a status row and a plausible lie.
 
@@ -368,6 +368,79 @@ WEEKLY_COLOR_CASES = (
     ("nothing reported", "-", "MUTED"),
 )
 
+# opencode 1.18.31 at 229 columns: a sidebar (context, MCP, LSP, cwd) down
+# the right of the transcript and of the input box, and the turn closed by
+# its `▣  Build · model · 46.6s` stamp.
+OPENCODE_SIDEBAR = """     Cleanup pass done on the widget backlog, TASKS.md:9 plus a summary in the new runbook:                                                                                                  ▼ MCP
+                                                                                                                                                                                             • container-use Disabled
+     - What looked missing was not:                                                                                                                                                          • context7 Connected
+       - Search TASKS.md:169 pagination, TASKS.md:176 live updates, TASKS.md:181 archiving: deferred on purpose (polling ships first, docs/ARCHITECTURE.md:15)                               • graft Connected
+       - Email TASKS.md:201 templates + TASKS.md:277 digest: deferred on purpose (needs a mail server and a scheduler, TASKS.md:247)                                                         • playwright Disabled
+       - Actually missing: the audit log TASKS.md:307 had every box unchecked but is already live behind a flag (backend/app/api/audit/router.py:1, ENABLE_AUDIT app/core/config.py:54)
+         - fixed to [x] DONE, and setup TASKS.md:9 was unchecked but done via mise, compose and CI, fixed to [x] as well (hosting still deferred TASKS.md:                                   LSP
+         43), and sign-in TASKS.md:64 with Google was unchecked but is live now (backend/app/services/sso.py:1), fixed to [                                                                  LSPs are disabled
+         x]
+
+     Remaining open items: billing TASKS.md:332, the mobile layout TASKS.md:298 and hosting TASKS.md:43.
+
+     One runbook covers setup, sign-in and deploy in one go: docs/RUNBOOK.md:1, 5 sections in order:
+
+     1. prereqs: mise run setup, then pytest, tsc and the build
+     2. config: SECRET_KEY, ENVIRONMENT=production and the CORS origins, then a compose smoke test and a database backup
+     3. sign-in: create the Google client, set GOOGLE_* and ENABLE_SSO=true, then check that a forged state is rejected (backend/app/services/
+        sso.py:11, a forged code gets a 400 from backend/tests/api/test_sso.py:83)
+     4. email: set SMTP_* and send a test message
+     5. deploy: DNS, then TLS, then mise run deploy mise.toml:82, then check https://example.com/api/v1/health and the logs; search, email and billing
+        stay deferred per TASKS.md:243.
+
+     Run through docs/RUNBOOK.md:1 top to bottom and TASKS.md:307, TASKS.md:9 and TASKS.md:64 are done in one deploy.
+
+     ▣  Build · Muse Spark 1.2 Free · 46.6s
+
+  ┃
+  ┃
+  ┃                                                                                                                                                                                          ~/work/widgets:
+  ┃  Build auto · Muse Spark 1.2 Free OpenCode Zen · high                                                                                                                                    main
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   /home/user/work/widgets                                                                                                                                  250.1K (24%)  ctrl+p commands    • OpenCode 1.18.31"""
+
+# The same pane cut to a block with sidebar rows beside it.
+OPENCODE_SIDEBAR_BLOCK = """     Cleanup pass done on the widget backlog, TASKS.md:9 plus a summary in the new runbook:                                                                                                  ▼ MCP
+                                                                                                                                                                                             • container-use Disabled
+     - What looked missing was not:                                                                                                                                                          • context7 Connected
+       - Search TASKS.md:169 pagination, TASKS.md:176 live updates, TASKS.md:181 archiving: deferred on purpose (polling ships first, docs/ARCHITECTURE.md:15)                               • graft Connected
+       - Email TASKS.md:201 templates + TASKS.md:277 digest: deferred on purpose (needs a mail server and a scheduler, TASKS.md:247)                                                         • playwright Disabled
+       - Actually missing: the audit log TASKS.md:307 had every box unchecked but is already live behind a flag (backend/app/api/audit/router.py:1, ENABLE_AUDIT app/core/config.py:54)
+         - fixed to [x] DONE, and setup TASKS.md:9 was unchecked but done via mise, compose and CI, fixed to [x] as well (hosting still deferred TASKS.md:                                   LSP
+         43), and sign-in TASKS.md:64 with Google was unchecked but is live now (backend/app/services/sso.py:1), fixed to [                                                                  LSPs are disabled
+         x]
+
+  ┃
+  ┃
+  ┃                                                                                                                                                                                          ~/work/widgets:
+  ┃  Build auto · Muse Spark 1.2 Free OpenCode Zen · high                                                                                                                                    main
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   /home/user/work/widgets                                                                                                                                  250.1K (24%)  ctrl+p commands    • OpenCode 1.18.31"""
+
+OPENCODE_LAST_WORDS = (
+    "Run through docs/RUNBOOK.md:1 top to bottom and TASKS.md:307, "
+    "TASKS.md:9 and TASKS.md:64 are done in one deploy."
+)
+OPENCODE_BLOCK_WHOLE = (
+    "- What looked missing was not: - Search TASKS.md:169 pagination, "
+    "TASKS.md:176 live updates, TASKS.md:181 archiving: deferred on "
+    "purpose (polling ships first, docs/ARCHITECTURE.md:15) - Email "
+    "TASKS.md:201 templates + TASKS.md:277 digest: deferred on purpose "
+    "(needs a mail server and a scheduler, TASKS.md:247) - Actually "
+    "missing: the audit log TASKS.md:307 had every box unchecked but is "
+    "already live behind a flag (backend/app/api/audit/router.py:1, "
+    "ENABLE_AUDIT app/core/config.py:54) - fixed to [x] DONE, and setup "
+    "TASKS.md:9 was unchecked but done via mise, compose and CI, fixed to "
+    "[x] as well (hosting still deferred TASKS.md: 43), and sign-in "
+    "TASKS.md:64 with Google was unchecked but is live now "
+    "(backend/app/services/sso.py:1), fixed to [ x]"
+)
+
 # Fixed clock so the `· done H:MM` arithmetic is deterministic: 2026-08-27
 # at 23:34 local time, the moment these captures were taken.
 NOW = time.mktime((2026, 8, 27, 23, 34, 0, 0, 0, -1))
@@ -476,6 +549,13 @@ FULL_MESSAGE_CASES = (
     ("so is the restored prompt", "interrupted", CLAUDE_INTERRUPTED,
      ("❯ Run this bash command in the foreground: ping -c 40 127.0.0.1",
       "❯ Run this bash command in the foreground: ping -c 40 127.0.0.1")),
+    # The input box, its model row and the sidebar are opencode's chrome;
+    # the last words are the paragraph above the turn's stamp.
+    ("opencode's last words, not its chrome", "done", OPENCODE_SIDEBAR,
+     (OPENCODE_LAST_WORDS, OPENCODE_LAST_WORDS)),
+    ("opencode's sidebar is not the message", "done",
+     OPENCODE_SIDEBAR_BLOCK,
+     ("- What looked missing was not:", OPENCODE_BLOCK_WHOLE)),
 )
 
 
