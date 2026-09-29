@@ -82,6 +82,10 @@ class Fake:
         self.ran: list[tuple[str, ...]] = []
         self.prs = {}
         self.pr_lookups: list[str] = []
+        self.accounts: list[tuple[str, str]] = []
+
+    def list_accounts(self):
+        return self.accounts
 
     async def scan(self):
         return self.rows
@@ -112,7 +116,8 @@ async def app_cases(mod) -> list[tuple[str, bool, str]]:
     )
     fake.prs = {"main": {"number": 12, "state": "MERGED", "draft": False}}
     app = mod.AgentSidebar(scan=fake.scan, panes_here=fake.panes_here,
-                           run=fake.run, pull_requests=fake.pull_requests)
+                           run=fake.run, pull_requests=fake.pull_requests,
+                           accounts=fake.list_accounts)
     glue = mod.GLUE
 
     async def rescan() -> None:
@@ -397,7 +402,8 @@ async def project_default_cases(mod) -> list[tuple[str, bool, str]]:
                         "agent-sidebar.harness", "codex"], check=True)
         fake = Fake([row("koyr", "%1", cwd=project)], {"%1"})
         app = mod.AgentSidebar(scan=fake.scan, panes_here=fake.panes_here,
-                               run=fake.run, pull_requests=fake.pull_requests)
+                               run=fake.run, pull_requests=fake.pull_requests,
+                               accounts=fake.list_accounts)
         async with app.run_test(size=(36, 30)) as pilot:
             await pilot.pause(0.3)
             await pilot.press("n")
@@ -436,7 +442,7 @@ async def fold_cases(mod) -> list[tuple[str, bool, str]]:
     def sidebar():
         return mod.AgentSidebar(scan=fake.scan, panes_here=fake.panes_here,
                                 run=fake.run, pull_requests=fake.pull_requests,
-                                state=state)
+                                accounts=fake.list_accounts, state=state)
 
     app = sidebar()
     async with app.run_test(size=(36, 30)) as pilot:
@@ -602,6 +608,65 @@ async def fold_cases(mod) -> list[tuple[str, bool, str]]:
     return results
 
 
+async def account_cases(mod) -> list[tuple[str, bool, str]]:
+    """A harness's accounts are listed beside it in the new-worktree
+    dialog, and the one picked is handed on."""
+    from textual.widgets import Checkbox, OptionList
+
+    results: list[tuple[str, bool, str]] = []
+
+    def check(name: str, ok: bool, detail: object) -> None:
+        results.append((name, ok, "" if ok else f"got={detail!r}"))
+
+    fake = Fake([row("koyr", "%1")], {"%1"})
+    fake.accounts = [("codex", "alt"), ("claude", "work"),
+                     ("claude", "personal")]
+    app = mod.AgentSidebar(scan=fake.scan, panes_here=fake.panes_here,
+                           run=fake.run, pull_requests=fake.pull_requests,
+                           accounts=fake.list_accounts)
+    async with app.run_test(size=(36, 40)) as pilot:
+        await pilot.pause(0.3)
+        await pilot.press("n")
+        await pilot.pause(0.1)
+        hlist = app.screen.query_one("#harness-list", OptionList)
+        ids = [hlist.get_option_at_index(i).id
+               for i in range(hlist.option_count)]
+        check("each harness's accounts come just before it",
+              ids == ["claude (personal)", "claude (work)", "claude",
+                      "codex (alt)", "codex", "opencode", "pi", "none"], ids)
+        check("and the harness on its default account is highlighted",
+              hlist.highlighted_option.id == "claude",
+              hlist.highlighted_option.id)
+        shown = plain(hlist.get_option("claude (work)").prompt).strip()
+        check("an account reads as a badge on its harness",
+              shown == "◆ claude (work)", shown)
+
+        async def create(branch: str, *keys: str):
+            await pilot.press(*branch, "tab", *keys)
+            await pilot.pause(0.1)
+            yolo = app.screen.query_one("#yolo-check", Checkbox)
+            before = len(fake.ran)
+            await pilot.press("enter")
+            await pilot.pause(0.1)
+            got = fake.ran[before] if len(fake.ran) > before else None
+            return yolo.disabled, got
+
+        disabled, got = await create("feat/w", "k")
+        check("an account keeps its harness's yolo", not disabled, disabled)
+        check("and is handed to new-worktree",
+              got == (mod.GLUE, "new-worktree", "%1", "feat/w",
+                      "claude --dangerously-skip-permissions",
+                      "--account", "work"), got)
+
+        await pilot.press("n")
+        await pilot.pause(0.1)
+        _, got = await create("feat/d")
+        check("the default account hands none",
+              got == (mod.GLUE, "new-worktree", "%1", "feat/d",
+                      "claude --dangerously-skip-permissions"), got)
+    return results
+
+
 def main() -> int:
     # The app remembers folds in $XDG_STATE_HOME; keep the real one out.
     os.environ["XDG_STATE_HOME"] = tempfile.mkdtemp()
@@ -685,6 +750,8 @@ def main() -> int:
         report("app", name, ok, detail)
     for name, ok, detail in asyncio.run(fold_cases(mod)):
         report("fold", name, ok, detail)
+    for name, ok, detail in asyncio.run(account_cases(mod)):
+        report("account", name, ok, detail)
 
     print(f"\n{total - failures}/{total} passed")
     return 1 if failures else 0

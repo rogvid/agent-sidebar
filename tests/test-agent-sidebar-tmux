@@ -59,6 +59,11 @@ cat >"${scratch}/bin/tv" <<EOF
 #!/bin/sh
 echo "\$*" >"${scratch}/tv-args"
 EOF
+# A harness that notes the account it was started on.
+cat >"${scratch}/bin/claude" <<'EOF'
+#!/bin/sh
+echo "${CLAUDE_CONFIG_DIR:-default}" >claude-account
+EOF
 chmod +x "${scratch}/bin/"*
 
 # A pre-commit hook hands down GIT_INDEX_FILE and friends, which would aim
@@ -82,6 +87,12 @@ export PATH="${scratch}/bin:${repo}/scripts/.local/bin:${PATH}"
 export AGENT_SIDEBAR_COMMAND="sleep 3600"
 export AGENT_SIDEBAR_AGENT="touch agent-started"
 unset TMUX TMUX_PANE
+# The panes' login shells read ~/.profile, and a real one puts the real
+# harnesses ahead of the stand-ins.
+export HOME="${scratch}/home" XDG_CONFIG_HOME="${scratch}/home/.config"
+mkdir -p "${HOME}"
+# An agent running this test would hand its own account on to every spawn.
+unset CLAUDE_CONFIG_DIR CODEX_HOME PI_CODING_AGENT_DIR
 
 t -f "${scratch}/tmux.conf" new-session -d -s main -x 160 -y 45 -n one
 t new-window -d -t main: -n two
@@ -237,6 +248,48 @@ check "spawn refuses a session that already exists" not act spawn "${agent}" fea
 check "and types nothing into it" equals "t list-panes -t =app-feat-y: -F #{pane_id}" "${spawned}"
 outsider="$(t new-window -d -t main: -c "${scratch}" -P -F '#{pane_id}' 'sleep 3600')"
 check "spawn from a pane outside a project fails" not act spawn "${outsider}" feat/z
+
+# Accounts: a harness's config folder next to its default one, named by its
+# suffix, when it holds a login; and any listed in the accounts file.
+home="${HOME}"
+mkdir -p "${home}/.claude-work" "${home}/.claude-empty" "${home}/.codex-alt" \
+    "${home}/.pi-lab/agent" "${home}/.config/agent-sidebar" "${scratch}/far"
+echo '{}' >"${home}/.claude-work/.claude.json"
+echo '{}' >"${home}/.codex-alt/auth.json"
+echo '{}' >"${home}/.pi-lab/agent/auth.json"
+printf '# harness name folder\nclaude far %s\nopencode far %s\n' "${scratch}/far" "${scratch}/far" \
+    >"${home}/.config/agent-sidebar/accounts"
+accounts() { agent-sidebar-tmux accounts; }
+expected="$(printf 'claude\tfar\t%s\nclaude\twork\t%s\ncodex\talt\t%s\npi\tlab\t%s' \
+    "${scratch}/far" "${home}/.claude-work" "${home}/.codex-alt" "${home}/.pi-lab/agent")"
+check "accounts lists each harness's accounts with a login, where it has any" \
+    equals accounts "${expected}"
+
+on_account() { cat "$1/claude-account"; }
+act spawn "${agent}" feat/work claude --account work >/dev/null
+check "spawn --account starts the harness on that account" \
+    equals "on_account ${project}/feat-work" "${home}/.claude-work"
+check "and the whole session stays on it" equals \
+    "t show-environment -t =app-feat-work CLAUDE_CONFIG_DIR" \
+    "CLAUDE_CONFIG_DIR=${home}/.claude-work"
+CLAUDE_CONFIG_DIR="${home}/.claude-work" act spawn "${agent}" feat/inherit claude >/dev/null
+check "spawn keeps the account of the agent calling it" \
+    equals "on_account ${project}/feat-inherit" "${home}/.claude-work"
+act spawn "${agent}" feat/plain claude >/dev/null
+check "and the default account when it has none" \
+    equals "on_account ${project}/feat-plain" default
+check "spawn refuses an account it does not know" \
+    not act spawn "${agent}" feat/nope claude --account nope
+check "before making a worktree" not exists "${project}/feat-nope"
+check "spawn refuses an account for a harness that keeps none" \
+    not act spawn "${agent}" feat/nope opencode --account work
+act spawn "${main}" feat/headless claude --account far >/dev/null
+check "spawn takes a project folder instead of a pane" \
+    equals "on_account ${project}/feat-headless" "${scratch}/far"
+
+act new-worktree "${agent}" feat/picked claude --account work
+check "new-worktree starts the account picked in the sidebar" \
+    equals "on_account ${project}/feat-picked" "${home}/.claude-work"
 
 act review "${agent}"
 check "review pastes tuicr's export into the agent" grep -qF 'rename B to b' \

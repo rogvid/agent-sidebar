@@ -18,16 +18,21 @@
 #
 # The sidebar's actions, each on an agent's pane:
 #
-#   new-worktree PANE BRANCH [HARNESS]
+#   new-worktree PANE BRANCH [HARNESS] [--account NAME]
 #                            create a worktree of PANE's project, give it a
 #                            session of its own and start HARNESS there
 #                            (default: $AGENT_SIDEBAR_AGENT or claude; "none"
-#                            starts no harness)
-#   spawn PANE BRANCH [HARNESS]
-#                            new-worktree for an agent starting workers: no
-#                            popup, you stay where you are, an existing
-#                            session is refused, failures exit non-zero;
-#                            prints the new session's pane id
+#                            starts no harness), on HARNESS's account NAME
+#   spawn PANE|DIR BRANCH [HARNESS] [--account NAME]
+#                            new-worktree for an agent starting workers, or
+#                            for you from any shell: no popup, you stay
+#                            where you are, an existing session is refused,
+#                            failures exit non-zero; prints the new
+#                            session's pane id. Without --account the
+#                            session keeps the caller's accounts.
+#   accounts                 list each harness's accounts besides its
+#                            default: harness, name and folder, tab
+#                            separated
 #   review PANE              review PANE's uncommitted changes in tuicr; its
 #                            export (y) is pasted into PANE's input
 #   git PANE                 lazygit in PANE's directory
@@ -37,6 +42,13 @@
 #                            first), then PANE
 #   open                     pick a git repository to open in its own
 #                            session (tv projects)
+#
+# An account is a harness's config folder next to its default one, named by
+# its suffix, when it holds a login: ~/.claude-NAME, ~/.codex-NAME,
+# ~/.pi-NAME/agent. Accounts kept anywhere else go in
+# ${XDG_CONFIG_HOME:-~/.config}/agent-sidebar/accounts, one
+# "HARNESS NAME FOLDER" a line. A session started on an account keeps it
+# for everything run in it.
 #
 # Whether the sidebar is wanted is the global @agent-sidebar-open option.
 # The pane itself carries the pane option @agent-sidebar. Keeping the two
@@ -267,11 +279,92 @@ notify() {
     tmux display-message -d 5000 "agent-sidebar: $1"
 }
 
+# The variable a harness picks its account by, for the harnesses that keep
+# more than one. opencode keeps its logins in its share of XDG_DATA_HOME,
+# and moving that would move every other tool's data along with them.
+account_variable() {
+    case "$1" in
+    claude) echo CLAUDE_CONFIG_DIR ;;
+    codex) echo CODEX_HOME ;;
+    pi) echo PI_CODING_AGENT_DIR ;;
+    *) return 1 ;;
+    esac
+}
+
+readonly account_variables=(CLAUDE_CONFIG_DIR CODEX_HOME PI_CODING_AGENT_DIR)
+
+# Each harness's accounts besides its default, "HARNESS<tab>NAME<tab>FOLDER"
+# a line. The login each folder must hold is what the harness writes there:
+# claude's credentials are in the macOS keychain, but .claude.json is not.
+accounts() {
+    local folder harness name file
+    {
+        for folder in "${HOME}"/.claude-*/.claude.json \
+            "${HOME}"/.codex-*/auth.json "${HOME}"/.pi-*/agent/auth.json; do
+            [[ -e "${folder}" ]] || continue
+            folder="$(dirname "${folder}")"
+            name="${folder#"${HOME}"/.}"
+            name="${name%/agent}"
+            printf '%s\t%s\t%s\n' "${name%%-*}" "${name#*-}" "${folder}"
+        done
+        file="${XDG_CONFIG_HOME:-${HOME}/.config}/agent-sidebar/accounts"
+        if [[ -r "${file}" ]]; then
+            while read -r harness name folder; do
+                if [[ -n "${folder}" ]] && account_variable "${harness}" >/dev/null; then
+                    printf '%s\t%s\t%s\n' "${harness}" "${name}" \
+                        "${folder/#\~/${HOME}}"
+                fi
+            done <"${file}"
+        fi
+    } | sort -t $'\t' -k1,1 -k2,2
+}
+
+# new-session's -e arguments for starting COMMAND on its harness's account
+# NAME, in `session_env`, or why not in `account_error`. With INHERIT, the
+# caller's accounts come along for every other harness, and for this one
+# when no NAME is given.
+account_env() {
+    local command="$1" name="$2" inherit="$3" harness variable folder h n f
+    session_env=()
+    read -r harness _ <<<"${command}"
+    harness="$(basename "${harness:-none}")"
+    if [[ -n "${name}" ]]; then
+        if ! variable="$(account_variable "${harness}")"; then
+            account_error="${harness} keeps no accounts"
+            return 1
+        fi
+        while IFS=$'\t' read -r h n f; do
+            if [[ "${h}" == "${harness}" && "${n}" == "${name}" ]]; then
+                folder="${f}"
+                break
+            fi
+        done < <(accounts)
+        if [[ -z "${folder:-}" ]]; then
+            account_error="no ${harness} account ${name} (see: agent-sidebar-tmux accounts)"
+            return 1
+        fi
+        session_env+=(-e "${variable}=${folder}")
+    fi
+    if [[ -n "${inherit}" ]]; then
+        for h in "${account_variables[@]}"; do
+            if [[ -n "${!h:-}" && "${h}" != "${variable:-}" ]]; then
+                session_env+=(-e "${h}=${!h}")
+            fi
+        done
+    fi
+}
+
 new_worktree() {
-    local pane="$1" branch="$2" harness="${3:-}" project path session chosen
+    local pane="$1" branch="$2" harness="${3:-}" account="${4:-}"
+    local project path session chosen
     project="$(project_of "$(pane_path "${pane}")")"
     if [[ -z "${project}" ]]; then
         notify "no project behind ${pane}"
+        return 0
+    fi
+    chosen="${harness:-${agent_command}}"
+    if ! account_env "${chosen}" "${account}" ""; then
+        notify "${account_error}"
         return 0
     fi
     # git-wt-add reports as it goes - setting the worktree up included - so
@@ -287,10 +380,9 @@ new_worktree() {
         return 0
     fi
     if ! tmux has-session -t "=${session}" 2>/dev/null; then
-        tmux new-session -d -s "${session}" -c "${path}"
+        tmux new-session -d -s "${session}" -c "${path}" "${session_env[@]}"
         # Typed into the shell rather than run as the session's command, so
         # the session outlives the agent.
-        chosen="${harness:-${agent_command}}"
         if [[ -n "${chosen}" && "${chosen}" != "none" ]]; then
             tmux send-keys -t "=${session}:" "${chosen}" Enter
         fi
@@ -302,10 +394,22 @@ new_worktree() {
 # and a session that already exists is refused rather than typed into: it
 # may be anyone's, and the harness command would reach whoever is in it.
 spawn() {
-    local pane="$1" branch="$2" harness="${3:-}" project path session new chosen
-    project="$(project_of "$(pane_path "${pane}")")"
+    local where="$1" branch="$2" harness="${3:-}" account="${4:-}"
+    local dir project path session new chosen
+    # A pane for an agent, a folder for you in a shell outside tmux.
+    if [[ "${where}" == %* ]]; then
+        dir="$(pane_path "${where}")"
+    else
+        dir="${where}"
+    fi
+    project="$(project_of "${dir}")"
     if [[ -z "${project}" ]]; then
-        echo "agent-sidebar-tmux: no git-wt project behind ${pane}" >&2
+        echo "agent-sidebar-tmux: no git-wt project behind ${where}" >&2
+        return 1
+    fi
+    chosen="${harness:-${agent_command}}"
+    if ! account_env "${chosen}" "${account}" inherit; then
+        echo "agent-sidebar-tmux: ${account_error}" >&2
         return 1
     fi
     (cd "${project}" && git-wt-add "${branch}" </dev/null) >&2
@@ -323,8 +427,8 @@ spawn() {
         echo "agent-sidebar-tmux: session ${session} already exists, started nothing" >&2
         return 1
     fi
-    new="$(tmux new-session -d -P -F '#{pane_id}' -s "${session}" -c "${path}")"
-    chosen="${harness:-${agent_command}}"
+    new="$(tmux new-session -d -P -F '#{pane_id}' -s "${session}" -c "${path}" \
+        "${session_env[@]}")"
     if [[ "${chosen}" != "none" ]]; then
         tmux send-keys -t "${new}" -l "${chosen}"
         tmux send-keys -t "${new}" Enter
@@ -427,19 +531,27 @@ main() {
         need 2 "$@"
         prune_resurrect "$2"
         ;;
-    new-worktree)
-        if [[ $# -lt 3 || $# -gt 4 ]]; then
+    new-worktree | spawn)
+        local command="$1" account=""
+        local -a args=()
+        shift
+        while (($#)); do
+            if [[ "$1" == --account && $# -ge 2 ]]; then
+                account="$2"
+                shift 2
+            else
+                args+=("$1")
+                shift
+            fi
+        done
+        if [[ ${#args[@]} -lt 2 || ${#args[@]} -gt 3 ]]; then
             usage >&2
             exit 2
         fi
-        new_worktree "$2" "$3" "${4:-}"
+        "${command//-/_}" "${args[0]}" "${args[1]}" "${args[2]:-}" "${account}"
         ;;
-    spawn)
-        if [[ $# -lt 3 || $# -gt 4 ]]; then
-            usage >&2
-            exit 2
-        fi
-        spawn "$2" "$3" "${4:-}"
+    accounts)
+        accounts
         ;;
     review)
         need 2 "$@"

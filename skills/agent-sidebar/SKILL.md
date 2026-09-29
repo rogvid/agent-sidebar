@@ -188,12 +188,15 @@ launch="claude --dangerously-skip-permissions \"\$(cat $brief)\""   # typed as-i
 worker=$(agent-sidebar-tmux spawn "$TMUX_PANE" "feat/my-feature" "$launch")
 ```
 
-`spawn PANE BRANCH [HARNESS]`:
-- Creates the worktree for BRANCH in PANE's project with `git-wt-add` (an existing branch or worktree is reused); its report goes to stderr.
+`spawn PANE|DIR BRANCH [HARNESS] [--account NAME]`:
+- Creates the worktree for BRANCH in PANE's project (or DIR's) with `git-wt-add` (an existing branch or worktree is reused); its report goes to stderr.
 - Creates the worktree's own session, types HARNESS into its shell and prints that pane's id. The session outlives the harness.
 - HARNESS is any command, the task included (`$launch` above); `none` starts nothing; default `$AGENT_SIDEBAR_AGENT` or `claude`.
 - Nothing appears on the user's screen and they stay where they are.
-- Fails with a message and a non-zero exit when PANE is not in a `git-wt` project, or when the worktree's session already exists - it never types into a session it did not create.
+- The worker runs on your account: the session keeps your `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and `PI_CODING_AGENT_DIR`.
+  Never set these in `$launch` yourself.
+- `--account NAME` starts the harness on another of its accounts instead, only when the user asks for one; `agent-sidebar-tmux accounts` lists them.
+- Fails with a message and a non-zero exit when PANE is not in a `git-wt` project, when the account is unknown, or when the worktree's session already exists - it never types into a session it did not create.
 
 When it fails, stop and tell the user what it said.
 Do not rebuild its steps by hand, and do not delete a session or worktree to make room.
@@ -201,7 +204,7 @@ Do not rebuild its steps by hand, and do not delete a session or worktree to mak
 After it succeeds, check once with `agent-scan` that the worker is listed. Do not type the launch command again - see section 3.
 To bring the user to the worker only when they ask: `tmux switch-client -t "$worker"`.
 
-`agent-sidebar-tmux new-worktree PANE BRANCH [HARNESS]` is the sidebar's version for the human: `git-wt-add` runs in a popup on their screen, an existing session is reused as it is, and it switches their client to the new session.
+`agent-sidebar-tmux new-worktree PANE BRANCH [HARNESS] [--account NAME]` is the sidebar's version for the human: `git-wt-add` runs in a popup on their screen, an existing session is reused as it is, and it switches their client to the new session.
 
 ### Tracking and reviewing workers
 
@@ -236,8 +239,9 @@ tmux kill-pane -t "%42"   # only if the worker's pane lived in another session
 All but `kill` and `spawn` open a `display-popup` on the attached client - they are for the human and fail with `no current client` when none is attached.
 
 ```bash
-agent-sidebar-tmux new-worktree <pane_id> <branch> [harness]  # see section 4
-agent-sidebar-tmux spawn <pane_id> <branch> [harness]         # section 4; no popup, prints the new pane id
+agent-sidebar-tmux new-worktree <pane_id> <branch> [harness] [--account name]  # see section 4
+agent-sidebar-tmux spawn <pane_id|dir> <branch> [harness] [--account name]     # section 4; no popup, prints the new pane id
+agent-sidebar-tmux accounts                   # each harness's accounts besides its default: harness, name, folder
 agent-sidebar-tmux review <pane_id>           # tuicr on its uncommitted changes; export (y) is pasted into the pane unsubmitted
 agent-sidebar-tmux git <pane_id>              # lazygit in the pane's cwd
 agent-sidebar-tmux pr <pane_id>               # gh pr view, or offer gh pr create
