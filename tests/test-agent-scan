@@ -589,21 +589,31 @@ TARGET_CASES = (
 # the sidebar scan them. Only a harness makes a pane an agent: programs left
 # open next to one are not agents, and the tool a harness is running is not
 # its role. Stand-in harnesses carry the real names and run a tool the way a
-# Bash tool call does. (name, working tree, command, (agent, role, flag) or
-# None for no row.)
+# Bash tool call does. A harness's account is the folder its account
+# variable names, "" on its default one. (name, working tree, command,
+# (agent, role, flag, account) or None for no row.)
 PANE_CASES = (
     ("top is not an agent", "shared", "top", None),
     ("lazygit is not an agent", "shared", "lazygit", None),
     ("man is not an agent", "shared", "man ls", None),
     ("tool run is not the role", "shared", "claude",
-     ("claude", "", " ")),
+     ("claude", "", " ", "")),
     ("opencode --agent plan", "plan", "opencode --agent plan",
-     ("opencode", "plan", " ")),
+     ("opencode", "plan", " ", "")),
     ("claude --agent reviewer shares tree", "pair",
-     "claude --agent reviewer", ("claude", "reviewer", "▲")),
+     "claude --agent reviewer", ("claude", "reviewer", "▲", "")),
     ("opencode runs build by default", "pair", "opencode",
-     ("opencode", "build", "▲")),
+     ("opencode", "build", "▲", "")),
+    ("claude on another account", "alt",
+     "CLAUDE_CONFIG_DIR=/cfg/.claude-alt claude",
+     ("claude", "", " ", "/cfg/.claude-alt")),
 )
+
+
+def program(command: str) -> str:
+    """The program a pane command runs, past its variable assignments."""
+    return next(word for word in command.split() if "=" not in word)
+
 
 # What a stand-in harness runs: a tool that outlives the scan.
 HARNESS_STAND_IN = "#!/bin/bash\ntimeout 3600 sleep 3600\n"
@@ -627,6 +637,9 @@ def scan_real_panes(root: Path) -> dict[str, dict | None]:
     }
     env.pop("TMUX", None)
     env.pop("TMUX_PANE", None)
+    # Stand-ins start on their default account unless a case says not.
+    for variable in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "PI_CODING_AGENT_DIR"):
+        env.pop(variable, None)
 
     def tmux(*args: str) -> str:
         return subprocess.run(
@@ -662,7 +675,7 @@ def scan_real_panes(root: Path) -> dict[str, dict | None]:
 
         deadline = time.time() + 10
         while not all(
-            {command.split()[0], *(("timeout",) if want else ())}
+            {program(command), *(("timeout",) if want else ())}
             <= running(name)
             for name, _tree, command, want in PANE_CASES
         ):
@@ -917,7 +930,7 @@ def main() -> int:
         scanned = scan_real_panes(Path(tmp))
     for name, _tree, _command, want in PANE_CASES:
         r = scanned[name]
-        got = r and (r["agent"], r["role"], r["flag"])
+        got = r and (r["agent"], r["role"], r["flag"], r.get("account"))
         ok = got == want and (r is None or r["harness"] == r["agent"])
         failures += not ok
         print(f"{'ok  ' if ok else 'FAIL'}  pane     {name:36} "

@@ -75,6 +75,13 @@ import psutil
 # (plan, reviewer, ...) is whatever it was started with via `--agent`; see
 # find_harness_and_role().
 HARNESS_NAMES = frozenset({"claude", "codex", "opencode", "pi"})
+# The variable a harness picks its account's folder by, as
+# agent-sidebar-tmux starts it on one. Unset is its default account.
+ACCOUNT_VARIABLE = {
+    "claude": "CLAUDE_CONFIG_DIR",
+    "codex": "CODEX_HOME",
+    "pi": "PI_CODING_AGENT_DIR",
+}
 
 RESET = "\033[0m"
 BLUE, YELLOW, GREEN, RED, MAGENTA, CYAN = (
@@ -411,6 +418,18 @@ def find_harness(
             return Agent(name, pid, started_at)
         queue.extend(children.get(pid, ()))
     return None
+
+
+def harness_account(harness: Agent) -> str:
+    """The folder of the account the harness runs on, "" for its default
+    one or when its environment cannot be read."""
+    variable = ACCOUNT_VARIABLE.get(harness.name)
+    if variable is None:
+        return ""
+    try:
+        return psutil.Process(harness.pid).environ().get(variable, "")
+    except psutil.Error:
+        return ""
 
 
 def _agent_from_cmdline(cmdline: list[str]) -> str | None:
@@ -1025,6 +1044,9 @@ class Row:
     # All of what the pane last said, where message is its first line cut
     # short: a whole recap, for the tools that read one.
     message_full: str = ""
+    # The folder of the account the harness runs on (CLAUDE_CONFIG_DIR and
+    # the like), "" for its default one. Usage limits belong to an account.
+    account: str = ""
 
 
 def sort_key(row: Row) -> tuple[int, int, float, str]:
@@ -1092,6 +1114,7 @@ def collect_rows() -> list[Row]:
             message_full=message_full,
             flag=SHARED_TREE if trees[pane.cwd] > 1 else " ",
             changes=changes,
+            account=harness_account(harness_agent),
         ))
 
     rows.sort(key=sort_key)
