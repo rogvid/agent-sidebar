@@ -11,7 +11,7 @@
 """Checks for agent-scan's pane-content state classifier.
 
 Every sample below is a real `tmux capture-pane` tail, trimmed to the live
-UI region: claude 2.1.247/2.1.248/2.1.250/2.1.270 and opencode
+UI region: claude 2.1.247/2.1.248/2.1.250/2.1.270/2.1.284 and opencode
 1.18.23/1.18.31 across the five states.
 They are the regression net for the patterns in agent-scan, which are the
 only thing standing between a status row and a plausible lie.
@@ -368,6 +368,39 @@ WEEKLY_COLOR_CASES = (
     ("nothing reported", "-", "MUTED"),
 )
 
+# claude 2.1.284 scrolled up in its fullscreen view: it lays a
+# ` Jump to bottom (ctrl+End) ↓ ` pill over the middle of the transcript's
+# last row, so the recap under it has lost 29 characters. Nor is the recap
+# the pane's last word: the session had answered again since, below the
+# fold, which is why the pill is there at all.
+CLAUDE_SCROLLED = """  Should I open a pull request for the widget changes? You can also answer the questions above and I'll pass each one on.
+
+✻ Baked for 1m 27s · done 1:15 PM
+
+※ recap: The widget service is split into three modules and the tests pass, and I have briefed the t Jump to bottom (ctrl+End) ↓ nd me your answers to the open questions, and I'll pass each one on.
+
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⎇ main | (+0,-0)                                                                                                                                                                                   Model: Opus 5.5 | Ctx: 65.9k
+  Total: 1.7M                                                                                                                                                                                   Session: 1hr 36m | Block: 1hr 15m
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"""
+
+# What a row says in place of words it cannot see.
+SCROLLED = "(scrolled up, last words off screen)"
+
+# The same pill once something new has arrived below the fold.
+CLAUDE_SCROLLED_NEW = CLAUDE_SCROLLED.replace(
+    " Jump to bottom (ctrl+End) ↓ ", " 2 new messages (ctrl+End) ↓ "
+)
+
+# A transcript line quoting the pill. It is not centred on the pane, which
+# is what tells it apart from the real thing.
+QUOTED_PILL = CLAUDE_IDLE.replace(
+    '● Done. The command slept for 12 seconds and then printed "done".',
+    "● claude draws Jump to bottom (ctrl+End) ↓ over the transcript.",
+)
+
 # opencode 1.18.31 at 229 columns: a sidebar (context, MCP, LSP, cwd) down
 # the right of the transcript and of the input box, and the turn closed by
 # its `▣  Build · model · 46.6s` stamp.
@@ -466,6 +499,8 @@ DURATION_CASES = (
     # A pane quoting this repo's own captures must not read the quoted
     # stamp as its own last turn.
     ("done pane quoting a stamp", "done", QUOTED_DONE, "-"),
+    # The stamp on screen closes an old turn; the last one is out of view.
+    ("scrolled up hides the stamp", "done", CLAUDE_SCROLLED, "-"),
 )
 
 
@@ -549,6 +584,15 @@ FULL_MESSAGE_CASES = (
     ("so is the restored prompt", "interrupted", CLAUDE_INTERRUPTED,
      ("❯ Run this bash command in the foreground: ping -c 40 127.0.0.1",
       "❯ Run this bash command in the foreground: ping -c 40 127.0.0.1")),
+    # Under the pill is an old recap with a hole in it. The pane's real
+    # last words are below the fold, and the screen cannot say what they are.
+    ("scrolled up hides the last words", "done", CLAUDE_SCROLLED,
+     (SCROLLED, SCROLLED)),
+    ("so does news below the fold", "done", CLAUDE_SCROLLED_NEW,
+     (SCROLLED, SCROLLED)),
+    ("a quoted pill is just text", "done", QUOTED_PILL,
+     ("claude draws Jump to bottom (ctrl+End) ↓ over the transcript.",
+      "claude draws Jump to bottom (ctrl+End) ↓ over the transcript.")),
     # The input box, its model row and the sidebar are opencode's chrome;
     # the last words are the paragraph above the turn's stamp.
     ("opencode's last words, not its chrome", "done", OPENCODE_SIDEBAR,

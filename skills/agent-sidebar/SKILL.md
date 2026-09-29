@@ -83,6 +83,7 @@ Fields:
 - `age` - session age from the statusline, else since the harness process started.
 - `message` - first line of the last thing the pane said, max 160 chars (spinner text while running, the question while blocked, the summary while done).
 - `message_full` - all of the last thing the pane said, uncut, as one line: a whole `※ recap:` or answer block. Read this instead of `tmux capture-pane` when you need what an agent reported.
+- Both read `(scrolled up, last words off screen)` when a claude pane is scrolled up: its latest words are below the fold, and `duration` is `-` for the same reason.
 - `flag` - `"▲"` when two agents share one working directory (danger - they overwrite each other), else `" "`.
 - `account` - the folder of the account the harness runs on (`CLAUDE_CONFIG_DIR`, `CODEX_HOME` or `PI_CODING_AGENT_DIR` of its process), `""` on its default one. Match it against `agent-sidebar-tmux accounts` for the name.
 

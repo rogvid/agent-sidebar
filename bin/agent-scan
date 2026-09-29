@@ -231,6 +231,17 @@ BORDER_RE = re.compile(r"^\s*[─═]{10,}")
 # cut away: it starts past the rule's end.
 OPENCODE_BOX_RE = re.compile(r"^\s*┃")
 OPENCODE_BOX_END_RE = re.compile(r"^\s*╹▀{4,}")
+# The pill claude's fullscreen view lays over the transcript's last row
+# while you are scrolled up: ` Jump to bottom (ctrl+End) ↓ `, or `2 new
+# messages …` once more has arrived below the fold, in whichever of its
+# forms fits the pane. It is centred, which is what tells it apart from a
+# transcript line quoting it.
+SCROLL_PILL_RE = re.compile(
+    r"(?:Jump to bottom|\d+ new messages?)"
+    r"(?: \([^)]*\) ↓|: \S+ to scroll| ↓)?"
+)
+# What a row says in place of the words the pill hides.
+SCROLLED = "(scrolled up, last words off screen)"
 # opencode names the action it wants approved on its own line: `→ Edit x`.
 ARROW_RE = re.compile(r"^\s*[│┃|]?\s*→\s*(\S.*)")
 # The line closing a finished turn, with or without the `· done` stamp that
@@ -733,14 +744,29 @@ def dialog_message(lines: list[str]) -> str:
     return "-"
 
 
-def delegated_message(
-    tray: list[str], region: list[str], whole: bool = False,
-) -> str:
-    """What the delegates are doing, else the session's parting words."""
+def delegate_activity(tray: list[str]) -> str:
+    """What the delegates are doing, or "" when the tray does not say."""
     doing = [activity for activity, _ in tray_delegates(tray) if activity]
-    if doing:
-        return clean(" · ".join(doing))
-    return last_paragraph(region, whole)
+    return clean(" · ".join(doing)) if doing else ""
+
+
+def scrolled_up(lines: list[str]) -> bool:
+    """True when claude's view is scrolled up off the transcript's bottom.
+
+    The pill sits on the last transcript row, centred on the pane, and the
+    box's rules are as wide as the pane.
+    """
+    borders = [i for i, line in enumerate(lines) if BORDER_RE.match(line)]
+    if not borders:
+        return False
+    last = next((line for line in reversed(transcript_region(lines))
+                 if line.strip()), "")
+    width = cells(lines[borders[-1]])
+    # In half-columns, so an odd leftover on either side still lines up.
+    return any(
+        abs(2 * cells(last[:m.start()]) + cells(m.group(0)) - width) <= 2
+        for m in SCROLL_PILL_RE.finditer(last)
+    )
 
 
 def input_draft(lines: list[str]) -> str:
@@ -759,10 +785,16 @@ def pick_message(state: str, lines: list[str], whole: bool = False) -> str:
     if state == "blocked":
         return dialog_message(body)
     region = transcript_region(body)
+    # Scrolled up, the bottom of the transcript is out of view, and the
+    # readers below would walk up from an older row with the pill punched
+    # through it. The tray and the input box are not part of the scroll.
+    hidden = scrolled_up(body)
     if state == "running":
-        return running_message(region)
+        return SCROLLED if hidden else running_message(region)
     if state == "delegated":
-        return delegated_message(tray, region, whole)
+        doing = delegate_activity(tray)
+        if doing:
+            return doing
     if state == "interrupted":
         # An interrupted turn was cut off mid-word, so its last line is
         # usually a fragment. claude puts the prompt back in the input box
@@ -771,7 +803,7 @@ def pick_message(state: str, lines: list[str], whole: bool = False) -> str:
         draft = input_draft(body)
         if draft:
             return f"❯ {draft}"
-    return last_paragraph(region, whole)
+    return SCROLLED if hidden else last_paragraph(region, whole)
 
 
 def messages(state: str, lines: list[str]) -> tuple[str, str]:
@@ -1013,7 +1045,8 @@ def state_seconds(state: str, lines: list[str], now: float) -> float | None:
     if state == "delegated":
         return tray_elapsed(tray)
     if state == "done":
-        return parse_done(body, now)
+        # The stamp on screen closes an older turn than the last one.
+        return None if scrolled_up(body) else parse_done(body, now)
     return None
 
 
