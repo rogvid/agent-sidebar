@@ -26,6 +26,10 @@ that its early turns are fading.
 Actions work on the highlighted agent, mostly in a tmux popup over the
 current window: `?` lists them and ctrl+p searches them. When an agent in
 another window stops and needs you, tmux says so on the status line.
+
+With many agents open, `h` folds a project into one line that counts its
+agents by state, and `c` puts an agent on one line. Both are remembered in
+$XDG_STATE_HOME/agent-sidebar/state.json for the next sidebar.
 """
 
 from __future__ import annotations
@@ -38,6 +42,7 @@ import time
 from collections import Counter
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from rich.console import Group
@@ -235,11 +240,28 @@ ACTIONS = (
     Action("kill", "x", "x", "Kill agent", "Kill the agent's pane"),
     Action("remove_worktree", "X", "X", "Remove worktree",
            "Remove the agent's worktree, then its pane"),
+    Action("collapse", "h", "h", "Collapse project",
+           "Fold the project into one line"),
+    Action("expand", "l", "l", "Expand project", "Unfold the project"),
+    Action("collapse_all", "H", "H", "Collapse all", "Fold every project"),
+    Action("expand_all", "L", "L", "Expand all", "Unfold every project"),
+    Action("compact", "c", "c", "One line for agent",
+           "Switch the agent between one line and three"),
+    Action("compact_all", "C", "C", "One line for all",
+           "Switch every agent between one line and three"),
     Action("rescan", "r", "r", "Rescan", "Scan again now"),
     Action("back", "escape", "esc", "Back", "Return to the pane you came from"),
     Action("close", "q", "q", "Close sidebar", "Close the sidebar until M-2"),
     Action("help", "question_mark", "?", "Help", "Show the keys"),
 )
+
+
+# Opposites share a line in the help, so it still fits a short pane.
+HELP_PAIRS = {
+    "collapse": ("expand", "Collapse/expand project"),
+    "collapse_all": ("expand_all", "Collapse/expand all"),
+    "compact": ("compact_all", "One line: agent/all"),
+}
 
 
 def group_by_project(rows: list[Row]) -> list[tuple[str, list[Row]]]:
@@ -337,6 +359,9 @@ def agent_prompt(
     if row.get("flag", " ").strip():
         branch = Text.assemble(("! ", "bold red"), branch)
     changes = _changes_display(row.get("changes", "-"))
+    # A branch cut short would otherwise run into its changes.
+    if changes.plain:
+        changes = Text.assemble(" ", changes)
     top.add_row(
         gutter,
         Text("●", style=color),
@@ -392,6 +417,74 @@ def project_prompt(project: str, count: int) -> Table:
         Text(f" {count}", style=MUTED),
     )
     return table
+
+
+def compact_prompt(row: Row, here: bool) -> Table:
+    """One line: the branch and its state."""
+    color = STATE_COLOR.get(row["state"], "default")
+    branch = Text(row["branch"])
+    if row.get("flag", " ").strip():
+        branch = Text.assemble(("! ", "bold red"), branch)
+    table = grid()
+    table.add_row(
+        Text(HERE if here else " ", style="bold"),
+        Text("●", style=color),
+        branch,
+        Text(" " + row.get("state", ""), style=color),
+    )
+    return table
+
+
+def collapsed_prompt(project: str, group: list[Row], here: bool) -> Table:
+    """A folded project: its name, and its agents counted by state."""
+    table = Table.grid(expand=True)
+    table.add_column(width=1, no_wrap=True)
+    table.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
+    table.add_column(justify="right", no_wrap=True)
+    table.add_row(
+        Text(HERE if here else "", style="bold"),
+        Text(project, style="bold"),
+        Text.assemble(" ", summary(group)),
+    )
+    return table
+
+
+def state_path() -> Path:
+    base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser(
+        "~/.local/state"
+    )
+    return Path(base) / "agent-sidebar" / "state.json"
+
+
+def load_state(path: Path) -> tuple[set[str], set[str]]:
+    """The folded projects, and the panes of agents on one line."""
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return set(), set()
+    if not isinstance(data, dict):
+        return set(), set()
+
+    def names(key: str) -> set[str]:
+        value = data.get(key)
+        if isinstance(value, list) and all(isinstance(v, str) for v in value):
+            return set(value)
+        return set()
+
+    return names("collapsed"), names("compact")
+
+
+def save_state(path: Path, collapsed: set[str], compact: set[str]) -> None:
+    state = {"collapsed": sorted(collapsed), "compact": sorted(compact)}
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Replaced whole, so a sidebar starting meanwhile never reads half.
+        partial = path.with_suffix(".partial")
+        partial.write_text(json.dumps(state) + "\n")
+        partial.replace(path)
+    except OSError:
+        # Forgetting the folds next time beats a sidebar that falls over.
+        pass
 
 
 def summary(rows: list[Row]) -> Text:
@@ -617,8 +710,14 @@ class Help(ModalScreen[None]):
         keys.add_column(no_wrap=True, style="bold")
         keys.add_column(no_wrap=True)
         keys.add_row("j/k", "Move")
+        by_name = {action.name: action for action in ACTIONS}
+        seconds = {second for second, _ in HELP_PAIRS.values()}
         for action in ACTIONS:
-            keys.add_row(action.label, action.title)
+            if action.name in HELP_PAIRS:
+                second, title = HELP_PAIRS[action.name]
+                keys.add_row(f"{action.label}/{by_name[second].label}", title)
+            elif action.name not in seconds:
+                keys.add_row(action.label, action.title)
         keys.add_row("^p", "Search commands")
 
         legend = Text.assemble(
@@ -782,6 +881,7 @@ class AgentSidebar(App[None]):
         pull_requests: Callable[[str], Awaitable[PullRequests | None]] = (
             pull_requests
         ),
+        state: Path | None = None,
     ) -> None:
         super().__init__(ansi_color=True)
         self._scan = scan
@@ -796,6 +896,8 @@ class AgentSidebar(App[None]):
         self._states: dict[str, str] | None = None
         self._prs: dict[str, PullRequests] = {}
         self._prs_checked: dict[str, float] = {}
+        self._state = state or state_path()
+        self._collapsed, self._compact = load_state(self._state)
 
     def get_css_variables(self) -> dict[str, str]:
         # catppuccin mocha's surface0, the theme the terminal and tmux use.
@@ -890,7 +992,11 @@ class AgentSidebar(App[None]):
 
     def show_rows(self) -> None:
         rows, here = self._rows, self._here
-        key = json.dumps([rows, sorted(here), self._prs], sort_keys=True)
+        key = json.dumps(
+            [rows, sorted(here), self._prs, sorted(self._collapsed),
+             sorted(self._compact)],
+            sort_keys=True,
+        )
         if key == self._shown:
             return
         first = self._shown is None
@@ -903,30 +1009,59 @@ class AgentSidebar(App[None]):
 
         previous = agents.highlighted_option
         options: list[Option | None] = []
+        # The line the cursor lands on for each agent and project: a folded
+        # project's one line stands in for its agents, and an unfolded
+        # project's header, which the cursor skips, for its first agent.
+        line: dict[str, str] = {}
+        folded_before = False
         for index, (project, group) in enumerate(group_by_project(rows)):
-            if index:
+            folded = project in self._collapsed
+            # Folded projects in a row read as one list, so no rule between.
+            if index and not (folded and folded_before):
                 options.append(None)
+            folded_before = folded
+            project_id = PROJECT_PREFIX + project
+            if folded:
+                options.append(Option(
+                    collapsed_prompt(
+                        project, group,
+                        any(row["pane_id"] in here for row in group),
+                    ),
+                    id=project_id,
+                ))
+                line |= dict.fromkeys(
+                    [project_id, *(row["pane_id"] for row in group)],
+                    project_id,
+                )
+                continue
             options.append(Option(
                 project_prompt(project, len(group)),
-                id=PROJECT_PREFIX + project,
+                id=project_id,
                 disabled=True,
             ))
             options.extend(
-                Option(agent_prompt(row, row["pane_id"] in here,
-                                    self.pull_request(row)),
+                Option(self.agent_prompt(row, row["pane_id"] in here),
                        id=row["pane_id"])
                 for row in group
             )
+            line[project_id] = group[0]["pane_id"]
+            line |= {row["pane_id"]: row["pane_id"] for row in group}
         agents.set_options(options)
 
         ids = [row["pane_id"] for row in rows]
-        # The same agent stays under the cursor as rows reorder. On the first
-        # scan there is nothing to keep, so start on where you already are.
+        # The same agent stays under the cursor as rows reorder or its
+        # project folds. On the first scan there is nothing to keep, so start
+        # on where you already are.
         target = previous.id if previous is not None and not first else None
-        if target not in ids:
+        if target not in line:
             target = next((i for i in ids if i in here), ids[0] if ids else None)
         if target is not None:
-            agents.highlighted = agents.get_option_index(target)
+            agents.highlighted = agents.get_option_index(line[target])
+
+    def agent_prompt(self, row: Row, here: bool) -> Group | Table:
+        if row["pane_id"] in self._compact:
+            return compact_prompt(row, here)
+        return agent_prompt(row, here, self.pull_request(row))
 
     def selected(self) -> Row | None:
         option = self.query_one("#agents", OptionList).highlighted_option
@@ -934,8 +1069,26 @@ class AgentSidebar(App[None]):
             return None
         return self._by_pane.get(option.id)
 
-    def on_agent(self, act: Callable[[Row], None]) -> None:
+    def project(self) -> str | None:
+        """The project under the cursor, folded or not."""
+        option = self.query_one("#agents", OptionList).highlighted_option
+        if option is None or option.id is None:
+            return None
+        if option.id.startswith(PROJECT_PREFIX):
+            return option.id.removeprefix(PROJECT_PREFIX)
+        row = self._by_pane.get(option.id)
+        return row["project"] if row else None
+
+    def on_agent(
+        self, act: Callable[[Row], None], or_project: bool = False,
+    ) -> None:
         row = self.selected()
+        # On a folded project, its first agent stands in for actions on
+        # the project itself.
+        if row is None and or_project:
+            project = self.project()
+            row = next((r for r in self._rows if r["project"] == project),
+                       None)
         if row is None:
             self.bell()
             return
@@ -960,6 +1113,9 @@ class AgentSidebar(App[None]):
         self.action_jump()
 
     def action_jump(self) -> None:
+        if self.selected() is None and self.project() in self._collapsed:
+            self.action_expand()
+            return
         # switch-client to a pane lands on its session, window and the pane
         # itself; the sidebar follows through tmux's hooks.
         self.on_agent(lambda row: self.run_worker(
@@ -978,7 +1134,7 @@ class AgentSidebar(App[None]):
                 NewWorktreePrompt(row["project"], row.get("cwd")),
                 create,
             )
-        self.on_agent(ask)
+        self.on_agent(ask, or_project=True)
 
     def action_open(self) -> None:
         self.glue("open")
@@ -1008,6 +1164,52 @@ class AgentSidebar(App[None]):
 
     def action_remove_worktree(self) -> None:
         self.on_agent(lambda row: self.glue("remove-worktree", row["pane_id"]))
+
+    def remember(
+        self, collapsed: set[str] | None = None,
+        compact: set[str] | None = None,
+    ) -> None:
+        if collapsed is not None:
+            self._collapsed = collapsed
+        if compact is not None:
+            # A pane id dies with its pane, and tmux hands it out again
+            # after a restart, so only agents still running are kept.
+            self._compact = compact & self._by_pane.keys()
+        save_state(self._state, self._collapsed, self._compact)
+        self.show_rows()
+
+    def action_collapse(self) -> None:
+        project = self.project()
+        if project is None:
+            self.bell()
+            return
+        self.remember(collapsed=self._collapsed | {project})
+
+    def action_expand(self) -> None:
+        project = self.project()
+        if project is None:
+            self.bell()
+            return
+        self.remember(collapsed=self._collapsed - {project})
+
+    def action_collapse_all(self) -> None:
+        projects = {project for project, _ in group_by_project(self._rows)}
+        self.remember(collapsed=self._collapsed | projects)
+
+    def action_expand_all(self) -> None:
+        self.remember(collapsed=set())
+
+    def action_compact(self) -> None:
+        self.on_agent(
+            lambda row: self.remember(compact=self._compact ^ {row["pane_id"]})
+        )
+
+    def action_compact_all(self) -> None:
+        panes = self._by_pane.keys()
+        if panes <= self._compact:
+            self.remember(compact=self._compact - panes)
+        else:
+            self.remember(compact=self._compact | panes)
 
     def action_help(self) -> None:
         self.push_screen(Help())

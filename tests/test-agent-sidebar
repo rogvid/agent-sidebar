@@ -22,6 +22,7 @@ import asyncio
 import importlib.machinery
 import importlib.util
 import io
+import json
 import os
 import subprocess
 import sys
@@ -118,7 +119,8 @@ async def app_cases(mod) -> list[tuple[str, bool, str]]:
         app.action_rescan()
         await pilot.pause(0.3)
 
-    async with app.run_test(size=(36, 30)) as pilot:
+    # Tall enough for the help without a scrollbar, as the sidebar is.
+    async with app.run_test(size=(36, 40)) as pilot:
         await pilot.pause(0.3)
         agents = app.query_one("#agents", OptionList)
 
@@ -414,7 +416,195 @@ async def project_default_cases(mod) -> list[tuple[str, bool, str]]:
     return results
 
 
+async def fold_cases(mod) -> list[tuple[str, bool, str]]:
+    """Collapsed projects and one-line agents, and that both are
+    remembered for the next sidebar."""
+    from textual.widgets import OptionList
+
+    results: list[tuple[str, bool, str]] = []
+
+    def check(name: str, ok: bool, detail: object) -> None:
+        results.append((name, ok, "" if ok else f"got={detail!r}"))
+
+    state = Path(tempfile.mkdtemp()) / "agent-sidebar" / "state.json"
+    fake = Fake(
+        [row("koyr", "%1", "blocked"), row("dotfiles", "%2"),
+         row("koyr", "%3", "running")],
+        {"%2"},
+    )
+
+    def sidebar():
+        return mod.AgentSidebar(scan=fake.scan, panes_here=fake.panes_here,
+                                run=fake.run, pull_requests=fake.pull_requests,
+                                state=state)
+
+    app = sidebar()
+    async with app.run_test(size=(36, 30)) as pilot:
+        await pilot.pause(0.3)
+        agents = app.query_one("#agents", OptionList)
+
+        def ids() -> list[str | None]:
+            return [agents.get_option_at_index(i).id
+                    for i in range(agents.option_count)]
+
+        def highlighted() -> str | None:
+            option = agents.highlighted_option
+            return option.id if option else None
+
+        def lines(option_id: str) -> list[str]:
+            return plain(agents.get_option(option_id).prompt).splitlines()
+
+        async def rescan() -> None:
+            app.action_rescan()
+            await pilot.pause(0.3)
+
+        async def press(*keys: str) -> None:
+            await pilot.press(*keys)
+            await pilot.pause(0.1)
+
+        full = ["project:koyr", "%1", "%3", "project:dotfiles", "%2"]
+        check("projects start expanded", ids() == full, ids())
+
+        await press("k", "h")
+        check("h collapses the agent's project",
+              ids() == ["project:koyr", "project:dotfiles", "%2"], ids())
+        check("and the cursor stays on it as one line",
+              highlighted() == "project:koyr", highlighted())
+        shown = lines("project:koyr")
+        check("which counts its agents by state",
+              len(shown) == 1 and "koyr" in shown[0]
+              and shown[0].rstrip().endswith("● 1 ● 1"), shown)
+
+        await press("j")
+        check("j steps from it past the expanded header",
+              highlighted() == "%2", highlighted())
+        await press("k")
+        check("and k back onto it", highlighted() == "project:koyr",
+              highlighted())
+
+        before = len(fake.ran)
+        await press("d")
+        check("agent actions do nothing on it", len(fake.ran) == before,
+              fake.ran[before:])
+        await press("n")
+        check("n still branches its project",
+              isinstance(app.screen, mod.NewWorktreePrompt)
+              and app.screen.project == "koyr", app.screen)
+        await press("escape")
+
+        check("the collapse is remembered",
+              json.loads(state.read_text())["collapsed"] == ["koyr"],
+              state.read_text())
+
+        await press("l")
+        check("l expands it", ids() == full, ids())
+        check("onto its first agent", highlighted() == "%1", highlighted())
+
+        await press("h")
+        before = len(fake.ran)
+        await press("enter")
+        check("enter on a collapsed project expands it",
+              ids() == full and highlighted() == "%1", (ids(), highlighted()))
+        check("instead of jumping", len(fake.ran) == before,
+              fake.ran[before:])
+
+        await press("end", "h")
+        shown = lines("project:dotfiles")
+        check("a collapsed project here keeps the bar",
+              shown[0].startswith(mod.HERE), shown)
+        await press("l")
+
+        await press("H")
+        check("H collapses every project",
+              ids() == ["project:koyr", "project:dotfiles"], ids())
+        check("with no rule between folded projects",
+              agents.virtual_size.height == 2, agents.virtual_size)
+        fake.rows = fake.rows + [row("hoyr", "%4")]
+        await rescan()
+        check("a new project starts expanded",
+              ids() == ["project:koyr", "project:dotfiles",
+                        "project:hoyr", "%4"], ids())
+        await press("L")
+        check("L expands every project", ids() == full + ["project:hoyr", "%4"],
+              ids())
+        fake.rows = fake.rows[:3]
+        await rescan()
+
+        def heights() -> list[int]:
+            return [len(lines(i)) for i in ("%1", "%3", "%2")]
+
+        await press("end", "c")
+        check("c puts the agent on one line", heights() == [3, 3, 1],
+              heights())
+        check("its branch and state",
+              lines("%2")[0].split() == [mod.HERE + "●", "main", "done"],
+              lines("%2"))
+        check("and remembers that",
+              json.loads(state.read_text())["compact"] == ["%2"],
+              state.read_text())
+        await press("c")
+        check("c again brings back its three lines", heights() == [3, 3, 3],
+              heights())
+
+        await press("C")
+        check("C puts every agent on one line", heights() == [1, 1, 1],
+              heights())
+        await press("C")
+        check("C again brings back all three lines", heights() == [3, 3, 3],
+              heights())
+        await press("c", "C")
+        check("C with only some on one line puts them all there",
+              heights() == [1, 1, 1], heights())
+
+        fake.rows = fake.rows[:2]
+        await rescan()
+        await press("c", "c")
+        check("an agent gone is forgotten",
+              json.loads(state.read_text())["compact"] == ["%1", "%2"],
+              state.read_text())
+        fake.rows = [row("koyr", "%1", "blocked"), row("dotfiles", "%2"),
+                     row("koyr", "%3", "running")]
+        await rescan()
+
+        await pilot.press("home")
+        await press("h")
+        before = state.read_text()
+        await press("c")
+        check("c does nothing on a collapsed project",
+              state.read_text() == before, state.read_text())
+
+    app = sidebar()
+    async with app.run_test(size=(36, 30)) as pilot:
+        await pilot.pause(0.3)
+        agents = app.query_one("#agents", OptionList)
+        got = [agents.get_option_at_index(i).id
+               for i in range(agents.option_count)]
+        check("the next sidebar starts with them collapsed",
+              got == ["project:koyr", "project:dotfiles", "%2"], got)
+        check("and its agents on one line",
+              len(plain(agents.get_option("%2").prompt).splitlines()) == 1,
+              plain(agents.get_option("%2").prompt))
+
+    fake.here = {"%3"}
+    app = sidebar()
+    async with app.run_test(size=(36, 30)) as pilot:
+        await pilot.pause(0.3)
+        agents = app.query_one("#agents", OptionList)
+        option = agents.highlighted_option
+        check("starting here in a collapsed project lands on it",
+              option is not None and option.id == "project:koyr", option)
+
+    for broken in ("not json", '{"collapsed": "koyr", "compact": 1}'):
+        state.write_text(broken)
+        got = mod.load_state(state)
+        check(f"a state file of {broken!r} reads as the defaults",
+              got == (set(), set()), got)
+    return results
+
+
 def main() -> int:
+    # The app remembers folds in $XDG_STATE_HOME; keep the real one out.
+    os.environ["XDG_STATE_HOME"] = tempfile.mkdtemp()
     mod = load_agent_sidebar()
     failures = 0
     total = 0
@@ -447,6 +637,13 @@ def main() -> int:
     ok = all(len(line) <= 34 for line in long.splitlines())
     report("prompt", "long branch and message stay on their line", ok,
            "" if ok else f"got={long!r}")
+
+    crowded = plain(mod.agent_prompt(
+        row("koyr", "%1", branch="feature/" + "x" * 60, changes="+3 -0"),
+        here=False)).splitlines()[0]
+    ok = crowded.rstrip().endswith("… +3 -0")
+    report("prompt", "a long branch keeps a gap before its changes", ok,
+           "" if ok else f"got={crowded!r}")
 
     unknown = plain(mod.agent_prompt(
         row("koyr", "%1", duration="-", message="-"), here=False))
@@ -486,6 +683,8 @@ def main() -> int:
         report("app", name, ok, detail)
     for name, ok, detail in asyncio.run(project_default_cases(mod)):
         report("app", name, ok, detail)
+    for name, ok, detail in asyncio.run(fold_cases(mod)):
+        report("fold", name, ok, detail)
 
     print(f"\n{total - failures}/{total} passed")
     return 1 if failures else 0
