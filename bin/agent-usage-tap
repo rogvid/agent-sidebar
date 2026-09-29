@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# Keep each Claude account's rate limits where agent-sidebar can read them.
+#
+#   agent-usage-tap [COMMAND...]
+#
+# Goes in front of Claude Code's statusline command, in settings.json:
+#
+#   "statusLine": {"type": "command", "command": "agent-usage-tap ccstatusline",
+#                  "refreshInterval": 10}
+#
+# Claude Code hands its rate limits (the 5 hour and 7 day windows: percent
+# used and when each resets) only to the statusline command, on stdin. This
+# keeps them per account, then runs COMMAND on the same input, so the
+# statusline looks just as it did. Nothing is printed without a COMMAND.
+#
+# The account is the folder CLAUDE_CONFIG_DIR names, ~/.claude by default,
+# and its limits land in
+# ${XDG_STATE_HOME:-~/.local/state}/agent-sidebar/usage/claude-<hash>.json.
+#
+# Every session on an account reports that account's limits, but each only
+# as fresh as its own last response. Within a window the highest reading is
+# the newest, since use only grows until the window resets; a new window is
+# one that resets at least an hour after the last did.
+#
+# Nothing here may break the statusline: a failure to keep the limits is
+# silent and COMMAND still runs.
+
+IFS= read -r -d '' input || true
+
+keep() {
+    command -v jq >/dev/null || return
+    local limits folder dir file current merged
+    limits="$(jq -ce '.rate_limits | select(type == "object")
+        | {five_hour, seven_day} | select(.five_hour or .seven_day)' \
+        <<<"${input}" 2>/dev/null)" || return
+    folder="$(realpath -m "${CLAUDE_CONFIG_DIR:-${HOME}/.claude}")"
+    dir="${XDG_STATE_HOME:-${HOME}/.local/state}/agent-sidebar/usage"
+    file="${dir}/claude-$(printf '%s' "${folder}" | md5sum | cut -c1-16).json"
+    mkdir -p "${dir}" 2>/dev/null || return
+    # Every pane on the account runs this every few seconds.
+    exec 9<"${dir}" && flock -w 2 9 || return
+    current="$(cat "${file}" 2>/dev/null)"
+    merged="$(jq -c --arg folder "${folder}" --argjson new "${limits}" '
+        def window: if type == "object"
+            then {used_percentage, resets_at} else null end;
+        def newer($old; $new):
+            if $new == null then $old
+            elif $old == null then $new
+            elif ($new.resets_at - $old.resets_at | fabs) < 3600 then
+                if $new.used_percentage >= $old.used_percentage
+                then $new else $old end
+            elif $new.resets_at > $old.resets_at then $new
+            else $old end;
+        (if type == "object" then . else {} end) as $old
+        | {harness: "claude", folder: $folder,
+           five_hour: newer($old.five_hour | window; $new.five_hour | window),
+           seven_day: newer($old.seven_day | window; $new.seven_day | window)}
+    ' <<<"${current:-null}" 2>/dev/null)" || return
+    [[ "${merged}" == "${current}" ]] && return
+    # Replaced whole, so the sidebar never reads half a file.
+    printf '%s\n' "${merged}" >"${file}.partial" 2>/dev/null \
+        && mv -f "${file}.partial" "${file}" 2>/dev/null
+}
+
+( keep ) 2>/dev/null
+
+(($# == 0)) && exit 0
+exec "$@" < <(printf '%s' "${input}")

@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# Checks for agent-usage-tap: what it keeps of each account's rate limits
+# from the statusline input, and that the statusline it wraps never notices.
+#
+# Run: scripts/tests/test-agent-usage-tap     (or `mise run test`)
+
+set -euo pipefail
+
+repo="$(cd "$(dirname "$0")/../.." && pwd)"
+readonly repo
+readonly tap="${repo}/scripts/.local/bin/agent-usage-tap"
+scratch="$(mktemp -d)"
+readonly scratch
+trap 'chmod -R u+w "${scratch}"; rm -rf "${scratch}"' EXIT
+
+export HOME="${scratch}/home"
+export XDG_STATE_HOME="${scratch}/state"
+unset CLAUDE_CONFIG_DIR
+mkdir -p "${HOME}"
+readonly usage="${XDG_STATE_HOME}/agent-sidebar/usage"
+
+# Statusline input as Claude Code sends it, with only the fields that
+# matter here: FIVE_USED FIVE_RESET WEEK_USED WEEK_RESET.
+input() {
+    printf '{"session_id":"s","model":{"display_name":"Opus"},"rate_limits":{"five_hour":{"used_percentage":%s,"resets_at":%s},"seven_day":{"used_percentage":%s,"resets_at":%s}}}' "$@"
+}
+
+# The saved record for the account in folder $1, as compact JSON.
+saved() {
+    local file
+    for file in "${usage}"/*.json; do
+        [[ -f "${file}" ]] || continue
+        if [[ "$(jq -r .folder "${file}")" == "$1" ]]; then
+            jq -c '{five_hour, seven_day}' "${file}"
+            return
+        fi
+    done
+    echo none
+}
+
+record() {
+    printf '{"five_hour":{"used_percentage":%s,"resets_at":%s},"seven_day":{"used_percentage":%s,"resets_at":%s}}' "$@"
+}
+
+failures=0
+total=0
+check() {
+    local name="$1"
+    shift
+    total=$((total + 1))
+    if "$@"; then
+        printf 'ok    %s\n' "${name}"
+    else
+        printf 'FAIL  %s\n' "${name}"
+        failures=$((failures + 1))
+    fi
+}
+same() {
+    [[ "$1" == "$2" ]] || { printf '      want %s\n      got  %s\n' "$2" "$1"; return 1; }
+}
+
+in="$(input 13 1790703000 67 1790942400)"
+out="$("${tap}" cat <<<"${in}")"
+check "the wrapped statusline gets the input unchanged" same "${out}" "${in}"
+check "the default account's limits are kept" \
+    same "$(saved "${HOME}/.claude")" "$(record 13 1790703000 67 1790942400)"
+
+out="$("${tap}" <<<"${in}")"
+check "with nothing to wrap it prints nothing" same "${out}" ""
+
+CLAUDE_CONFIG_DIR="${HOME}/.claude-alt/" "${tap}" <<<"$(input 5 1790700000 2 1790956800)"
+check "another account's are kept apart" \
+    same "$(saved "${HOME}/.claude-alt")" "$(record 5 1790700000 2 1790956800)"
+check "without touching the default's" \
+    same "$(saved "${HOME}/.claude")" "$(record 13 1790703000 67 1790942400)"
+
+# An idle session still hands on what it last heard, which can be behind a
+# busy one on the same account.
+"${tap}" <<<"$(input 9 1790703000 60 1790942400)"
+check "an older reading of the same window does not win" \
+    same "$(saved "${HOME}/.claude")" "$(record 13 1790703000 67 1790942400)"
+"${tap}" <<<"$(input 20 1790703001 70 1790942400)"
+check "a newer one does" \
+    same "$(saved "${HOME}/.claude")" "$(record 20 1790703001 70 1790942400)"
+"${tap}" <<<"$(input 1 1790721000 70 1790942400)"
+check "and a new window replaces a lower number from the last" \
+    same "$(saved "${HOME}/.claude")" "$(record 1 1790721000 70 1790942400)"
+"${tap}" <<<"$(input 20 1790703001 70 1790942400)"
+check "which the last window cannot take back" \
+    same "$(saved "${HOME}/.claude")" "$(record 1 1790721000 70 1790942400)"
+
+# Claude Code drops a window once it resets, and sends no rate_limits at
+# all before a session's first response on some plans.
+"${tap}" <<<'{"rate_limits":{"seven_day":{"used_percentage":71,"resets_at":1790942400}}}'
+check "a window missing from the input is kept" \
+    same "$(saved "${HOME}/.claude")" "$(record 1 1790721000 71 1790942400)"
+out="$("${tap}" cat <<<'{"model":{}}')"
+check "input with no rate limits still reaches the statusline" same "${out}" '{"model":{}}'
+check "and changes nothing" \
+    same "$(saved "${HOME}/.claude")" "$(record 1 1790721000 71 1790942400)"
+
+out="$("${tap}" cat <<<'not json')"
+check "input that is not JSON still reaches the statusline" same "${out}" "not json"
+
+chmod -w "${usage}"
+out="$("${tap}" cat <<<"$(input 50 1790721000 90 1790942400)" 2>&1)"
+check "a state folder it cannot write leaves the statusline alone" \
+    same "${out}" "$(input 50 1790721000 90 1790942400)"
+chmod u+w "${usage}"
+
+rm -rf "${XDG_STATE_HOME}"
+XDG_STATE_HOME="" "${tap}" <<<"${in}"
+check "without XDG_STATE_HOME it keeps them in ~/.local/state" \
+    test -n "$(ls "${HOME}/.local/state/agent-sidebar/usage/"*.json)"
+
+printf '\n%s/%s passed\n' "$((total - failures))" "${total}"
+((failures == 0))
