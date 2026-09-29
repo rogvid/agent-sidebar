@@ -261,7 +261,10 @@ CHROME_RE = re.compile(
     r"^\s*[❯>]\s*$|^\s*/rc\s*$|^\s*⧉|Total:|Session:|Model:|"
     r"⊙|/status\b|Ask anything|^\s*[│┃|]?\s*[█▀▄]{3,}|"
     r"^\s*[│┃|]\s*Build\s+·|You've used \d+%|Approaching your|"
-    r"^\s*▣\s"
+    r"^\s*▣\s|"
+    # The cache notice under an idle session: `~66k uncached · /clear to
+    # start fresh`.
+    r"uncached · /clear to"
 )
 # claude's transient limit notices, drawn right-aligned just above the input
 # box. Both are account-wide, like the block clock.
@@ -760,7 +763,7 @@ def scrolled_up(lines: list[str]) -> bool:
     if not borders:
         return False
     last = next((line for line in reversed(transcript_region(lines))
-                 if line.strip()), "")
+                 if not is_chrome(line)), "")
     width = cells(lines[borders[-1]])
     # In half-columns, so an odd leftover on either side still lines up.
     return any(

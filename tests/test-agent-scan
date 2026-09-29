@@ -394,6 +394,16 @@ CLAUDE_SCROLLED_NEW = CLAUDE_SCROLLED.replace(
     " Jump to bottom (ctrl+End) ↓ ", " 2 new messages (ctrl+End) ↓ "
 )
 
+# claude's cache notice, drawn right-aligned under the transcript's last row
+# once a session has sat idle long enough for its prompt cache to lapse.
+UNCACHED = "~66k uncached · /clear to start fresh"
+CLAUDE_SCROLLED_NOTICE = CLAUDE_SCROLLED.replace(
+    "each one on.\n\n─", "each one on.\n" + UNCACHED.rjust(229) + "\n\n─", 1
+)
+CLAUDE_IDLE_NOTICE = CLAUDE_IDLE.replace(
+    'printed "done".\n', 'printed "done".\n' + UNCACHED.rjust(60) + "\n", 1
+)
+
 # A transcript line quoting the pill. It is not centred on the pane, which
 # is what tells it apart from the real thing.
 QUOTED_PILL = CLAUDE_IDLE.replace(
@@ -590,6 +600,11 @@ FULL_MESSAGE_CASES = (
      (SCROLLED, SCROLLED)),
     ("so does news below the fold", "done", CLAUDE_SCROLLED_NEW,
      (SCROLLED, SCROLLED)),
+    ("and a notice under the pill", "done", CLAUDE_SCROLLED_NOTICE,
+     (SCROLLED, SCROLLED)),
+    ("the cache notice is not the pane talking", "done", CLAUDE_IDLE_NOTICE,
+     ('Done. The command slept for 12 seconds and then printed "done".',
+      'Done. The command slept for 12 seconds and then printed "done".')),
     ("a quoted pill is just text", "done", QUOTED_PILL,
      ("claude draws Jump to bottom (ctrl+End) ↓ over the transcript.",
       "claude draws Jump to bottom (ctrl+End) ↓ over the transcript.")),
