@@ -30,6 +30,12 @@ another window stops and needs you, tmux says so on the status line.
 With many agents open, `h` folds a project into one line that counts its
 agents by state, and `c` puts an agent on one line. Both are remembered in
 $XDG_STATE_HOME/agent-sidebar/state.json for the next sidebar.
+
+At the bottom, each Claude account a running agent is on shows how much of
+its 5 hour and weekly limits is used, and when each resets. Claude Code
+hands those only to its statusline, so agent-usage-tap has to sit in front
+of the statusline command to keep them; without it every account says it
+has seen no usage yet.
 """
 
 from __future__ import annotations
@@ -63,6 +69,9 @@ SCAN_INTERVAL = 1.0
 # Pull requests change over minutes, and each look is a round trip to
 # GitHub per project.
 PR_INTERVAL = 120.0
+# agent-usage-tap rewrites an account's limits at most every few seconds,
+# and a percent a few seconds late costs nothing.
+USAGE_INTERVAL = 10.0
 
 # agent-scan's colours, as terminal palette names so the sidebar reads in
 # the same theme as the panes beside it.
@@ -82,6 +91,12 @@ PR_COLOR = {"OPEN": "green", "MERGED": "magenta", "CLOSED": "red"}
 CONTEXT_COLOR = {"warn": "yellow", "rot": "red"}
 MUTED = "color(245)"
 HERE = "▌"
+# The empty part of a usage meter: as quiet as the rules.
+TRACK = "bright_black"
+# The windows of an account's limits, and their labels.
+WINDOWS = (("five_hour", "5h"), ("seven_day", "wk"))
+# Where agent-scan starts warning about the weekly limit.
+USAGE_WARN, USAGE_HIGH = 60, 85
 
 # Harness colours/icons are fixed; roles are the harness's --agent
 # (opencode's build/plan or any custom one) and get a stable colour
@@ -196,9 +211,9 @@ def yolo_default_for_project(cwd: str | None) -> bool:
     return True
 
 
-def accounts() -> list[tuple[str, str]]:
-    """Each harness's accounts besides its default, as (harness, name):
-    agent-sidebar-tmux finds them, for the sidebar and spawn alike."""
+def account_listing() -> list[tuple[str, str, str]]:
+    """Each harness's accounts besides its default, as (harness, name,
+    folder): agent-sidebar-tmux finds them, for the sidebar and spawn alike."""
     try:
         listing = subprocess.run(
             [GLUE, "accounts"], capture_output=True, text=True, timeout=5,
@@ -206,9 +221,90 @@ def accounts() -> list[tuple[str, str]]:
     except (OSError, subprocess.SubprocessError):
         return []
     return [
-        (harness, name)
-        for harness, name, *_ in (line.split("\t") for line in listing.splitlines())
+        (fields[0], fields[1], fields[2])
+        for fields in (line.split("\t") for line in listing.splitlines())
+        if len(fields) >= 3
     ]
+
+
+def accounts() -> list[tuple[str, str]]:
+    """Each harness's accounts besides its default, as (harness, name)."""
+    return [(harness, name) for harness, name, _ in account_listing()]
+
+
+def account_folder(account: str, home: Path | None = None) -> str:
+    """The folder of a Claude account, as agent-scan reports it ("" for the
+    default) and agent-usage-tap keys it."""
+    home = home or Path.home()
+    return os.path.realpath(os.path.expanduser(account) if account
+                            else home / ".claude")
+
+
+def plan(config: Path) -> str:
+    """The account's plan ("max", "pro") from its .claude.json, "" when it
+    does not say."""
+    try:
+        data = json.loads(config.read_text())
+        kind = data["oauthAccount"]["organizationType"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return ""
+    return kind.removeprefix("claude_") if isinstance(kind, str) else ""
+
+
+def _window(value: Any) -> dict[str, float] | None:
+    if not isinstance(value, dict):
+        return None
+    used, resets = value.get("used_percentage"), value.get("resets_at")
+    if not all(isinstance(v, (int, float)) for v in (used, resets)):
+        return None
+    return {"used_percentage": used, "resets_at": resets}
+
+
+def read_usage(
+    home: Path, state: Path, listing: list[tuple[str, str, str]],
+) -> dict[str, dict[str, Any]]:
+    """Each Claude account by folder: its name, its plan, and whether
+    agent-usage-tap has kept its limits, with them when it has."""
+    default = account_folder("", home)
+    names = {default: "claude"} | {
+        account_folder(folder, home): f"claude ({name})"
+        for harness, name, folder in listing if harness == "claude"
+    }
+    found: dict[str, dict[str, Any]] = {}
+    for file in sorted(state.glob("claude-*.json")):
+        try:
+            data = json.loads(file.read_text())
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict) and isinstance(data.get("folder"), str):
+            found[data["folder"]] = data
+    usage: dict[str, dict[str, Any]] = {}
+    for folder in names.keys() | found.keys():
+        # Claude keeps the default account's .claude.json beside its folder.
+        config = (home / ".claude.json" if folder == default
+                  else Path(folder) / ".claude.json")
+        record: dict[str, Any] = {
+            "name": names.get(folder, f"claude ({Path(folder).name})"),
+            "plan": plan(config),
+            "seen": folder in found,
+        }
+        if folder in found:
+            record |= {key: _window(found[folder].get(key))
+                       for key, _ in WINDOWS}
+        usage[folder] = record
+    return usage
+
+
+def usage_path() -> Path:
+    return state_path().parent / "usage"
+
+
+async def usage() -> dict[str, dict[str, Any]]:
+    """read_usage for this user, off the event loop: it asks
+    agent-sidebar-tmux for the accounts' names."""
+    return await asyncio.to_thread(
+        lambda: read_usage(Path.home(), usage_path(), account_listing())
+    )
 
 
 def build_harness_command(harness: str, yolo: bool) -> str:
@@ -462,6 +558,86 @@ def collapsed_prompt(project: str, group: list[Row], here: bool) -> Table:
         Text.assemble(" ", summary(group)),
     )
     return table
+
+
+def countdown(seconds: float) -> str | None:
+    """`42m`, `3h40m`, `2d22h` until a reset, None once it has passed."""
+    if seconds <= 0:
+        return None
+    minutes = max(1, int(seconds // 60))
+    days, minutes = divmod(minutes, 24 * 60)
+    hours, minutes = divmod(minutes, 60)
+    if days:
+        return f"{days}d{hours}h"
+    return f"{hours}h{minutes}m" if hours else f"{minutes}m"
+
+
+def usage_color(used: float) -> str:
+    if used >= USAGE_HIGH:
+        return "red"
+    return "yellow" if used >= USAGE_WARN else "green"
+
+
+def meter(used: float, width: int, color: str | None = None) -> Text:
+    """A bar width cells wide, filled to the nearest cell."""
+    filled = min(width, max(0, round(width * used / 100)))
+    return Text.assemble(("━" * filled, color or usage_color(used)),
+                         ("━" * (width - filled), TRACK))
+
+
+class Meter:
+    """A meter as wide as the column it lands in; None is all track."""
+
+    def __init__(self, used: float | None) -> None:
+        self.used = used
+
+    def __rich_console__(self, console: Any, options: Any) -> Iterable[Text]:
+        yield meter(self.used or 0, options.max_width)
+
+
+def usage_prompt(
+    accounts: list[dict[str, Any]], now: float,
+) -> Group:
+    """Per account: its name and plan, then each window's meter, percent
+    used and time to reset, or that no usage has been seen yet."""
+    lines: list[Table | Text] = []
+    for account in accounts:
+        head = Table.grid(expand=True)
+        head.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
+        head.add_column(justify="right", no_wrap=True)
+        head.add_row(
+            Text.assemble((f"{agent_icon('claude')} ", agent_color("claude")),
+                          (account["name"], agent_color("claude"))),
+            Text(f" {account['plan']}" if account["plan"] else "",
+                 style=MUTED),
+        )
+        lines.append(head)
+        if not account["seen"]:
+            lines.append(Text("  no usage seen yet", style=MUTED))
+            continue
+        for key, label in WINDOWS:
+            window = account.get(key)
+            left = window and countdown(window["resets_at"] - now)
+            # A window past its reset has started over at a number nobody
+            # has seen yet.
+            used = window["used_percentage"] if left else None
+            row = Table.grid(expand=True)
+            row.add_column(width=5, no_wrap=True)
+            row.add_column(ratio=1, no_wrap=True)
+            row.add_column(width=5, no_wrap=True)
+            row.add_column(width=9, justify="right", no_wrap=True)
+            row.add_row(
+                Text(f"  {label} ", style=MUTED),
+                Meter(used),
+                # The dash under the digits, where a number would be.
+                Text(f"{used:.0f}%".rjust(5) if used is not None
+                     else "   - ",
+                     style=usage_color(used) if used is not None else MUTED),
+                Text(f"↻ {left or 'reset':>5}" if window else "",
+                     style=MUTED),
+            )
+            lines.append(row)
+    return Group(*lines)
 
 
 def state_path() -> Path:
@@ -823,6 +999,14 @@ class AgentSidebar(App[None]):
         padding: 1 1;
         color: ansi_bright_black;
     }
+    #usage-rule {
+        height: 1;
+        color: ansi_bright_black;
+    }
+    #usage {
+        height: auto;
+        padding: 0 1;
+    }
     #footer {
         height: 1;
         padding: 0 1;
@@ -910,6 +1094,7 @@ class AgentSidebar(App[None]):
             pull_requests
         ),
         accounts: Callable[[], list[tuple[str, str]]] = accounts,
+        usage: Callable[[], Awaitable[dict[str, dict[str, Any]]]] = usage,
         state: Path | None = None,
     ) -> None:
         super().__init__(ansi_color=True)
@@ -918,6 +1103,11 @@ class AgentSidebar(App[None]):
         self._run = run
         self._pull_requests = pull_requests
         self._accounts = accounts
+        self._usage = usage
+        # Each Claude account's usage by folder, None until first read.
+        self._usage_by_folder: dict[str, dict[str, Any]] | None = None
+        self._usage_checked = -USAGE_INTERVAL
+        self._usage_shown: str | None = None
         self._wake = asyncio.Event()
         self._shown: str | None = None
         self._rows: list[Row] = []
@@ -948,11 +1138,15 @@ class AgentSidebar(App[None]):
         yield Static("─" * 200, id="header-rule")
         yield OptionList(id="agents")
         yield Static("No agents running", id="empty")
+        yield Static("─" * 200, id="usage-rule")
+        yield Static(id="usage")
         yield Static(id="footer")
 
     def on_mount(self) -> None:
         self.query_one("#agents").display = False
         self.query_one("#empty").display = False
+        self.query_one("#usage-rule").display = False
+        self.query_one("#usage").display = False
         self.show_header([], ok=True)
         self.run_worker(self.poll(), exclusive=True)
 
@@ -977,6 +1171,8 @@ class AgentSidebar(App[None]):
         self.announce(rows, here)
         self.refresh_pull_requests(rows)
         self.show_rows()
+        self.refresh_usage()
+        self.show_usage()
 
     def announce(self, rows: list[Row], here: set[str]) -> None:
         """Say on the status line when an agent elsewhere stops for you."""
@@ -1005,6 +1201,48 @@ class AgentSidebar(App[None]):
         # A project gh cannot see simply shows no pull requests.
         self._prs[project] = await self._pull_requests(cwd) or {}
         self.show_rows()
+
+    def refresh_usage(self) -> None:
+        now = time.monotonic()
+        if now - self._usage_checked < USAGE_INTERVAL:
+            return
+        self._usage_checked = now
+        self.run_worker(self.fetch_usage())
+
+    async def fetch_usage(self) -> None:
+        self._usage_by_folder = await self._usage()
+        self.show_usage()
+
+    def show_usage(self) -> None:
+        """The overview for each Claude account a running agent is on, the
+        default first; nothing without one."""
+        folders = {
+            account_folder(row.get("account", ""))
+            for row in self._rows
+            if _harness_and_role(row)[0] == "claude"
+        }
+        known = self._usage_by_folder or {}
+        accounts = sorted(
+            (known.get(folder)
+             or {"name": f"claude ({Path(folder).name})", "plan": "",
+                 "seen": False}
+             for folder in folders),
+            key=lambda account: (account["name"] != "claude",
+                                 account["name"]),
+        ) if self._usage_by_folder is not None else []
+        now = time.time()
+        # Redraw only when an account or a countdown changes.
+        left = [countdown(window["resets_at"] - now)
+                for account in accounts for key, _ in WINDOWS
+                if (window := account.get(key))]
+        key = json.dumps([accounts, left], sort_keys=True)
+        if key == self._usage_shown:
+            return
+        self._usage_shown = key
+        self.query_one("#usage-rule").display = bool(accounts)
+        usage = self.query_one("#usage", Static)
+        usage.display = bool(accounts)
+        usage.update(usage_prompt(accounts, now))
 
     def show_header(self, rows: list[Row], ok: bool) -> None:
         title = Table.grid(expand=True)

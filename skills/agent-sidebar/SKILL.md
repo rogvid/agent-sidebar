@@ -14,6 +14,7 @@ The sidebar is for humans - you use `agent-scan`, `git-wt` and `tmux` directly.
 |------|------------|----------------|
 | `agent-scan` | Scans every tmux pane for a harness process | Discovery - who exists, what state they are in |
 | `agent-sidebar` | Textual TUI down the left of the viewed window (M-2) | Not for you - the user sees it. You get the same data from `agent-scan --json` |
+| `agent-usage-tap` | Sits in front of Claude's statusline command and keeps each account's rate limits | Reading how much of an account's 5h and weekly limits is used (section 5) |
 | `agent-sidebar-tmux` | Moves the sidebar pane with the viewed window, and runs the sidebar's actions on panes | Spawning worktrees, killing panes; the rest are interactive popups for the human |
 | `git-wt` | Worktree and session naming | Creating/removing worktrees, finding a worktree's session |
 | `tmux send-keys / paste-buffer / capture-pane / list-panes` | tmux itself | Messaging and inspection |
@@ -56,7 +57,8 @@ Each row (real output):
   "harness": "claude",
   "role": "",
   "changes": "∅",
-  "context_level": "ok"
+  "context_level": "ok",
+  "account": ""
 }
 ```
 
@@ -82,6 +84,7 @@ Fields:
 - `message` - first line of the last thing the pane said, max 160 chars (spinner text while running, the question while blocked, the summary while done).
 - `message_full` - all of the last thing the pane said, uncut, as one line: a whole `※ recap:` or answer block. Read this instead of `tmux capture-pane` when you need what an agent reported.
 - `flag` - `"▲"` when two agents share one working directory (danger - they overwrite each other), else `" "`.
+- `account` - the folder of the account the harness runs on (`CLAUDE_CONFIG_DIR`, `CODEX_HOME` or `PI_CODING_AGENT_DIR` of its process), `""` on its default one. Match it against `agent-sidebar-tmux accounts` for the name.
 
 Rows arrive sorted as a queue - most urgent state first, freshest within each state.
 `agent-scan --json` prints `[]` when there are no agent panes.
@@ -255,6 +258,17 @@ agent-sidebar-tmux toggle    # M-2
 agent-sidebar-tmux close
 agent-sidebar-tmux follow    # tmux hooks run this
 ```
+
+The bottom of the sidebar shows, for each Claude account a running agent is on, how much of its 5h and weekly limits is used and when each resets.
+You read the same from the files `agent-usage-tap` keeps, one per account; `resets_at` is Unix seconds, and a window past it has started over at an unknown number:
+
+```bash
+jq -c . "${XDG_STATE_HOME:-$HOME/.local/state}"/agent-sidebar/usage/claude-*.json
+# {"harness":"claude","folder":"/home/u/.claude-personal","five_hour":{"used_percentage":25,"resets_at":1790703000},"seven_day":{"used_percentage":69,"resets_at":1790942400}}
+```
+
+They exist only when Claude's `statusLine.command` in settings.json runs through it (`agent-usage-tap ccstatusline`), and they are as fresh as the last response any agent on that account got.
+Check them before spawning a batch of workers on an account.
 
 Sidebar keys (for the human): `⏎` jump, `n` new worktree, `o` open project, `d` review, `g` git, `p` pr, `x` kill, `X` remove worktree, `r` rescan, `esc` back, `q` close, `?` help.
 

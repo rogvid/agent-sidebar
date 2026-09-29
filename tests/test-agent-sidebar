@@ -27,6 +27,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 from rich.console import Console
@@ -67,6 +68,16 @@ GROUP_CASES = (
 )
 
 
+# How long until a window resets, as the overview counts it down.
+COUNTDOWN_CASES = (
+    ("minutes", 42 * 60 + 5, "42m"),
+    ("hours and minutes", 3 * 3600 + 40 * 60, "3h40m"),
+    ("days and hours", 2 * 86400 + 22 * 3600 + 59 * 60, "2d22h"),
+    ("under a minute still says a minute", 20, "1m"),
+    ("past is none", -5, None),
+)
+
+
 def plain(renderable, width: int = 34) -> str:
     console = Console(file=io.StringIO(), width=width, color_system=None)
     console.print(renderable)
@@ -83,9 +94,15 @@ class Fake:
         self.prs = {}
         self.pr_lookups: list[str] = []
         self.accounts: list[tuple[str, str]] = []
+        self.usage: dict[str, dict] = {}
+        self.usage_lookups = 0
 
     def list_accounts(self):
         return self.accounts
+
+    async def list_usage(self):
+        self.usage_lookups += 1
+        return self.usage
 
     async def scan(self):
         return self.rows
@@ -667,6 +684,170 @@ async def account_cases(mod) -> list[tuple[str, bool, str]]:
     return results
 
 
+def window(used: float, resets_in: float) -> dict:
+    """A rate-limit window as agent-usage-tap keeps it, resetting in
+    resets_in seconds (and 30 more, so a countdown taken a moment later
+    still reads the same minute)."""
+    return {"used_percentage": used,
+            "resets_at": int(time.time() + resets_in + 30)}
+
+
+async def usage_cases(mod) -> list[tuple[str, bool, str]]:
+    """The usage overview at the bottom: one block per account a running
+    agent is on, in from agent-usage-tap's files."""
+    from textual.widgets import Static
+
+    results: list[tuple[str, bool, str]] = []
+
+    def check(name: str, ok: bool, detail: object) -> None:
+        results.append((name, ok, "" if ok else f"got={detail!r}"))
+
+    default = mod.account_folder("")
+    personal = "/cfg/.claude-personal"
+    fake = Fake(
+        [row("koyr", "%1", harness="claude", account=personal),
+         row("dotfiles", "%2", harness="claude"),
+         row("hoyr", "%3", harness="claude", account=personal + "/"),
+         row("tools", "%4", agent="opencode", harness="opencode")],
+        {"%2"},
+    )
+    fake.usage = {
+        default: {"name": "claude", "plan": "max", "seen": True,
+                  "five_hour": window(1, 3 * 3600 + 50 * 60),
+                  "seven_day": window(2, 3 * 86400 + 2 * 3600)},
+        personal: {"name": "claude (personal)", "plan": "pro", "seen": True,
+                   "five_hour": window(13, 3 * 3600 + 40 * 60),
+                   "seven_day": window(67, 2 * 86400 + 22 * 3600)},
+        "/cfg/.claude-idle": {"name": "claude (idle)", "plan": "pro",
+                              "seen": False},
+    }
+    app = mod.AgentSidebar(scan=fake.scan, panes_here=fake.panes_here,
+                           run=fake.run, pull_requests=fake.pull_requests,
+                           accounts=fake.list_accounts, usage=fake.list_usage)
+    async with app.run_test(size=(36, 40)) as pilot:
+        await pilot.pause(0.3)
+        usage = app.query_one("#usage", Static)
+
+        def shown() -> list[str]:
+            return [line.rstrip() for line in
+                    plain(usage.content, width=34).splitlines()]
+
+        async def rescan() -> None:
+            app.action_rescan()
+            await pilot.pause(0.3)
+
+        want = [
+            "◆ claude                       max",
+            "  5h ━━━━━━━━━━━━━━━   1%  ↻ 3h50m",
+            "  wk ━━━━━━━━━━━━━━━   2%  ↻  3d2h",
+            "◆ claude (personal)            pro",
+            "  5h ━━━━━━━━━━━━━━━  13%  ↻ 3h40m",
+            "  wk ━━━━━━━━━━━━━━━  67%  ↻ 2d22h",
+        ]
+        check("each account in use, the default first", shown() == want,
+              shown())
+        check("and not an account no agent is on",
+              "idle" not in "".join(shown()), shown())
+        check("the overview sits between the agents and the footer",
+              app.query_one("#agents").region.bottom
+              <= app.query_one("#usage-rule").region.y
+              < usage.region.y < app.query_one("#footer").region.y,
+              [app.query_one(i).region for i in
+               ("#agents", "#usage-rule", "#usage", "#footer")])
+        check("under a rule",
+              str(app.query_one("#usage-rule", Static).render()).startswith(
+                  "─" * 36),
+              app.query_one("#usage-rule", Static).render())
+
+        lookups = fake.usage_lookups
+        await rescan()
+        await rescan()
+        check("usage is read at a modest rate, not every scan",
+              fake.usage_lookups == lookups, fake.usage_lookups)
+
+        fake.usage = fake.usage | {
+            default: {"name": "claude", "plan": "max", "seen": True,
+                      "five_hour": window(40, -60),
+                      "seven_day": window(2, 3 * 86400 + 2 * 3600)},
+        }
+        fake.rows = fake.rows + [row("koyr", "%5", harness="claude",
+                                     account="/cfg/.claude-idle")]
+        app._usage_checked = -mod.USAGE_INTERVAL
+        await rescan()
+        check("a window past its reset shows no number",
+              shown()[1] == "  5h ━━━━━━━━━━━━━━━   -   ↻ reset", shown())
+        check("an account with nothing kept yet says so",
+              shown()[3:5] == ["◆ claude (idle)                pro",
+                               "  no usage seen yet"], shown())
+        check("the others by name, after the default",
+              [line for line in shown() if line.startswith("◆")]
+              == ["◆ claude                       max",
+                  "◆ claude (idle)                pro",
+                  "◆ claude (personal)            pro"], shown())
+
+        fake.usage = {}
+        app._usage_checked = -mod.USAGE_INTERVAL
+        fake.rows = [row("koyr", "%1", harness="claude",
+                         account="/cfg/.claude-other")]
+        await rescan()
+        check("an account nothing names is called after its folder",
+              shown() == ["◆ claude (.claude-other)",
+                          "  no usage seen yet"], shown())
+
+        fake.rows = [row("tools", "%4", agent="opencode", harness="opencode")]
+        await rescan()
+        check("no claude agent, no overview",
+              not usage.display
+              and not app.query_one("#usage-rule").display,
+              usage.display)
+    return results
+
+
+def usage_file_cases(mod) -> list[tuple[str, bool, str]]:
+    """What read_usage makes of agent-usage-tap's files and each account's
+    .claude.json."""
+    results: list[tuple[str, bool, str]] = []
+
+    def check(name: str, ok: bool, detail: object) -> None:
+        results.append((name, ok, "" if ok else f"got={detail!r}"))
+
+    root = Path(tempfile.mkdtemp())
+    home, state = root / "home", root / "usage"
+    (home / ".claude").mkdir(parents=True)
+    (home / ".claude-personal").mkdir()
+    state.mkdir()
+    (home / ".claude.json").write_text(json.dumps(
+        {"oauthAccount": {"organizationType": "claude_max"}}))
+    (home / ".claude-personal" / ".claude.json").write_text(json.dumps(
+        {"oauthAccount": {"organizationType": "claude_pro"}}))
+    five = {"used_percentage": 13, "resets_at": 1790703000}
+    (state / "claude-a.json").write_text(json.dumps({
+        "harness": "claude", "folder": str(home / ".claude-personal"),
+        "five_hour": five, "seven_day": None,
+    }))
+    (state / "claude-b.json").write_text(json.dumps({
+        "harness": "claude", "folder": "/cfg/.claude-gone",
+        "five_hour": {"used_percentage": "lots", "resets_at": 1},
+    }))
+    (state / "claude-c.json").write_text("not json")
+    listing = [("claude", "personal", str(home / ".claude-personal")),
+               ("codex", "alt", str(home / ".codex-alt"))]
+    got = mod.read_usage(home, state, listing)
+    want = {
+        str(home / ".claude"): {"name": "claude", "plan": "max",
+                                "seen": False},
+        str(home / ".claude-personal"): {
+            "name": "claude (personal)", "plan": "pro", "seen": True,
+            "five_hour": five, "seven_day": None},
+        "/cfg/.claude-gone": {"name": "claude (.claude-gone)", "plan": "",
+                              "seen": True, "five_hour": None,
+                              "seven_day": None},
+    }
+    check("accounts are named, their plans read and their limits kept",
+          got == want, got)
+    return results
+
+
 def main() -> int:
     # The app remembers folds in $XDG_STATE_HOME; keep the real one out.
     os.environ["XDG_STATE_HOME"] = tempfile.mkdtemp()
@@ -752,6 +933,26 @@ def main() -> int:
         report("fold", name, ok, detail)
     for name, ok, detail in asyncio.run(account_cases(mod)):
         report("account", name, ok, detail)
+    for name, ok, detail in asyncio.run(usage_cases(mod)):
+        report("usage", name, ok, detail)
+    for name, ok, detail in usage_file_cases(mod):
+        report("usage", name, ok, detail)
+
+    for name, seconds, want in COUNTDOWN_CASES:
+        got = mod.countdown(seconds)
+        report("usage", name, got == want, "" if got == want else f"got={got!r}")
+
+    bar = mod.meter(13, 15)
+    got = [(span.start, span.end, str(span.style)) for span in bar.spans]
+    want = [(0, 2, "green"), (2, 15, mod.TRACK)]
+    ok = bar.plain == "━" * 15 and got == want
+    report("usage", "the meter fills to the nearest cell", ok,
+           "" if ok else f"got={bar.plain!r} {got}")
+
+    colors = [mod.usage_color(used) for used in (0, 59, 60, 84, 85, 100)]
+    want = ["green", "green", "yellow", "yellow", "red", "red"]
+    report("usage", "green, then yellow from 60%, red from 85%",
+           colors == want, "" if colors == want else f"got={colors}")
 
     print(f"\n{total - failures}/{total} passed")
     return 1 if failures else 0
