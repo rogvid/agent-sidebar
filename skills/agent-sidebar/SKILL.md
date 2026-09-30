@@ -18,6 +18,7 @@ The sidebar is for humans - you use `agent-scan`, `agent-msg`, `git-wt` and `tmu
 | `agent-usage-tap` | Sits in front of Claude's statusline command and keeps each account's rate limits | Reading how much of an account's 5h and weekly limits is used (section 5) |
 | `agent-sidebar-tmux` | Moves the sidebar pane with the viewed window, and runs the sidebar's actions on panes | Spawning worktrees, killing panes; the rest are interactive popups for the human |
 | `agent-sidebar-config` | Reads the settings file for the other tools | Checking the settings (section 5) |
+| `agent-orchestrator` | The orchestrator's tmux session `orchestrator`, shown in a popup (M-1) | Finding or starting the orchestrator (section 4) |
 | `git-wt` | Worktree and session naming | Creating/removing worktrees, finding a worktree's session |
 | `tmux capture-pane / list-panes / send-keys` | tmux itself | Inspection, and keys that are not a message |
 
@@ -212,6 +213,21 @@ tmux send-keys -t "%42" Enter
 
 ## 4. Orchestrator pattern - one main session spawning workers
 
+### The orchestrator session
+
+The user's orchestrator is one claude session that keeps track of all the other agents and relays the user's decisions to them.
+It is the tmux session `orchestrator`, which M-1 shows in a popup on the user's screen and hides again; it keeps running while hidden.
+
+- Its home is `~/.local/share/agent-sidebar/orchestrator`, a real folder outside every repository, so `agent-scan` shows its `project` as `orchestrator` and its `branch` as `no git`.
+- Its `AGENTS.md` and `CLAUDE.md` there are links to `agents/orchestrator/AGENTS.md` in dotfiles; change that file in dotfiles, never the links.
+- `projects.md` beside them is the machine's own, untracked list of projects and what speech-to-text turns their names into.
+- Its pane, when it runs: `agent-scan --json | jq -r '.[] | select(.target | startswith("orchestrator:")) | .pane_id'`.
+- `agent-orchestrator start` creates the session if there is none, without showing it, and prints its pane id.
+  It types `claude` into a shell in the home, on the account the `orchestrator.account` setting names (section 5), else on the caller's.
+  When this machine has no such account, or the settings file is broken, it says so and starts nothing.
+  Start it only when the user asks.
+- `agent-orchestrator toggle` (M-1) is for the human: it opens a popup.
+
 A worker gets its task the moment it starts: as the launch command's prompt argument, never as a message sent after launch (see section 3).
 
 | Harness | Start with a task | Yolo flag |
@@ -340,6 +356,7 @@ Every setting is optional, and so is the file.
 | `yolo` | `AGENT_SIDEBAR_YOLO` | `git config agent-sidebar.yolo` | sidebar | Default of the yolo checkbox; the variable's `0`/`false`/`no`/`off` turn it off (default on) |
 | `width` | `AGENT_SIDEBAR_WIDTH` | - | `agent-sidebar-tmux` | Sidebar width in columns (default `36`) |
 | `command` | `AGENT_SIDEBAR_COMMAND` | - | `agent-sidebar-tmux` | Command run in the sidebar pane (default `agent-sidebar`) |
+| `orchestrator.account` | - | - | `agent-orchestrator` | The claude account the orchestrator starts on, a name from `agent-sidebar-tmux accounts`; written `account = "personal"` under `[orchestrator]` (default unset: the account of whatever creates the session) |
 
 Precedence, first wins: per-project git config > variable > file > default.
 The git config keys only affect the dialog; `agent-sidebar-tmux new-worktree` and `spawn` without HARNESS use the variable, then the file.
@@ -359,7 +376,7 @@ agent-sidebar-config path           # where the file is
 
 - Outside tmux, `tmux` commands (and `agent-scan`) talk to the default server. A server on another socket (`-L`/`-S`) is only reached with `TMUX` set to it: `TMUX="$(tmux -L name display-message -p '#{socket_path},#{pid},0')"`.
 - `$TMUX_PANE` is your own pane id.
-- `claude` in a folder that neither it nor a parent was trusted in first asks whether to trust it, and Enter picks "No, exit". Worktrees inside a project folder that was trusted inherit that trust.
+- `claude` in a folder that neither it nor a parent was trusted in first asks whether to trust it, and Enter picks "No, exit". Worktrees inside a project folder that was trusted inherit that trust. `agent-orchestrator` trusts the orchestrator's home itself (`projects[FOLDER].hasTrustDialogAccepted` in the account's `.claude.json`).
 - `tmux display-message -p -t "%42" '#{pane_current_path}'` gives a pane's cwd.
 - `agent-sidebar-tmux follow` is lock-guarded because hooks fire in bursts. Do not call it in a loop.
 - A popup that attaches a nested client is a second client; the sidebar ignores server-spawned clients when deciding which window you are viewing.
