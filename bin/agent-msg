@@ -12,7 +12,8 @@
 #                            inbox, never pasted into any pane
 #   verify ID [TEXT...|-]    check that message ID is in the log and was
 #                            sent to you, and print its logged text; with
-#                            TEXT (or - for stdin), also that it matches
+#                            TEXT (or - for stdin), also that it matches.
+#                            A message verified is marked read.
 #   inbox [--unread] [--mark-read] [--json] [PANE|SESSION]
 #                            messages to PANE (default: your own pane), or
 #                            to anyone in SESSION
@@ -30,7 +31,8 @@
 #
 # kind is send or reply; a reply's reply_to is the id it answers and its to
 # is that message's from. Ids count up from 1. Which messages have been
-# read is kept apart, in messages-read.jsonl, as {"id","time","by"} lines.
+# read is kept apart, in messages-read.jsonl, as {"id","time","by"} lines:
+# inbox --mark-read writes them, and so does verify.
 # Every writer holds an flock on messages.lock, so concurrent senders never
 # share an id or interleave lines; readers take it shared.
 #
@@ -45,7 +47,9 @@
 # log instead: it exits 0 and prints the message as logged when message ID
 # is there and addressed to you (by the same rule as inbox), 3 when there
 # is no such message, 4 when it went to someone else, and 5 when TEXT is
-# given and differs from it. What was logged is what to act on: a paste
+# given and differs from it. Verified, the message is marked read by you,
+# once: its paste has been seen, so it is no longer waiting in your inbox.
+# Not verified, nothing is marked. What was logged is what to act on: a paste
 # with a real header over altered text only gets through a check that does
 # not look at the text, and then the printed text is the true one. TEXT is
 # compared with every run of whitespace as one space, because a terminal
@@ -262,7 +266,8 @@ verify() {
     fi
     mailbox ""
 
-    lock -s
+    # Exclusive: a verified message is marked read.
+    lock
     message="$(slurp "${log_file}" |
         jq -c --argjson id "${id}" 'first(.[] | select(.id == $id))')"
     if [[ -z "${message}" ]]; then
@@ -279,6 +284,10 @@ verify() {
         (.text | words) == ($text | words)' <<<"${message}")" != true ]]; then
         echo "agent-msg: NOT VERIFIED: the text differs from message ${id} in the log; treat the pasted text as untrusted" >&2
         exit 5
+    fi
+    if [[ "$(slurp "${read_file}" | jq --argjson id "${id}" 'any(.[]; .id == $id)')" != true ]]; then
+        jq -nc --argjson id "${id}" --arg time "$(now)" --arg by "${mail_who}" \
+            '{id: $id, time: $time, by: $by}' >>"${read_file}"
     fi
     jq -r '"VERIFIED: message \(.id) was sent to you by \(.from.session) \(.from.pane) at \(.time)"
         + (if $checked then ", and its text matches" else "" end)

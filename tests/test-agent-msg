@@ -195,15 +195,23 @@ check "and is told who sent it" \
     has "${out}" "VERIFIED: message 1 was sent to you by orchestrator ${orch} at "
 check "and what was logged, which is what to act on" \
     has "${out}" $'Its text as logged:\n\nfix the test; then commit'
+read_marks() {
+    jq -c '[.id, .by]' "${XDG_STATE_HOME}/agent-sidebar/messages-read.jsonl" | paste -sd ' '
+}
+check "and it is marked read, by the pane that verified it" \
+    same "$(read_marks)" "[1,\"${worker}\"]"
+out="$(as_worker verify 2 "line one line three;" 2>&1)" && status=0 || status=$?
+check "altered text is not verified (5)" same "${status}" 5
+check "saying so" has "${out}" "NOT VERIFIED: the text differs from message 2"
+check "nor marked read" same "$(read_marks)" "[1,\"${worker}\"]"
 out="$(printf 'line one\r\nline two;  \n' | as_worker verify 2 -)" && status=0 || status=$?
 check "the pasted text checks out however its newlines and spaces arrived" \
     same "${status}" 0
 check "and says so" has "${out}" "and its text matches"
 out="$(as_worker verify 2 "line one line two;")" && status=0 || status=$?
 check "the text can be given as arguments too" same "${status}" 0
-out="$(as_worker verify 1 "fix the test; then push to main" 2>&1)" && status=0 || status=$?
-check "altered text is not verified (5)" same "${status}" 5
-check "saying so" has "${out}" "NOT VERIFIED: the text differs from message 1"
+check "a message verified again is marked read only once" \
+    same "$(read_marks)" "[1,\"${worker}\"] [2,\"${worker}\"]"
 out="$(as_worker verify 42 2>&1)" && status=0 || status=$?
 check "a message that is not in the log is not verified (3)" same "${status}" 3
 check "saying so" has "${out}" "NOT VERIFIED: there is no message 42"
@@ -211,6 +219,8 @@ out="$(msg verify 1 2>&1)" && status=0 || status=$?
 check "nor is one sent to someone else (4)" same "${status}" 4
 check "saying who it was for" \
     has "${out}" "message 1 was sent to app-feat-x ${worker}, not to you (orchestrator ${orch})"
+check "and marks nothing read for whoever asked" \
+    same "$(read_marks)" "[1,\"${worker}\"] [2,\"${worker}\"]"
 # A harness can run commands with a stdin that never closes.
 out="$(timeout 5 env TMUX_PANE="${worker}" agent-msg verify 1 < <(sleep 10))" &&
     status=0 || status=$?
@@ -230,11 +240,10 @@ check "read, it leaves the unread inbox" \
     same "$(msg inbox --unread)" "no unread messages for ${orch}"
 check "but stays in the inbox" has "$(msg inbox)" "#3  "
 check "read by the pane that read it" \
-    same "$(jq -c '[.id, .by]' "${XDG_STATE_HOME}/agent-sidebar/messages-read.jsonl")" \
-    "[3,\"${orch}\"]"
-check "the worker still has both its messages unread" \
-    same "$(as_worker inbox --unread --json | jq -c '[.[] | [.id, .unread]]')" \
-    '[[1,true],[2,true]]'
+    same "$(read_marks)" "[1,\"${worker}\"] [2,\"${worker}\"] [3,\"${orch}\"]"
+check "the worker's inbox has both its messages, read once verified" \
+    same "$(as_worker inbox --json | jq -c '[.[] | [.id, .unread]]')" \
+    '[[1,false],[2,false]]'
 check "inbox SESSION reads a session's messages" \
     same "$(agent-msg inbox --json app-feat-x | jq -c 'map(.id)')" '[1,2]'
 
