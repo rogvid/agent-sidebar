@@ -55,10 +55,19 @@ or unknown), and `message_full`: the whole of what the pane last said, where
 
 --tmux prints one coloured count per state in tmux's own style syntax, for
 the status bar, and nothing at all when no agent is running.
+
+Agents in a tmux session the agent-sidebar config's `hide` names (see
+agent-sidebar-config) are left out of --tmux, and of the sidebar. Everything
+else still lists them, since agents need to find them: --json says
+`hidden: true`, the table says `hidden` before the message. A broken config
+file is reported on stderr, and --tmux shows a red warning, until it is
+fixed.
 """
 
 from __future__ import annotations
 
+import importlib.machinery
+import importlib.util
 import json
 import os
 import re
@@ -67,10 +76,27 @@ import sys
 import time
 import unicodedata
 from collections import Counter
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 import psutil
+
+
+def load_config():
+    """agent-sidebar-config, the one reader of the config file, from beside
+    this script's real path: it is linked into ~/.local/bin on its own."""
+    source = Path(__file__).resolve().with_name("agent-sidebar-config")
+    loader = importlib.machinery.SourceFileLoader(
+        "agent_sidebar_config", str(source))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+config = load_config()
 
 # Only these harnesses make a pane an agent. The role a harness plays
 # (plan, reviewer, ...) is whatever it was started with via `--agent`; see
@@ -1121,6 +1147,9 @@ class Row:
     # The folder of the account the harness runs on (CLAUDE_CONFIG_DIR and
     # the like), "" for its default one. Usage limits belong to an account.
     account: str = ""
+    # In a session the config's hide names: out of the sidebar and the
+    # status bar, still here for agents looking for it.
+    hidden: bool = False
 
 
 def sort_key(row: Row) -> tuple[int, int, float, str]:
@@ -1140,7 +1169,7 @@ def sort_key(row: Row) -> tuple[int, int, float, str]:
     )
 
 
-def collect_rows() -> list[Row]:
+def collect_rows(hide: Sequence[str] = ()) -> list[Row]:
     panes = list_panes()
     if not panes:
         return []
@@ -1189,6 +1218,7 @@ def collect_rows() -> list[Row]:
             flag=SHARED_TREE if trees[pane.cwd] > 1 else " ",
             changes=changes,
             account=harness_account(harness_agent),
+            hidden=config.hidden(pane.session, hide),
         ))
 
     rows.sort(key=sort_key)
@@ -1229,6 +1259,7 @@ def render(rows: list[Row], color: bool) -> list[str]:
         return any(getattr(r, field) != "-" for r in rows)
 
     show_weekly = informative("weekly")
+    show_hidden = any(r.hidden for r in rows)
 
     out: list[str] = []
     for r in rows:
@@ -1257,6 +1288,8 @@ def render(rows: list[Row], color: bool) -> list[str]:
                 + paint(r.weekly.rjust(w_weekly), weekly_color(r.weekly))
             )
         columns.append(paint(f"up {r.age.rjust(w_age)}", MUTED))
+        if show_hidden:
+            columns.append(paint("hidden" if r.hidden else " " * 6, MUTED))
         out.append("  ".join(columns) + "   " + paint(r.message, MUTED))
     return out
 
@@ -1278,14 +1311,17 @@ TMUX_STATE_COLOR = {
 }
 
 
-def render_tmux(rows: list[Row]) -> str:
-    """`● 1 ● 2 ` in tmux style syntax, most urgent state first.
+def render_tmux(rows: list[Row], broken_config: bool = False) -> str:
+    """`● 1 ● 2 ` in tmux style syntax, most urgent state first, leaving out
+    hidden agents.
 
     The trailing space is part of the output, so the status bar only makes
-    room when there is something to show.
+    room when there is something to show. A broken config file always is:
+    the status bar is the one place sure to be seen.
     """
-    counts = Counter(r.state for r in rows)
-    parts = [
+    counts = Counter(r.state for r in rows if not r.hidden)
+    parts = ["#[fg=red]⚠ agent-sidebar config"] if broken_config else []
+    parts += [
         f"#[fg={TMUX_STATE_COLOR[state]}]● {counts[state]}"
         for state in sorted(counts, key=lambda s: STATE_ORDER.get(s, 9))
         if state in TMUX_STATE_COLOR
@@ -1296,11 +1332,15 @@ def render_tmux(rows: list[Row]) -> str:
 def cmd_scan(
     color: bool, as_json: bool = False, as_tmux: bool = False,
 ) -> int:
-    rows = collect_rows()
+    settings, error = config.load()
+    if error:
+        # Only stderr: the rows still go out, just with nothing hidden.
+        print(f"agent-scan: ignoring {error}", file=sys.stderr)
+    rows = collect_rows(config.get("hide", settings=settings))
     if as_tmux:
         # An empty line, not a message: the status bar shows whatever this
         # prints.
-        print(render_tmux(rows))
+        print(render_tmux(rows, broken_config=error is not None))
         return 0
     if as_json:
         # Always a list, even an empty one: a consumer polling this wants

@@ -31,6 +31,11 @@ With many agents open, `h` folds a project into one line that counts its
 agents by state, and `c` puts an agent on one line. Both are remembered in
 $XDG_STATE_HOME/agent-sidebar/state.json for the next sidebar.
 
+Settings, and a `hide` list of tmux sessions whose agents it leaves out,
+are in ${XDG_CONFIG_HOME:-~/.config}/agent-sidebar/config.toml (see
+agent-sidebar-config). When that file is broken it says so in red and runs
+as if there were none.
+
 At the bottom, each Claude account a running agent is on shows how much of
 its 5 hour and weekly limits is used, and when each resets. Claude Code
 hands those only to its statusline, so agent-usage-tap has to sit in front
@@ -41,6 +46,8 @@ has seen no usage yet.
 from __future__ import annotations
 
 import asyncio
+import importlib.machinery
+import importlib.util
 import json
 import os
 import subprocess
@@ -135,9 +142,22 @@ def agent_icon(agent: str) -> str:
 PROJECT_PREFIX = "project:"
 GLUE = "agent-sidebar-tmux"
 
-# Harnesses that can be started in a new worktree's session.
-# Overridable with AGENT_SIDEBAR_HARNESSES (space or comma separated).
-_DEFAULT_HARNESSES = ("claude", "codex", "opencode", "pi")
+
+def load_config():
+    """agent-sidebar-config, the one reader of the config file, from beside
+    this script's real path: it is linked into ~/.local/bin on its own."""
+    source = Path(__file__).resolve().with_name("agent-sidebar-config")
+    loader = importlib.machinery.SourceFileLoader(
+        "agent_sidebar_config", str(source))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+config = load_config()
+
 # YOLO flag per harness when the checkbox is on (on by default).
 # pi has no permission gate, so no flag and the checkbox is disabled.
 _HARNESS_YOLO: dict[str, str] = {
@@ -147,68 +167,25 @@ _HARNESS_YOLO: dict[str, str] = {
 }
 
 
-def harnesses() -> list[str]:
-    raw = os.environ.get("AGENT_SIDEBAR_HARNESSES")
-    if raw is not None:
-        parts = [p.strip() for p in raw.replace(",", " ").split() if p.strip()]
-        return parts if parts else list(_DEFAULT_HARNESSES)
-    agent = os.environ.get("AGENT_SIDEBAR_AGENT")
-    base = list(_DEFAULT_HARNESSES)
-    if agent and agent not in base:
-        base.append(agent)
-    return base
-
-
-def default_harness() -> str:
-    agent = os.environ.get("AGENT_SIDEBAR_AGENT", "claude")
-    # AGENT_SIDEBAR_AGENT may be a full command; the harness list holds
-    # the same string so the default can be highlighted.
-    return agent
-
-
-def _git_config_get(cwd: str | None, key: str) -> str | None:
-    if not cwd:
-        return None
-    try:
-        proc = subprocess.run(
-            ["git", "config", "--get", key],
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            timeout=2,
-        )
-        if proc.returncode == 0:
-            val = proc.stdout.strip()
-            return val if val else None
-    except Exception:
-        return None
-    return None
-
-
 def harnesses_for_project(cwd: str | None) -> list[str]:
     """The harnesses offered, the project's default among them and
-    "none" (a worktree with no harness started) last."""
-    options = harnesses()
-    for harness in (default_harness_for_project(cwd), "none"):
+    "none" (a worktree with no harness started) last. The default may be a
+    full command; the list holds that same string so it can be
+    highlighted."""
+    options = list(config.get("harnesses"))
+    for harness in (default_harness_for_project(cwd), config.get("agent"),
+                    "none"):
         if harness not in options:
             options.append(harness)
     return options
 
 
 def default_harness_for_project(cwd: str | None) -> str:
-    # `git config agent-sidebar.harness` overrides the global default.
-    return _git_config_get(cwd, "agent-sidebar.harness") or default_harness()
+    return config.get("agent", cwd)
 
 
 def yolo_default_for_project(cwd: str | None) -> bool:
-    val = _git_config_get(cwd, "agent-sidebar.yolo")
-    if val is not None:
-        return val.lower() not in ("0", "false", "no", "off")
-    # Global env var AGENT_SIDEBAR_YOLO or default on
-    env = os.environ.get("AGENT_SIDEBAR_YOLO")
-    if env is not None:
-        return env.lower() not in ("0", "false", "no", "off")
-    return True
+    return config.get("yolo", cwd)
 
 
 def account_listing() -> list[tuple[str, str, str]]:
@@ -728,6 +705,14 @@ async def scan() -> list[Row] | None:
     return rows if isinstance(rows, list) else None
 
 
+def config_error() -> str | None:
+    """What is wrong with the config file, None when nothing is. Without
+    the file's path: that would fill the sidebar, and
+    `agent-sidebar-config check` has it."""
+    error = config.load()[1]
+    return error and error.removeprefix(f"{config.path()}: ")
+
+
 async def panes_here() -> set[str]:
     """The panes sharing a window with this one."""
     pane = os.environ.get("TMUX_PANE")
@@ -967,6 +952,11 @@ class AgentSidebar(App[None]):
         height: 1;
         color: ansi_bright_black;
     }
+    #config-error {
+        height: auto;
+        padding: 0 1 1 1;
+        color: ansi_red;
+    }
     OptionList {
         height: 1fr;
         max-height: 100%;
@@ -1095,6 +1085,7 @@ class AgentSidebar(App[None]):
         ),
         accounts: Callable[[], list[tuple[str, str]]] = accounts,
         usage: Callable[[], Awaitable[dict[str, dict[str, Any]]]] = usage,
+        config_error: Callable[[], str | None] = config_error,
         state: Path | None = None,
     ) -> None:
         super().__init__(ansi_color=True)
@@ -1104,6 +1095,7 @@ class AgentSidebar(App[None]):
         self._pull_requests = pull_requests
         self._accounts = accounts
         self._usage = usage
+        self._config_error = config_error
         # Each Claude account's usage by folder, None until first read.
         self._usage_by_folder: dict[str, dict[str, Any]] | None = None
         self._usage_checked = -USAGE_INTERVAL
@@ -1136,6 +1128,7 @@ class AgentSidebar(App[None]):
     def compose(self) -> ComposeResult:
         yield Static(id="header")
         yield Static("─" * 200, id="header-rule")
+        yield Static(id="config-error")
         yield OptionList(id="agents")
         yield Static("No agents running", id="empty")
         yield Static("─" * 200, id="usage-rule")
@@ -1144,6 +1137,7 @@ class AgentSidebar(App[None]):
 
     def on_mount(self) -> None:
         self.query_one("#agents").display = False
+        self.query_one("#config-error").display = False
         self.query_one("#empty").display = False
         self.query_one("#usage-rule").display = False
         self.query_one("#usage").display = False
@@ -1161,11 +1155,15 @@ class AgentSidebar(App[None]):
 
     async def rescan(self) -> None:
         rows, here = await asyncio.gather(self._scan(), self._panes_here())
+        self.show_config_error(self._config_error())
         if rows is None:
             # Keep what is on screen; a list that blinks empty on one bad
             # scan is worse than one that is a second old.
             self.show_header(self._rows, ok=False)
             return
+        # Hidden agents are left out before anything else looks: the
+        # header's counts, the announcements, the usage overview.
+        rows = [row for row in rows if not row.get("hidden")]
         self._rows, self._here = rows, here
         self.show_header(rows, ok=True)
         self.announce(rows, here)
@@ -1243,6 +1241,12 @@ class AgentSidebar(App[None]):
         usage = self.query_one("#usage", Static)
         usage.display = bool(accounts)
         usage.update(usage_prompt(accounts, now))
+
+    def show_config_error(self, error: str | None) -> None:
+        widget = self.query_one("#config-error", Static)
+        widget.display = error is not None
+        if error is not None:
+            widget.update(f"config.toml ignored: {error}")
 
     def show_header(self, rows: list[Row], ok: bool) -> None:
         title = Table.grid(expand=True)

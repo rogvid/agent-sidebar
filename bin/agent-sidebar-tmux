@@ -21,8 +21,9 @@
 #   new-worktree PANE BRANCH [HARNESS] [--account NAME]
 #                            create a worktree of PANE's project, give it a
 #                            session of its own and start HARNESS there
-#                            (default: $AGENT_SIDEBAR_AGENT or claude; "none"
-#                            starts no harness), on HARNESS's account NAME
+#                            (default: the agent setting, claude unless
+#                            configured; "none" starts no harness), on
+#                            HARNESS's account NAME
 #   spawn PANE|DIR BRANCH [HARNESS] [--account NAME]
 #                            new-worktree for an agent starting workers, or
 #                            for you from any shell: no popup, you stay
@@ -50,6 +51,9 @@
 # "HARNESS NAME FOLDER" a line. A session started on an account keeps it
 # for everything run in it.
 #
+# The sidebar's width, its command and the default harness are settings:
+# see agent-sidebar-config.
+#
 # Whether the sidebar is wanted is the global @agent-sidebar-open option.
 # The pane itself carries the pane option @agent-sidebar. Keeping the two
 # apart is what lets follow bring a fresh sidebar back after the old one
@@ -57,16 +61,35 @@
 
 set -euo pipefail
 
-readonly width="${AGENT_SIDEBAR_WIDTH:-36}"
-readonly sidebar_command="${AGENT_SIDEBAR_COMMAND:-agent-sidebar}"
 # resurrect saves panes with their title, which is how prune-resurrect
 # recognises this one.
 readonly title="agent-sidebar"
-# What new-worktree starts in the new session.
-readonly agent_command="${AGENT_SIDEBAR_AGENT:-claude}"
 
 usage() {
     sed -n '2,/^$/s/^# \{0,1\}//p' "$0"
+}
+
+# The one reader of the config file, from beside this script's real path:
+# it is linked into ~/.local/bin on its own, and a script added since the
+# last `mise bootstrap` is not linked yet.
+config_reader="$(dirname "$(realpath "$0")")/agent-sidebar-config"
+readonly config_reader
+
+# One setting, from the variables, the config file and the defaults. Asked
+# only where it is needed: each ask starts Python.
+#
+# A broken config file is not reported here: the hooks run this in the
+# background, and tmux would put the report over your pane on every window
+# switch. The sidebar and the status bar say it instead.
+setting() {
+    local value
+    value="$("${config_reader}" get "$1" 2>/dev/null)" || true
+    if [[ -z "${value}" ]]; then
+        echo "agent-sidebar-tmux: cannot read the $1 setting from" \
+            "${config_reader}" >&2
+        return 1
+    fi
+    echo "${value}"
 }
 
 # The sidebar's pane id, or nothing.
@@ -119,13 +142,15 @@ viewed_window() {
     done
 }
 
-# Start a sidebar in a window without focusing it; print its pane id.
+# Start a sidebar WIDTH columns wide in a window without focusing it; print
+# its pane id.
 #
 # COLORTERM because tmux does not set it, and without it textual rounds its
 # colours to the 256 palette: the cursor row's quiet surface turns grey.
 # tmux converts true colour for any terminal that lacks it, so it is safe.
 open_in() {
-    local window="$1" pane
+    local window="$1" width="$2" pane sidebar_command
+    sidebar_command="$(setting command)"
     pane="$(tmux split-window -hbf -l "${width}" -d -t "${window}" \
         -e COLORTERM=truecolor -P -F '#{pane_id}' "${sidebar_command}")"
     tmux set-option -p -t "${pane}" @agent-sidebar 1 \; \
@@ -137,7 +162,8 @@ follow() {
     if [[ "$(tmux show-options -gqv @agent-sidebar-open)" != 1 ]]; then
         return 0
     fi
-    local viewed window zoomed pane home panes pane_width
+    local viewed window zoomed pane home panes pane_width width
+    width="$(setting width)"
     viewed="$(viewed_window)"
     if [[ -z "${viewed}" ]]; then
         return 0
@@ -168,7 +194,7 @@ follow() {
         return 0
     fi
     if [[ -z "${pane}" ]]; then
-        open_in "${window}" >/dev/null
+        open_in "${window}" "${width}" >/dev/null
     elif [[ "${home}" != "${window}" ]]; then
         tmux join-pane -hbf -l "${width}" -d -s "${pane}" -t "${window}"
     elif ((pane_width != width)); then
@@ -180,7 +206,8 @@ follow() {
 }
 
 toggle() {
-    local viewed window zoomed pane home
+    local viewed window zoomed pane home width
+    width="$(setting width)"
     viewed="$(viewed_window)"
     if [[ -z "${viewed}" ]]; then
         return 0
@@ -204,7 +231,7 @@ toggle() {
     elif [[ -n "${pane}" ]]; then
         tmux join-pane -hbf -l "${width}" -d -s "${pane}" -t "${window}"
     else
-        pane="$(open_in "${window}")"
+        pane="$(open_in "${window}" "${width}")"
     fi
     tmux select-pane -t "${pane}"
 }
@@ -362,7 +389,7 @@ new_worktree() {
         notify "no project behind ${pane}"
         return 0
     fi
-    chosen="${harness:-${agent_command}}"
+    chosen="${harness:-$(setting agent)}"
     if ! account_env "${chosen}" "${account}" ""; then
         notify "${account_error}"
         return 0
@@ -407,7 +434,7 @@ spawn() {
         echo "agent-sidebar-tmux: no git-wt project behind ${where}" >&2
         return 1
     fi
-    chosen="${harness:-${agent_command}}"
+    chosen="${harness:-$(setting agent)}"
     if ! account_env "${chosen}" "${account}" inherit; then
         echo "agent-sidebar-tmux: ${account_error}" >&2
         return 1

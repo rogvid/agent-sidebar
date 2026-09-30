@@ -1,0 +1,31 @@
+# agent-sidebar settings, read by agent-scan, agent-sidebar and
+# agent-sidebar-tmux through agent-sidebar-config.
+#
+# Every setting is optional. For each one the first of these that has it
+# wins: the project's `git config agent-sidebar.harness` / `agent-sidebar.yolo`
+# (agent and yolo, in the sidebar's new-worktree dialog only), the
+# AGENT_SIDEBAR_<NAME> variable (not hide), this file, the default shown.
+#
+# A mistake here (bad TOML, an unknown setting, a wrong type) makes every
+# tool ignore the whole file until it is fixed; the sidebar and the status
+# bar say so. `agent-sidebar-config check` says what is wrong.
+
+# tmux sessions whose agents the sidebar and the status bar count leave out.
+# agent-scan --json and its table still list them, marked hidden. Shell
+# globs match too.
+# hide = []
+
+# The harnesses the new-worktree dialog offers.
+# harnesses = ["claude", "codex", "opencode", "pi"]
+
+# The default harness, or a whole command.
+# agent = "claude"
+
+# Whether the dialog's yolo checkbox starts ticked.
+# yolo = true
+
+# The sidebar's width in columns.
+# width = 36
+
+# What runs in the sidebar pane.
+# command = "agent-sidebar"

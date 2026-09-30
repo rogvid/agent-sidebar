@@ -709,6 +709,20 @@ TMUX_CASES = (
      "#[fg=yellow]● 1 #[fg=blue]● 2#[default] "),
 )
 
+# A hidden agent is not counted; a broken config file always shows, since
+# the status bar is the one place sure to be seen. (name, (state, hidden)
+# per row, broken config, output)
+TMUX_HIDDEN_CASES = (
+    ("hidden agents are not counted",
+     (("blocked", True), ("running", False)), False,
+     "#[fg=blue]● 1#[default] "),
+    ("only hidden agents, no output", (("done", True),), False, ""),
+    ("a broken config says so, agents or not", (), True,
+     "#[fg=red]⚠ agent-sidebar config#[default] "),
+    ("and goes first", (("done", False),), True,
+     "#[fg=red]⚠ agent-sidebar config #[fg=green]● 1#[default] "),
+)
+
 # television finds the pane by pulling the first `session:window.pane` out
 # of the row, so nothing to the left of the target may look like one, and a
 # message quoting another pane must not win.
@@ -721,6 +735,8 @@ TARGET_CASES = (
      dict(project="flowform-backend", branch="@4f2e526",
           target="gpt-core-prototype-improve-file-parsing:1.2"),
      "gpt-core-prototype-improve-file-parsing:1.2"),
+    ("hidden agent", dict(target="orchestrator:1.1", hidden=True),
+     "orchestrator:1.1"),
 )
 
 
@@ -756,10 +772,14 @@ def program(command: str) -> str:
 
 # What a stand-in harness runs: a tool that outlives the scan.
 HARNESS_STAND_IN = "#!/bin/bash\ntimeout 3600 sleep 3600\n"
+# A session the agent-sidebar config hides, with an agent in it.
+HIDDEN_SESSION = "orchestrator"
 
 
-def scan_real_panes(root: Path) -> dict[str, dict | None]:
-    """Run PANE_CASES in real panes; return each case's agent-scan row."""
+def scan_real_panes(root: Path) -> tuple[dict[str, dict | None], str]:
+    """Run PANE_CASES in real panes, and an agent in HIDDEN_SESSION; return
+    each case's agent-scan row, the hidden agent's under HIDDEN_SESSION, and
+    what agent-scan --tmux says of them all."""
     socket = f"agent-scan-test-{os.getpid()}"
     bin_dir = root / "bin"
     bin_dir.mkdir()
@@ -779,6 +799,9 @@ def scan_real_panes(root: Path) -> dict[str, dict | None]:
     # Stand-ins start on their default account unless a case says not.
     for variable in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "PI_CODING_AGENT_DIR"):
         env.pop(variable, None)
+    (root / "config" / "agent-sidebar").mkdir(parents=True)
+    (root / "config" / "agent-sidebar" / "config.toml").write_text(
+        f'hide = ["{HIDDEN_SESSION[:5]}*"]\n')
 
     def tmux(*args: str) -> str:
         return subprocess.run(
@@ -796,6 +819,14 @@ def scan_real_panes(root: Path) -> dict[str, dict | None]:
                 "new-window", "-d", "-P", "-F", "#{pane_id}", "-t", "scan:",
                 "-c", str(root / tree), command,
             )
+        (root / HIDDEN_SESSION).mkdir()
+        panes[HIDDEN_SESSION] = tmux(
+            "new-session", "-d", "-P", "-F", "#{pane_id}",
+            "-s", HIDDEN_SESSION, "-c", str(root / HIDDEN_SESSION), "claude",
+        )
+        cases = [(name, command, want)
+                 for name, _tree, command, want in PANE_CASES]
+        cases.append((HIDDEN_SESSION, "claude", True))
         # Every pane is running its program, and every harness its tool.
         pids = {
             pane_id: int(pid) for pane_id, pid in (
@@ -816,24 +847,28 @@ def scan_real_panes(root: Path) -> dict[str, dict | None]:
         while not all(
             {program(command), *(("timeout",) if want else ())}
             <= running(name)
-            for name, _tree, command, want in PANE_CASES
+            for name, command, want in cases
         ):
             if time.time() > deadline:
                 raise RuntimeError("panes never settled: " + ", ".join(
                     f"{name}: {sorted(running(name))}"
-                    for name, *_ in PANE_CASES
+                    for name, *_ in cases
                 ))
             time.sleep(0.1)
         socket_path = tmux("display-message", "-p", "#{socket_path}")
-        out = subprocess.run(
-            [str(SCRIPT), "--json"], env=env | {"TMUX": f"{socket_path},0,0"},
-            check=True, capture_output=True, text=True,
-        ).stdout
+
+        def scan(flag: str) -> str:
+            return subprocess.run(
+                [str(SCRIPT), flag], env=env | {"TMUX": f"{socket_path},0,0"},
+                check=True, capture_output=True, text=True,
+            ).stdout
+
+        out, status_bar = scan("--json"), scan("--tmux")
     finally:
         subprocess.run(["tmux", "-L", socket, "kill-server"], env=env,
                        capture_output=True)
     rows = {r["pane_id"]: r for r in json.loads(out)}
-    return {name: rows.get(pane) for name, pane in panes.items()}
+    return {name: rows.get(pane) for name, pane in panes.items()}, status_bar
 
 
 def git(cwd: Path, *args: str) -> str:
@@ -1043,6 +1078,36 @@ def main() -> int:
         print(f"{'ok  ' if ok else 'FAIL'}  tmux     {name:36} "
               f"{'ok' if ok else f'want={want!r} got={got!r}'}")
 
+    for name, cases, broken, want in TMUX_HIDDEN_CASES:
+        got = mod.render_tmux([row(state=st, hidden=h) for st, h in cases],
+                              broken_config=broken)
+        ok = got == want
+        failures += not ok
+        print(f"{'ok  ' if ok else 'FAIL'}  tmux     {name:36} "
+              f"{'ok' if ok else f'want={want!r} got={got!r}'}")
+
+    # The table still lists hidden agents, for agents looking for them, and
+    # says which they are; with none hidden it spends no width on it.
+    lines = mod.render([row(message="shown"),
+                        row(hidden=True, message="behind")], color=False)
+    ok = ("hidden" not in lines[0]
+          and lines[1].endswith("up 2h  hidden   behind")
+          and lines[0].index("shown") == lines[1].index("behind"))
+    failures += not ok
+    print(f"{'ok  ' if ok else 'FAIL'}  render   {'hidden agents are marked':36} "
+          f"{'ok' if ok else f'got={lines!r}'}")
+    line = mod.render([row()], color=False)[0]
+    ok = "hidden" not in line and line.endswith("up 2h   hello")
+    failures += not ok
+    print(f"{'ok  ' if ok else 'FAIL'}  render   {'no column when none is hidden':36} "
+          f"{'ok' if ok else f'got={line!r}'}")
+    got = [r["hidden"] for r in json.loads(mod.render_json(
+        [row(), row(hidden=True)]))]
+    ok = got == [False, True]
+    failures += not ok
+    print(f"{'ok  ' if ok else 'FAIL'}  json     {'rows say whether they are hidden':36} "
+          f"{'ok' if ok else f'got={got}'}")
+
     ok = json.loads(mod.render_json([])) == []
     failures += not ok
     print(f"{'ok  ' if ok else 'FAIL'}  json     {'no agents is an empty list':36} "
@@ -1066,14 +1131,27 @@ def main() -> int:
           f"{'ok' if ok else f'got={sorted(templates)}'}")
 
     with tempfile.TemporaryDirectory() as tmp:
-        scanned = scan_real_panes(Path(tmp))
+        scanned, status_bar = scan_real_panes(Path(tmp))
     for name, _tree, _command, want in PANE_CASES:
         r = scanned[name]
         got = r and (r["agent"], r["role"], r["flag"], r.get("account"))
-        ok = got == want and (r is None or r["harness"] == r["agent"])
+        ok = (got == want and (r is None or r["harness"] == r["agent"])
+              and (r is None or r["hidden"] is False))
         failures += not ok
         print(f"{'ok  ' if ok else 'FAIL'}  pane     {name:36} "
               f"want={want} got={got}")
+
+    hidden = scanned[HIDDEN_SESSION]
+    ok = hidden is not None and hidden["hidden"] is True
+    failures += not ok
+    print(f"{'ok  ' if ok else 'FAIL'}  pane     {'a hidden session still scans, marked':36} "
+          f"{'ok' if ok else f'got={hidden}'}")
+    shown = sum(1 for r in scanned.values() if r and not r["hidden"])
+    counted = sum(int(n) for n in re.findall(r"● (\d+)", status_bar))
+    ok = counted == shown
+    failures += not ok
+    print(f"{'ok  ' if ok else 'FAIL'}  pane     {'the status bar leaves it out':36} "
+          f"{'ok' if ok else f'want={shown} got={status_bar!r}'}")
 
     total = (len(STATE_CASES) + len(CONTEXT_CASES) + len(AGE_CASES)
              + len(BLOCK_CASES) + len(COLOR_CASES) + len(DURATION_CASES)
@@ -1083,7 +1161,8 @@ def main() -> int:
              + len(COLLAPSE_CASES) + len(PROJECT_CASES)
              + len(IDENTITY_CASES) + len(FIT_CASES) + 1
              + len(TARGET_CASES) + 1 + 4 + len(CONTEXT_LEVEL_CASES)
-             + len(TMUX_CASES) + len(PANE_CASES))
+             + len(TMUX_CASES) + len(TMUX_HIDDEN_CASES) + 3
+             + len(PANE_CASES) + 2)
     print(f"\n{total - failures}/{total} passed")
     return 1 if failures else 0
 

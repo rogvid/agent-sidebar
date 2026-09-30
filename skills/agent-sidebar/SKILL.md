@@ -16,6 +16,7 @@ The sidebar is for humans - you use `agent-scan`, `git-wt` and `tmux` directly.
 | `agent-sidebar` | Textual TUI down the left of the viewed window (M-2) | Not for you - the user sees it. You get the same data from `agent-scan --json` |
 | `agent-usage-tap` | Sits in front of Claude's statusline command and keeps each account's rate limits | Reading how much of an account's 5h and weekly limits is used (section 5) |
 | `agent-sidebar-tmux` | Moves the sidebar pane with the viewed window, and runs the sidebar's actions on panes | Spawning worktrees, killing panes; the rest are interactive popups for the human |
+| `agent-sidebar-config` | Reads the settings file for the other tools | Checking the settings (section 5) |
 | `git-wt` | Worktree and session naming | Creating/removing worktrees, finding a worktree's session |
 | `tmux send-keys / paste-buffer / capture-pane / list-panes` | tmux itself | Messaging and inspection |
 
@@ -58,13 +59,14 @@ Each row (real output):
   "role": "",
   "changes": "∅",
   "context_level": "ok",
-  "account": ""
+  "account": "",
+  "hidden": false
 }
 ```
 
 Other outputs (human-oriented, do not parse):
-- `agent-scan` (or `--no-color`) - aligned table
-- `agent-scan --tmux` - `#[fg=green]● 14 #[fg=blue]● 1#[default] ` for the tmux status bar, empty when no agents
+- `agent-scan` (or `--no-color`) - aligned table; a `hidden` column before the message when any agent is hidden
+- `agent-scan --tmux` - `#[fg=green]● 14 #[fg=blue]● 1#[default] ` for the tmux status bar, empty when no agents; hidden agents are not counted
 
 Fields:
 - `pane_id` - stable tmux id (`%12`). Address panes with this, never `target` (window indices shift).
@@ -86,6 +88,7 @@ Fields:
 - Both read `(scrolled up, last words off screen)` when a claude pane is scrolled up: its latest words are below the fold, and `duration` is `-` for the same reason.
 - `flag` - `"▲"` when two agents share one working directory (danger - they overwrite each other), else `" "`.
 - `account` - the folder of the account the harness runs on (`CLAUDE_CONFIG_DIR`, `CODEX_HOME` or `PI_CODING_AGENT_DIR` of its process), `""` on its default one. Match it against `agent-sidebar-tmux accounts` for the name.
+- `hidden` - `true` when the pane's tmux session is in the config's `hide` list (see Configuration). The user does not see it in the sidebar or the status bar, but you can still find and message it.
 
 Rows arrive sorted as a queue - most urgent state first, freshest within each state.
 `agent-scan --json` prints `[]` when there are no agent panes.
@@ -281,17 +284,32 @@ New-worktree dialog (`n`):
 
 ### Configuration
 
-| Setting | Read by | Effect |
-|---------|---------|--------|
-| `AGENT_SIDEBAR_HARNESSES` | sidebar | Harnesses in the dialog, space or comma separated (default `claude codex opencode pi`) |
-| `AGENT_SIDEBAR_AGENT` | sidebar, `agent-sidebar-tmux` | Default harness (default `claude`); added to the dialog list when not in it |
-| `AGENT_SIDEBAR_YOLO` | sidebar | Default of the yolo checkbox; `0`/`false`/`no`/`off` turn it off (default on) |
-| `git config agent-sidebar.harness` | sidebar | Per-project default harness, overrides `AGENT_SIDEBAR_AGENT` |
-| `git config agent-sidebar.yolo` | sidebar | Per-project yolo default, overrides `AGENT_SIDEBAR_YOLO` |
-| `AGENT_SIDEBAR_WIDTH` | `agent-sidebar-tmux` | Sidebar width in columns (default `36`) |
-| `AGENT_SIDEBAR_COMMAND` | `agent-sidebar-tmux` | Command run in the sidebar pane (default `agent-sidebar`) |
+Settings live in `${XDG_CONFIG_HOME:-~/.config}/agent-sidebar/config.toml`, linked from `agent-sidebar/.config/agent-sidebar/config.toml` in the dotfiles.
+Every setting is optional, and so is the file.
+`agent-sidebar-config` is the one reader of it: agent-scan and agent-sidebar load it as a module, and `agent-sidebar-tmux` runs it.
 
-The git config keys only affect the dialog; `agent-sidebar-tmux new-worktree` without HARNESS uses `AGENT_SIDEBAR_AGENT`.
+| Setting | Variable | Per project | Read by | Effect |
+|---------|----------|-------------|---------|--------|
+| `hide` | - | - | agent-scan, sidebar | tmux session names (shell globs allowed) whose agents the sidebar and `agent-scan --tmux` leave out (default `[]`) |
+| `harnesses` | `AGENT_SIDEBAR_HARNESSES` | - | sidebar | Harnesses in the dialog; the variable is space or comma separated (default `claude codex opencode pi`) |
+| `agent` | `AGENT_SIDEBAR_AGENT` | `git config agent-sidebar.harness` | sidebar, `agent-sidebar-tmux` | Default harness or a whole command (default `claude`); added to the dialog list when not in it |
+| `yolo` | `AGENT_SIDEBAR_YOLO` | `git config agent-sidebar.yolo` | sidebar | Default of the yolo checkbox; the variable's `0`/`false`/`no`/`off` turn it off (default on) |
+| `width` | `AGENT_SIDEBAR_WIDTH` | - | `agent-sidebar-tmux` | Sidebar width in columns (default `36`) |
+| `command` | `AGENT_SIDEBAR_COMMAND` | - | `agent-sidebar-tmux` | Command run in the sidebar pane (default `agent-sidebar`) |
+
+Precedence, first wins: per-project git config > variable > file > default.
+The git config keys only affect the dialog; `agent-sidebar-tmux new-worktree` and `spawn` without HARNESS use the variable, then the file.
+
+Hidden agents are still in `agent-scan --json` (`"hidden": true`) and the table, so you can find and message them; only the user's views leave them out.
+
+A file that is not valid TOML, or has an unknown setting or a wrong type, is ignored as a whole until fixed: everything falls back to variables and defaults.
+The sidebar shows `config.toml ignored: <error>` in red, the status bar shows `⚠ agent-sidebar config`, and agent-scan warns on stderr.
+
+```bash
+agent-sidebar-config check          # silent when fine; prints the error and exits 1 when broken
+agent-sidebar-config get hide width # resolved values, one a line (lists space separated)
+agent-sidebar-config path           # where the file is
+```
 
 ## 6. tmux gotchas
 

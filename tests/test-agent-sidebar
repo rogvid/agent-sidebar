@@ -684,6 +684,85 @@ async def account_cases(mod) -> list[tuple[str, bool, str]]:
     return results
 
 
+async def config_cases(mod) -> list[tuple[str, bool, str]]:
+    """What the config file changes in the app: hidden agents are left out
+    altogether, the dialog takes its settings, and a broken file says so."""
+    from textual.widgets import Checkbox, OptionList, Static
+
+    results: list[tuple[str, bool, str]] = []
+
+    def check(name: str, ok: bool, detail: object) -> None:
+        results.append((name, ok, "" if ok else f"got={detail!r}"))
+
+    config = mod.config.path()
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text('harnesses = ["pi", "codex"]\nagent = "codex"\n'
+                      "yolo = false\n")
+    fake = Fake([row("koyr", "%1", "running"),
+                 row("orchestrator", "%2", "running", hidden=True)], {"%1"})
+    app = mod.AgentSidebar(scan=fake.scan, panes_here=fake.panes_here,
+                           run=fake.run, pull_requests=fake.pull_requests,
+                           accounts=fake.list_accounts)
+    try:
+        async with app.run_test(size=(36, 30)) as pilot:
+            await pilot.pause(0.3)
+            agents = app.query_one("#agents", OptionList)
+            ids = [agents.get_option_at_index(i).id
+                   for i in range(agents.option_count)]
+            check("a hidden agent is not listed",
+                  ids == ["project:koyr", "%1"], ids)
+            header = plain(app.query_one("#header", Static).content)
+            check("nor counted", "● 1" in header and "● 2" not in header,
+                  header)
+
+            fake.rows = [row("koyr", "%1", "running"),
+                         row("orchestrator", "%2", hidden=True)]
+            before = len(fake.ran)
+            app.action_rescan()
+            await pilot.pause(0.3)
+            said = [c for c in fake.ran[before:]
+                    if c[:2] == ("tmux", "display-message")]
+            check("nor announced when it stops", said == [], said)
+
+            error = app.query_one("#config-error", Static)
+            check("a good file shows no error", not error.display,
+                  error.display)
+
+            await pilot.press("n")
+            await pilot.pause(0.1)
+            hlist = app.screen.query_one("#harness-list", OptionList)
+            options = [hlist.get_option_at_index(i).id
+                       for i in range(hlist.option_count)]
+            check("the dialog offers the file's harnesses",
+                  options == ["pi", "codex", "none"], options)
+            check("starts on the file's agent",
+                  hlist.highlighted_option.id == "codex",
+                  hlist.highlighted_option.id)
+            yolo = app.screen.query_one("#yolo-check", Checkbox)
+            check("and its yolo", yolo.value is False, yolo.value)
+            await pilot.press("escape")
+            await pilot.pause(0.1)
+
+            config.write_text("hide = orchestrator\n")
+            app.action_rescan()
+            await pilot.pause(0.3)
+            shown = plain(error.content).replace("\n", "")
+            check("a broken file is reported where you look",
+                  error.display and shown.startswith(
+                      "config.toml ignored: Invalid value"), shown)
+            check("and the sidebar keeps going", agents.option_count == 2,
+                  agents.option_count)
+
+            config.write_text("")
+            app.action_rescan()
+            await pilot.pause(0.3)
+            check("fixing it clears the error", not error.display,
+                  error.display)
+    finally:
+        config.unlink(missing_ok=True)
+    return results
+
+
 def window(used: float, resets_in: float) -> dict:
     """A rate-limit window as agent-usage-tap keeps it, resetting in
     resets_in seconds (and 30 more, so a countdown taken a moment later
@@ -849,8 +928,12 @@ def usage_file_cases(mod) -> list[tuple[str, bool, str]]:
 
 
 def main() -> int:
-    # The app remembers folds in $XDG_STATE_HOME; keep the real one out.
+    # The app remembers folds in $XDG_STATE_HOME and reads its settings
+    # from $XDG_CONFIG_HOME and AGENT_SIDEBAR_*; keep the real ones out.
     os.environ["XDG_STATE_HOME"] = tempfile.mkdtemp()
+    os.environ["XDG_CONFIG_HOME"] = tempfile.mkdtemp()
+    for var in [v for v in os.environ if v.startswith("AGENT_SIDEBAR_")]:
+        del os.environ[var]
     mod = load_agent_sidebar()
     failures = 0
     total = 0
@@ -933,6 +1016,8 @@ def main() -> int:
         report("fold", name, ok, detail)
     for name, ok, detail in asyncio.run(account_cases(mod)):
         report("account", name, ok, detail)
+    for name, ok, detail in asyncio.run(config_cases(mod)):
+        report("config", name, ok, detail)
     for name, ok, detail in asyncio.run(usage_cases(mod)):
         report("usage", name, ok, detail)
     for name, ok, detail in usage_file_cases(mod):

@@ -87,6 +87,10 @@ export PATH="${scratch}/bin:${repo}/scripts/.local/bin:${PATH}"
 export AGENT_SIDEBAR_COMMAND="sleep 3600"
 export AGENT_SIDEBAR_AGENT="touch agent-started"
 unset TMUX TMUX_PANE
+# agent-sidebar-config is a uv script. Under the throwaway HOME below, uv
+# would download a Python on its first run, slower than any check waits.
+UV_CACHE_DIR="$(uv cache dir)" UV_PYTHON_INSTALL_DIR="$(uv python dir)"
+export UV_CACHE_DIR UV_PYTHON_INSTALL_DIR
 # The panes' login shells read ~/.profile, and a real one puts the real
 # harnesses ahead of the stand-ins.
 export HOME="${scratch}/home" XDG_CONFIG_HOME="${scratch}/home/.config"
@@ -211,6 +215,23 @@ check "and forgets it was open" equals open_flag ""
 t select-window -t main:two
 sleep 0.5
 check "a closed sidebar stays closed" equals sidebar_count 0
+
+# The width is a setting, and nothing but the config file sets it here.
+config="${XDG_CONFIG_HOME}/agent-sidebar/config.toml"
+mkdir -p "$(dirname "${config}")"
+sidebar_width() { t display-message -p -t "$(sidebar)" '#{pane_width}'; }
+printf 'width = 40\n' >"${config}"
+press M-2
+check "the config file sets its width" equals sidebar_width 40
+press M-2
+check "and M-2 still closes it" equals sidebar_count 0
+printf 'width = \n' >"${config}"
+press M-2
+check "a broken config file still opens it, at the default" \
+    equals sidebar_width "${width}"
+press M-2
+check "and closes it" equals sidebar_count 0
+rm "${config}"
 
 printf 'pane\tmain\t1\t1\t:*\t0\tagent-sidebar\t:/home\t0\tsleep\t:\n' >"${scratch}/save"
 printf 'pane\tmain\t1\t1\t:*\t1\tzsh\t:/home\t1\tzsh\t:\n' >>"${scratch}/save"

@@ -1,0 +1,242 @@
+#!/usr/bin/env -S uv run --script
+# vim: set ft=python:
+# -*- mode: python -*-
+# language: python
+# /// script
+# requires-python = ">=3.13"
+# dependencies = []
+# ///
+"""Checks for agent-sidebar-config: reading the file, what beats what, and
+the command bash asks.
+
+Run: scripts/tests/test-agent-sidebar-config     (or `mise run test`)
+"""
+
+from __future__ import annotations
+
+import importlib.machinery
+import importlib.util
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import tomllib
+from pathlib import Path
+
+SCRIPT = (Path(__file__).resolve().parents[1] / ".local" / "bin"
+          / "agent-sidebar-config")
+# The config the dotfiles link into place.
+SHIPPED = (SCRIPT.parents[3] / "agent-sidebar" / ".config" / "agent-sidebar"
+           / "config.toml")
+
+
+def load_config():
+    loader = importlib.machinery.SourceFileLoader(
+        "agent_sidebar_config", str(SCRIPT))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+# (name, file contents or None for no file, settings wanted or None for
+# broken, a piece of the error wanted)
+READ_CASES = (
+    ("no file is no settings", None, {}, None),
+    ("an empty file is no settings", "", {}, None),
+    ("every setting",
+     'hide = ["orchestrator", "scratch-*"]\n'
+     'harnesses = ["claude", "pi"]\nagent = "codex"\nyolo = false\n'
+     'width = 40\ncommand = "agent-sidebar --debug"\n',
+     {"hide": ["orchestrator", "scratch-*"], "harnesses": ["claude", "pi"],
+      "agent": "codex", "yolo": False, "width": 40,
+      "command": "agent-sidebar --debug"}, None),
+    ("not TOML names the line", 'hide = ["a"]\nwidth = \n', None, "line 2"),
+    ("an unknown setting, such as a typo", 'hidden = ["a"]\n', None,
+     "unknown setting 'hidden'"),
+    ("hide as one name rather than a list", 'hide = "orchestrator"\n', None,
+     "hide must be a list"),
+    ("a list with something not a name in it", "hide = [1]\n", None,
+     "hide must be a list"),
+    ("no harnesses at all", "harnesses = []\n", None, "at least one"),
+    ("yolo as text", 'yolo = "no"\n', None, "yolo must be true or false"),
+    ("width as text", 'width = "40"\n', None, "whole number"),
+    ("width zero", "width = 0\n", None, "whole number"),
+    ("width true", "width = true\n", None, "whole number"),
+    ("an empty agent", 'agent = ""\n', None, "one line of text"),
+    ("a command over two lines", 'command = "a\\nb"\n', None,
+     "one line of text"),
+)
+
+# (name, git config in the project, variables, file, key, want). Per
+# project beats the variables, the variables beat the file, the file beats
+# the default.
+GET_CASES = (
+    ("default", {}, {}, {}, "agent", "claude"),
+    ("file over default", {}, {}, {"agent": "codex"}, "agent", "codex"),
+    ("variable over file", {}, {"AGENT_SIDEBAR_AGENT": "pi"},
+     {"agent": "codex"}, "agent", "pi"),
+    ("project over variable", {"agent-sidebar.harness": "opencode"},
+     {"AGENT_SIDEBAR_AGENT": "pi"}, {"agent": "codex"}, "agent",
+     "opencode"),
+    ("project yolo off", {"agent-sidebar.yolo": "off"}, {}, {"yolo": True},
+     "yolo", False),
+    ("variable yolo off over file", {}, {"AGENT_SIDEBAR_YOLO": "0"},
+     {"yolo": True}, "yolo", False),
+    ("file yolo off", {}, {}, {"yolo": False}, "yolo", False),
+    ("variable harnesses, commas or spaces", {},
+     {"AGENT_SIDEBAR_HARNESSES": "claude, pi codex"}, {"harnesses": ["x"]},
+     "harnesses", ["claude", "pi", "codex"]),
+    ("an empty variable is unset", {}, {"AGENT_SIDEBAR_HARNESSES": " "},
+     {"harnesses": ["pi"]}, "harnesses", ["pi"]),
+    ("variable width", {}, {"AGENT_SIDEBAR_WIDTH": "50"}, {"width": 40},
+     "width", 50),
+    ("a width that is no number falls through", {},
+     {"AGENT_SIDEBAR_WIDTH": "wide"}, {"width": 40}, "width", 40),
+    ("hide has no variable", {}, {"AGENT_SIDEBAR_HIDE": "x"}, {}, "hide",
+     []),
+)
+
+# Session names against hide = ["orchestrator", "scratch-*"].
+HIDE_CASES = (
+    ("the name itself", "orchestrator", True),
+    ("a glob", "scratch-1", True),
+    ("a name only starting with one", "orchestrator-2", False),
+    ("any other", "dotfiles", False),
+    ("case counts", "Orchestrator", False),
+)
+
+
+def git(cwd: Path, *args: str) -> None:
+    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
+
+
+def cli(config_home: Path, *args: str,
+        env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+    base = {k: v for k, v in os.environ.items()
+            if not k.startswith("AGENT_SIDEBAR_")}
+    return subprocess.run(
+        [str(SCRIPT), *args], capture_output=True, text=True,
+        env=base | {"XDG_CONFIG_HOME": str(config_home)} | (env or {}),
+    )
+
+
+def main() -> int:
+    mod = load_config()
+    failures = 0
+    total = 0
+
+    def report(kind: str, name: str, ok: bool, detail: str) -> None:
+        nonlocal failures, total
+        total += 1
+        failures += not ok
+        print(f"{'ok  ' if ok else 'FAIL'}  {kind:8} {name:44} {detail}")
+
+    # git hands a pre-commit hook GIT_DIR and friends, which would aim the
+    # git calls below at this repository.
+    for var in [v for v in os.environ if v.startswith("GIT_")]:
+        del os.environ[var]
+    root = Path(tempfile.mkdtemp())
+    os.environ["GIT_CEILING_DIRECTORIES"] = str(root)
+    file = root / "config.toml"
+
+    for name, text, want, error_part in READ_CASES:
+        file.unlink(missing_ok=True)
+        if text is not None:
+            file.write_text(text)
+        settings, error = mod.load(file)
+        if want is None:
+            ok = (settings == {} and error is not None
+                  and str(file) in error and error_part in error)
+        else:
+            ok = settings == want and error is None
+        report("read", name, ok, "" if ok else f"got={settings!r} {error!r}")
+
+    settings, error = mod.load(SHIPPED)
+    report("shipped", "the linked config is valid", error is None,
+           "" if error is None else error)
+    # Each setting is there, commented out at its default, so uncommenting
+    # one is where to start.
+    commented = re.findall(r"^# (\w+ = .*)$", SHIPPED.read_text(), re.M)
+    shown = tomllib.loads("\n".join(commented))
+    ok = shown == mod.DEFAULTS
+    report("shipped", "shows every setting at its default", ok,
+           "" if ok else f"got={shown!r}")
+
+    got = mod.path({"XDG_CONFIG_HOME": "/cfg"})
+    want = Path("/cfg/agent-sidebar/config.toml")
+    report("path", "under XDG_CONFIG_HOME", got == want,
+           "" if got == want else f"got={got}")
+
+    for index, (name, git_config, env, settings, key, want) in enumerate(
+            GET_CASES):
+        project = root / f"project-{index}"
+        git(root, "init", "-q", str(project))
+        for git_key, value in git_config.items():
+            git(project, "config", git_key, value)
+        got = mod.get(key, str(project), settings=settings, env=env)
+        report("get", name, got == want,
+               "" if got == want else f"want={want!r} got={got!r}")
+
+    got = mod.get("agent", str(root / "project-0"), settings={},
+                  env={"AGENT_SIDEBAR_AGENT": "pi"})
+    ok = got == "pi"
+    report("get", "without a project's config, the variable", ok,
+           "" if ok else f"got={got!r}")
+
+    patterns = ["orchestrator", "scratch-*"]
+    for name, session, want in HIDE_CASES:
+        got = mod.hidden(session, patterns)
+        report("hide", name, got == want, "" if got == want else f"got={got}")
+
+    home = root / "home"
+    (home / "agent-sidebar").mkdir(parents=True)
+    config = home / "agent-sidebar" / "config.toml"
+
+    out = cli(home, "get", "width", "command", "agent", "yolo", "harnesses")
+    want = "36\nagent-sidebar\nclaude\ntrue\nclaude codex opencode pi\n"
+    ok = out.returncode == 0 and out.stdout == want
+    report("cli", "get, one a line, defaults with no file", ok,
+           "" if ok else f"got={out!r}")
+
+    config.write_text('width = 40\nhide = ["a", "b"]\nyolo = false\n')
+    out = cli(home, "get", "width", "hide", "yolo",
+              env={"AGENT_SIDEBAR_WIDTH": "44"})
+    ok = out.returncode == 0 and out.stdout == "44\na b\nfalse\n"
+    report("cli", "get, the variable over the file", ok,
+           "" if ok else f"got={out!r}")
+
+    out = cli(home, "check")
+    ok = out.returncode == 0 and not out.stdout and not out.stderr
+    report("cli", "check is quiet on a good file", ok,
+           "" if ok else f"got={out!r}")
+
+    config.write_text("width = 40\nhide = orchestrator\n")
+    out = cli(home, "check")
+    ok = out.returncode == 1 and str(config) in out.stderr
+    report("cli", "check names a broken file and fails", ok,
+           "" if ok else f"got={out!r}")
+
+    out = cli(home, "get", "width")
+    ok = (out.returncode == 0 and out.stdout == "36\n"
+          and "ignoring" in out.stderr and str(config) in out.stderr)
+    report("cli", "get on a broken file still answers, the defaults", ok,
+           "" if ok else f"got={out!r}")
+
+    out = cli(home, "get", "colour")
+    ok = out.returncode == 2 and not out.stdout
+    report("cli", "get of no such setting fails", ok,
+           "" if ok else f"got={out!r}")
+
+    out = cli(home)
+    ok = out.returncode == 2 and "Usage" in out.stderr
+    report("cli", "no command prints usage", ok, "" if ok else f"got={out!r}")
+
+    print(f"\n{total - failures}/{total} passed")
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
