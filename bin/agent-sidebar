@@ -934,6 +934,7 @@ class Help(ModalScreen[None]):
         with Vertical(classes="dialog"):
             yield Static(Text("Keys", style="bold"))
             yield Static(keys)
+            yield Static(Text("Symbols", style="bold"), classes="legend-title")
             yield Static(legend, classes="legend")
             yield Static("esc close", classes="hint")
 
@@ -1021,6 +1022,9 @@ class AgentSidebar(App[None]):
     .dialog-title {
         color: #cdd6f4;
         margin-bottom: 1;
+    }
+    .dialog > .legend-title {
+        margin-top: 1;
     }
     .dialog > .hint {
         color: #a6adc8;

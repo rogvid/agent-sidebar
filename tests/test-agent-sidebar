@@ -322,6 +322,12 @@ async def app_cases(mod) -> list[tuple[str, bool, str]]:
         await pilot.pause(0.1)
         check("? shows the keys", isinstance(app.screen, mod.Help),
               app.screen)
+        title = app.screen.query_one(".legend-title", Static)
+        check("the symbols have a heading of their own",
+              title.content.plain == "Symbols", title.content)
+        check("set off from the keys by a blank line",
+              title.region.y - app.screen.query(Static)[1].region.bottom == 1,
+              (title.region, app.screen.query(Static)[1].region))
         legend = app.screen.query_one(".legend", Static)
         shown = legend.content.plain
         drawn = [plain(mod.agent_prompt(row("koyr", "%1", harness=harness),
