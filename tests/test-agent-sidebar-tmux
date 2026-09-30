@@ -102,6 +102,8 @@ export HOME="${scratch}/home" XDG_CONFIG_HOME="${scratch}/home/.config"
 mkdir -p "${HOME}"
 # An agent running this test would hand its own account on to every spawn.
 unset CLAUDE_CONFIG_DIR CODEX_HOME PI_CODING_AGENT_DIR
+# What the hooks and keys run would otherwise go unseen.
+export AGENT_SIDEBAR_LOG="${scratch}/sidebar.log"
 
 t -f "${scratch}/tmux.conf" new-session -d -s main -x 160 -y 45 -n one
 t new-window -d -t main: -n two
@@ -180,6 +182,8 @@ dump_state() {
     echo "      tmux messages:"
     t show-messages 2>&1 | grep -E 'key |run-shell|returned|error|fail' |
         head -n 25 | sed 's/^/        /'
+    echo "      sidebar log:"
+    sed 's/^/        /' "${AGENT_SIDEBAR_LOG}" 2>/dev/null | tail -n 10
     echo "      still running:"
     pgrep -af 'bin/agent-sidebar-(tmux|config)' | sed 's/^/        /' || true
     echo "      toggle, traced:"
@@ -194,6 +198,7 @@ equals() {
     [[ "${got}" == "$2" ]]
 }
 open_flag() { t show-options -gqv @agent-sidebar-open; }
+in_messages() { t show-messages | grep -qF "$1"; }
 active_pane() { t display-message -p -t "$(viewed)" '#{pane_id}'; }
 
 check "client attached" equals viewed "$(t display-message -p -t main:one '#{window_id}')"
@@ -282,6 +287,24 @@ check "a broken config file still opens it, at the default" \
 press M-2
 check "and closes it" equals sidebar_count 0
 rm "${config}"
+
+# Anything a key's run-shell prints, its failure included, tmux shows in
+# view mode over your pane, where it takes the next keys: M-2 among them.
+# A toggle that cannot get the lock in time fails.
+pane_mode() { t display-message -p -t "$(viewed)" '#{pane_mode}'; }
+flock "${TMPDIR:-/tmp}/agent-sidebar-$(id -u)-${socket}.lock" sleep 7 &
+holder=$!
+sleep 0.3
+press M-2
+sleep 6
+check "a failed M-2 leaves your pane out of view mode" equals pane_mode ""
+check "and says so on the status line" in_messages "toggle failed"
+check "and logs where" grep -q 'toggle: line [0-9]*: flock' "${AGENT_SIDEBAR_LOG}"
+wait "${holder}"
+press M-2
+check "and the next M-2 works" equals sidebar_count 1
+press M-2
+check "and closes it again" equals sidebar_count 0
 
 printf 'pane\tmain\t1\t1\t:*\t0\tagent-sidebar\t:/home\t0\tsleep\t:\n' >"${scratch}/save"
 printf 'pane\tmain\t1\t1\t:*\t1\tzsh\t:/home\t1\tzsh\t:\n' >>"${scratch}/save"
