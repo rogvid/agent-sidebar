@@ -165,6 +165,18 @@ dump_state() {
         done
     t list-panes -a -F '      pane #{pane_id} #{session_name}:#{window_id} #{pane_width}x#{pane_height} sidebar=#{@agent-sidebar} #{pane_current_command}'
     echo "      open flag: $(open_flag)  M-2: $(t list-keys -T root M-2)"
+    local active
+    active="$(t display-message -p -t "$(viewed)" '#{pane_id}')"
+    echo "      active pane ${active}: mode=$(t display-message -p -t "${active}" '#{pane_mode}')"
+    if [[ "$(t display-message -p -t "${active}" "#{pane_in_mode}")" == 1 ]]; then
+        t send-keys -t "${active}" -X history-top \; \
+            send-keys -t "${active}" -X begin-selection \; \
+            send-keys -t "${active}" -X history-bottom \; \
+            send-keys -t "${active}" -X end-of-line \; \
+            send-keys -t "${active}" -X copy-selection
+        echo "      what the mode shows:"
+        t show-buffer 2>&1 | sed '/^$/d; s/^/        /' | head -n 20
+    fi
     echo "      tmux messages:"
     t show-messages 2>&1 | grep -E 'key |run-shell|returned|error|fail' |
         head -n 25 | sed 's/^/        /'
