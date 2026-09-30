@@ -1,0 +1,349 @@
+#!/usr/bin/env bash
+# agent-msg - messages between agents in tmux panes, every one of them
+# logged, whatever harness each agent runs.
+#
+# Usage: agent-msg COMMAND [ARGS]
+#
+#   send PANE [TEXT...]      paste TEXT (else stdin) into PANE's agent and
+#                            submit it, under a header saying who sent it
+#                            and how to answer; refused while PANE is
+#                            blocked on a dialog
+#   reply ID [TEXT...]       answer message ID: logged for its sender's
+#                            inbox, never pasted into any pane
+#   inbox [--unread] [--mark-read] [--json] [PANE|SESSION]
+#                            messages to PANE (default: your own pane), or
+#                            to anyone in SESSION
+#   log [--json] [--from WHO] [--to WHO] [--with WHO] [--thread ID]
+#       [--last N]           every message, oldest first; WHO is a pane id
+#                            or a session name
+#
+# The log is ${XDG_STATE_HOME:-~/.local/state}/agent-sidebar/messages.jsonl,
+# one message a line, only ever appended to:
+#
+#   {"id":17,"time":"2026-09-30T12:00:00Z","kind":"send",
+#    "from":{"pane":"%137","session":"orchestrator","project":"dotfiles",
+#            "branch":"main"},
+#    "to":{...},"reply_to":null,"text":"..."}
+#
+# kind is send or reply; a reply's reply_to is the id it answers and its to
+# is that message's from. Ids count up from 1. Which messages have been
+# read is kept apart, in messages-read.jsonl, as {"id","time","by"} lines.
+# Every writer holds an flock on messages.lock, so concurrent senders never
+# share an id or interleave lines; readers take it shared.
+#
+# A send is pasted bracketed, so a newline in it does not submit early, and
+# then submitted with Enter. The header names the sender and the command
+# that answers it:
+#
+#   [msg 17 from orchestrator %137 · reply: agent-msg reply 17 "..."]
+#
+# Only a pane agent-scan lists as an agent is sent to: in a shell, Enter
+# would run the text. A blocked pane is refused, because its dialog would
+# take the paste as its answer.
+#
+# A reply only goes to the log. Its recipient may be a pane a human dictates
+# into, and a paste there would land in the middle of their words.
+#
+# Addresses are a pane in a session. Pane ids do not survive a session that
+# is killed and started again, and tmux hands them out again from %0 when
+# its server restarts, while a session's name comes back. So a pane's inbox
+# holds what was sent to it in its session, plus what was sent to any pane
+# of its session that no longer exists: the orchestrator started afresh in
+# its session inherits the mail of the one before it. The pane has to be in
+# the same session to match, so a reused pane id elsewhere matches nothing.
+# inbox SESSION shows everything sent to anyone in SESSION.
+
+set -euo pipefail
+
+readonly dir="${XDG_STATE_HOME:-${HOME}/.local/state}/agent-sidebar"
+readonly log_file="${dir}/messages.jsonl"
+readonly read_file="${dir}/messages-read.jsonl"
+readonly lock_file="${dir}/messages.lock"
+# Time for a harness to take in a paste before Enter submits it.
+readonly settle=0.3
+
+usage() {
+    sed -n '2,/^$/s/^# \{0,1\}//p' "$0"
+}
+
+die() {
+    echo "agent-msg: $*" >&2
+    exit 1
+}
+
+now() {
+    date -u +%Y-%m-%dT%H:%M:%SZ
+}
+
+# Hold the log's lock on fd 9 until the script exits: exclusive, or shared
+# with -s.
+lock() {
+    mkdir -p "${dir}"
+    exec 9>>"${lock_file}"
+    flock "$@" -w 10 9 || die "the message log stayed locked for 10s"
+}
+
+# The lines of a JSONL file as one JSON array, skipping any that are not a
+# JSON object.
+slurp() {
+    if [[ -f "$1" ]]; then
+        jq -cnR '[inputs | fromjson? | select(type == "object")]' "$1"
+    else
+        echo '[]'
+    fi
+}
+
+next_id() {
+    slurp "${log_file}" | jq '[.[].id | numbers] | (max // 0) + 1'
+}
+
+# Project and branch of a directory, tab separated, named the way agent-scan
+# names them.
+identity() {
+    local cwd="$1" common project branch sha
+    if ! common="$(git -C "${cwd}" rev-parse --path-format=absolute \
+        --git-common-dir 2>/dev/null)"; then
+        printf '%s\t%s\n' "$(basename "${cwd}")" "no git"
+        return
+    fi
+    # .git, and the .bare of a git-wt project, are storage inside the
+    # project; a bare app.git is the project itself.
+    if [[ "$(basename "${common}")" == .* ]]; then
+        project="$(basename "$(dirname "${common}")")"
+    else
+        project="$(basename "${common}" .git)"
+    fi
+    if ! branch="$(git -C "${cwd}" symbolic-ref --short -q HEAD)"; then
+        sha="$(git -C "${cwd}" rev-parse --short HEAD 2>/dev/null)" || sha="?"
+        branch="@${sha}"
+    fi
+    printf '%s\t%s\n' "${project}" "${branch}"
+}
+
+# FORMAT expanded for pane PANE, or a failure when there is no such pane:
+# display-message falls back to the current pane rather than fail.
+pane_format() {
+    local out
+    out="$(tmux display-message -p -t "$1" "#{pane_id}	$2" 2>/dev/null)" ||
+        return 1
+    [[ "${out%%	*}" == "$1" ]] || return 1
+    printf '%s\n' "${out#*	}"
+}
+
+# A pane as a message address: {pane, session, project, branch}.
+endpoint() {
+    local info pane="$1" session cwd project branch
+    info="$(pane_format "${pane}" '#{session_name}	#{pane_current_path}')" ||
+        return 1
+    IFS=$'\t' read -r session cwd <<<"${info}"
+    IFS=$'\t' read -r project branch < <(identity "${cwd}")
+    jq -nc --arg pane "${pane}" --arg session "${session}" \
+        --arg project "${project}" --arg branch "${branch}" \
+        '{pane: $pane, session: $session, project: $project, branch: $branch}'
+}
+
+# The message: the arguments joined, else stdin ("-" asks for stdin too).
+message_text() {
+    local text
+    if (($# > 0)) && [[ "$*" != "-" ]]; then
+        text="$*"
+    elif [[ -t 0 ]]; then
+        die "no text: give it after the arguments or on stdin"
+    else
+        text="$(cat)"
+    fi
+    [[ -n "${text//[[:space:]]/}" ]] || die "the message is empty"
+    printf '%s' "${text}"
+}
+
+own_pane() {
+    [[ -n "${TMUX_PANE:-}" ]] ||
+        die "not in a tmux pane (\$TMUX_PANE is unset), so an answer could not find you"
+    endpoint "${TMUX_PANE}" || die "cannot find your own pane ${TMUX_PANE}"
+}
+
+# Append a message to the log; the caller holds the lock.
+append() {
+    local id="$1" kind="$2" from="$3" to="$4" reply_to="$5" text="$6"
+    jq -nc --argjson id "${id}" --arg time "$(now)" --arg kind "${kind}" \
+        --argjson from "${from}" --argjson to "${to}" \
+        --argjson reply_to "${reply_to}" --arg text "${text}" \
+        '{id: $id, time: $time, kind: $kind, from: $from, to: $to,
+          reply_to: $reply_to, text: $text}' >>"${log_file}"
+}
+
+# Paste TEXT into PANE as one bracketed paste, then submit it. The buffer is
+# this process's own, so two senders at once cannot swap texts.
+paste_into() {
+    local pane="$1" text="$2" buffer="agent-msg-$$"
+    printf '%s' "${text}" | tmux load-buffer -b "${buffer}" - &&
+        tmux paste-buffer -p -d -b "${buffer}" -t "${pane}" &&
+        sleep "${settle}" &&
+        tmux send-keys -t "${pane}" Enter
+}
+
+send() {
+    (($# >= 1)) || { usage >&2; exit 2; }
+    local target="$1" text from to row state session id header
+    shift
+    text="$(message_text "$@")"
+    from="$(own_pane)"
+    # Only a pane id: tmux resolves a name to a session's active pane, even
+    # a name that is only the start of another session's.
+    [[ "${target}" =~ ^%[0-9]+$ ]] ||
+        die "${target} is not a pane id; take one like %12 from agent-scan --json"
+    [[ "${target}" != "${TMUX_PANE}" ]] || die "${target} is your own pane"
+    to="$(endpoint "${target}")" || die "no pane ${target}"
+    session="$(jq -r .session <<<"${to}")"
+    row="$(agent-scan --json |
+        jq -c --arg pane "${target}" '.[] | select(.pane_id == $pane)')"
+    [[ -n "${row}" ]] ||
+        die "${target} (${session}) runs no agent that agent-scan knows; a paste would go to whatever runs there"
+    state="$(jq -r .state <<<"${row}")"
+    if [[ "${state}" == blocked ]]; then
+        die "${target} (${session}) is blocked on a dialog ($(jq -r .message <<<"${row}")): a paste could answer it. Send once it is no longer blocked."
+    fi
+
+    lock
+    id="$(next_id)"
+    header="[msg ${id} from $(jq -r .session <<<"${from}") ${TMUX_PANE} · reply: agent-msg reply ${id} \"...\"]"
+    paste_into "${target}" "${header}"$'\n'"${text}" ||
+        die "could not paste into ${target}; nothing was logged"
+    append "${id}" send "${from}" "${to}" null "${text}"
+    echo "sent msg ${id} to ${session} ${target}"
+}
+
+reply() {
+    (($# >= 1)) || { usage >&2; exit 2; }
+    local original="$1" text from to id
+    shift
+    [[ "${original}" =~ ^[0-9]+$ ]] || die "${original} is not a message id"
+    text="$(message_text "$@")"
+    from="$(own_pane)"
+
+    lock
+    to="$(slurp "${log_file}" |
+        jq -c --argjson id "${original}" 'first(.[] | select(.id == $id)) | .from')"
+    [[ -n "${to}" ]] || die "no message ${original}"
+    id="$(next_id)"
+    append "${id}" reply "${from}" "${to}" "${original}" "${text}"
+    echo "reply ${id} logged for $(jq -r '"\(.session) \(.pane)"' <<<"${to}"); they read it with agent-msg inbox"
+}
+
+# How a message reads to a person. .unread is set only in an inbox.
+readonly show='
+    def who: "\(.session) \(.pane)";
+    def stamp: fromdateiso8601? // . | if type == "number"
+        then strflocaltime("%Y-%m-%d %H:%M") else . end;
+    "#\(.id)  \(.time | stamp)  \(.from | who) → \(.to | who)"
+        + (if .reply_to then "  re #\(.reply_to)" else "" end)
+        + (if .unread then "  unread" else "" end),
+    (.text | split("\n") | map("    " + .) | join("\n")),
+    ""
+'
+
+inbox() {
+    local unread=0 mark=0 json=0 who="" pane="" session messages reads live
+    while (($#)); do
+        case "$1" in
+        --unread) unread=1 ;;
+        --mark-read) mark=1 ;;
+        --json) json=1 ;;
+        -*) usage >&2; exit 2 ;;
+        *) [[ -z "${who}" ]] || { usage >&2; exit 2; }; who="$1" ;;
+        esac
+        shift
+    done
+    who="${who:-${TMUX_PANE:-}}"
+    [[ -n "${who}" ]] || die "not in a tmux pane: name a PANE or SESSION"
+    live='[]'
+    if [[ "${who}" == %* ]]; then
+        pane="${who}"
+        session="$(pane_format "${pane}" '#{session_name}')" ||
+            die "no pane ${pane}; its messages are in agent-msg log --to ${pane}"
+        live="$(tmux list-panes -s -t "=${session}" -F '#{pane_id}' | jq -cR '[., inputs]')"
+    else
+        session="${who}"
+    fi
+
+    if ((mark)); then lock; else lock -s; fi
+    reads="$(slurp "${read_file}")"
+    messages="$(slurp "${log_file}" | jq -c \
+        --arg pane "${pane}" --arg session "${session}" --argjson live "${live}" \
+        --argjson reads "${reads}" --argjson unread "${unread}" '
+        ([$reads[].id]) as $read
+        | map(select(.to.session == $session
+                and ($pane == "" or .to.pane == $pane
+                     or (.to.pane | IN($live[]) | not))))
+        | map(.unread = (.id | IN($read[]) | not))
+        | if $unread == 1 then map(select(.unread)) else . end')"
+    if ((mark)); then
+        jq -c --arg time "$(now)" --arg by "${who}" \
+            '.[] | select(.unread) | {id, time: $time, by: $by}' \
+            <<<"${messages}" >>"${read_file}"
+    fi
+
+    if ((json)); then
+        jq . <<<"${messages}"
+    elif [[ "${messages}" == '[]' ]]; then
+        if ((unread)); then echo "no unread messages for ${who}"; else echo "no messages for ${who}"; fi
+    else
+        jq -r ".[] | ${show}" <<<"${messages}"
+    fi
+}
+
+log() {
+    local json=0 from="" to="" with="" thread="" last=""
+    while (($#)); do
+        case "$1" in
+        --json) json=1; shift ;;
+        --from | --to | --with | --thread | --last)
+            (($# >= 2)) || { usage >&2; exit 2; }
+            printf -v "${1#--}" '%s' "$2"
+            shift 2
+            ;;
+        *) usage >&2; exit 2 ;;
+        esac
+    done
+    [[ -z "${thread}" || "${thread}" =~ ^[0-9]+$ ]] || die "--thread takes a message id"
+    [[ -z "${last}" || "${last}" =~ ^[0-9]+$ ]] || die "--last takes a number"
+
+    lock -s
+    local messages
+    messages="$(slurp "${log_file}" | jq -c \
+        --arg from "${from}" --arg to "${to}" --arg with "${with}" \
+        --arg thread "${thread}" --arg last "${last}" '
+        def is($who): if $who | startswith("%")
+            then .pane == $who else .session == $who end;
+        (map({key: (.id | tostring), value: .reply_to}) | from_entries) as $up
+        # A reply answers an older message, so the walk always ends.
+        | def root: $up[tostring] as $parent
+            | if $parent == null or $parent >= . then . else $parent | root end;
+        (if $thread == "" then null else $thread | tonumber | root end) as $root
+        | map(select(
+            ($from == "" or (.from | is($from)))
+            and ($to == "" or (.to | is($to)))
+            and ($with == "" or (.from | is($with)) or (.to | is($with)))
+            and ($root == null or (.id | root) == $root)))
+        | if $last == "" then . else .[([length - ($last | tonumber), 0] | max):] end')"
+
+    if ((json)); then
+        jq . <<<"${messages}"
+    elif [[ "${messages}" == '[]' ]]; then
+        echo "no messages"
+    else
+        jq -r ".[] | ${show}" <<<"${messages}"
+    fi
+}
+
+main() {
+    local command="${1:-}"
+    (($#)) && shift
+    case "${command}" in
+    send | reply | inbox | log) "${command}" "$@" ;;
+    -h | --help | help) usage ;;
+    *) usage >&2; exit 2 ;;
+    esac
+}
+
+main "$@"

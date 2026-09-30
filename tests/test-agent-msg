@@ -1,0 +1,285 @@
+#!/usr/bin/env bash
+# End-to-end checks for agent-msg on a throwaway tmux server: what reaches
+# an agent's pane, what the log keeps, whose inbox a message lands in, and
+# that concurrent writers never share an id.
+#
+# The agents are stand-ins named after harnesses, so agent-scan lists them
+# and reads their state off the screen: one waits at a prompt with
+# bracketed paste on and records every byte it is sent, one sits on a
+# permission dialog.
+#
+# Run: scripts/tests/test-agent-msg     (or `mise run test`)
+
+set -euo pipefail
+
+repo="$(cd "$(dirname "$0")/../.." && pwd)"
+readonly repo
+readonly socket="agent-msg-test-$$"
+scratch="$(mktemp -d)"
+readonly scratch
+
+cleanup() {
+    tmux -L "${socket}" kill-server 2>/dev/null || true
+    rm -rf "${scratch}"
+}
+trap cleanup EXIT
+
+readonly received="${scratch}/received"
+mkdir -p "${scratch}/bin" "${received}"
+# An idle agent: a direct #!/bin/bash, so the process keeps the name claude
+# (and cat does not replace it).
+cat >"${scratch}/bin/claude" <<EOF
+#!/bin/bash
+printf '\e[?2004h❯ '
+stty raw -echo
+cat >"${received}/\${TMUX_PANE#%}"
+EOF
+# An agent waiting on a permission dialog.
+cat >"${scratch}/bin/codex" <<EOF
+#!/bin/bash
+printf 'Do you want to run this command?\n❯ 1. Yes\n  2. No\n\nEsc to cancel\n'
+stty raw -echo
+cat >"${received}/\${TMUX_PANE#%}"
+EOF
+chmod +x "${scratch}/bin/"*
+
+# A pre-commit hook hands down GIT_INDEX_FILE and friends.
+while IFS= read -r var; do unset "${var}"; done < <(env | awk -F= '/^GIT_/ { print $1 }')
+readonly project="${scratch}/app"
+git init -q -b main "${project}"
+
+export PATH="${scratch}/bin:${repo}/scripts/.local/bin:${PATH}"
+# agent-scan is a uv script: keep uv's Python and cache out of the fake
+# home, or every run downloads them again.
+UV_CACHE_DIR="$(uv cache dir)" UV_PYTHON_INSTALL_DIR="$(uv python dir)"
+export UV_CACHE_DIR UV_PYTHON_INSTALL_DIR
+export HOME="${scratch}/home" XDG_STATE_HOME="${scratch}/state"
+mkdir -p "${HOME}"
+readonly messages="${XDG_STATE_HOME}/agent-sidebar/messages.jsonl"
+unset TMUX TMUX_PANE
+
+t() { tmux -L "${socket}" "$@"; }
+
+t -f /dev/null new-session -d -s scratch -x 160 -y 40
+t set-option -g default-shell /bin/sh
+TMUX="$(t display-message -p '#{socket_path},#{pid},0')"
+export TMUX
+
+# Start COMMAND in a new session NAME; print its pane id.
+start() {
+    t new-session -d -s "$1" -x 160 -y 40 -c "${project}" -P -F '#{pane_id}' "$2"
+}
+# Wait until PANE shows TEXT, which a stand-in draws once it listens.
+wait_for() {
+    local _
+    for _ in $(seq 50); do
+        t capture-pane -p -t "$1" | grep -qF "$2" && return 0
+        sleep 0.1
+    done
+    echo "      ${1} never showed ${2}" >&2
+    return 1
+}
+# What PANE's agent has been sent, once the paste has had time to land;
+# with SKIP, only what came after its first SKIP bytes.
+got() {
+    sleep 0.2
+    tail -c "+$((${2:-0} + 1))" "${received}/${1#%}" 2>/dev/null
+}
+size() {
+    wc -c <"${received}/${1#%}" | tr -d ' '
+}
+
+orch="$(start orchestrator claude)"
+worker="$(start app-feat-x claude)"
+dialog="$(start app-feat-y codex)"
+shell="$(start app-shell 'sleep 3600')"
+wait_for "${orch}" '❯'
+wait_for "${worker}" '❯'
+wait_for "${dialog}" 'Esc to cancel'
+
+failures=0
+total=0
+check() {
+    local name="$1"
+    shift
+    total=$((total + 1))
+    if "$@"; then
+        printf 'ok    %s\n' "${name}"
+    else
+        printf 'FAIL  %s\n' "${name}"
+        failures=$((failures + 1))
+    fi
+}
+same() {
+    [[ "$1" == "$2" ]] || { printf '      want %q\n      got  %q\n' "$2" "$1"; return 1; }
+}
+has() {
+    [[ "$1" == *"$2"* ]] || { printf '      want it to contain %q\n      got %q\n' "$2" "$1"; return 1; }
+}
+# A field of message ID in the log, as compact JSON.
+field() {
+    jq -c --argjson id "$1" "select(.id == \$id) | $2" "${messages}"
+}
+count() {
+    if [[ -f "${messages}" ]]; then wc -l <"${messages}" | tr -d ' '; else echo 0; fi
+}
+
+msg() { TMUX_PANE="${orch}" agent-msg "$@"; }
+as_worker() { TMUX_PANE="${worker}" agent-msg "$@"; }
+
+# --- send ---
+
+out="$(msg send "${worker}" "fix the test; then commit")"
+check "send says what it sent where" same "${out}" "sent msg 1 to app-feat-x ${worker}"
+check "the agent gets one bracketed paste, header first, then Enter" \
+    same "$(got "${worker}")" \
+    $'\e[200~[msg 1 from orchestrator '"${orch}"$' · reply: agent-msg reply 1 "..."]\rfix the test; then commit\e[201~\r'
+check "the log keeps who sent it to whom" \
+    same "$(field 1 '[.kind, .from, .to, .reply_to, .text]')" \
+    "$(jq -c -n --arg orch "${orch}" --arg worker "${worker}" '["send",
+        {pane: $orch, session: "orchestrator", project: "app", branch: "main"},
+        {pane: $worker, session: "app-feat-x", project: "app", branch: "main"},
+        null, "fix the test; then commit"]')"
+check "and when" test -n "$(field 1 '.time | fromdateiso8601')"
+
+skip="$(size "${worker}")"
+printf 'line one\nline two;\n' | msg send "${worker}" >/dev/null
+check "text on stdin keeps its newlines inside the paste, so only the last Enter submits" \
+    same "$(got "${worker}" "${skip}")" \
+    $'\e[200~[msg 2 from orchestrator '"${orch}"$' · reply: agent-msg reply 2 "..."]\rline one\rline two;\e[201~\r'
+check "and is logged whole" same "$(field 2 .text)" '"line one\nline two;"'
+
+# --- refusals: nothing pasted, nothing logged ---
+
+before="$(count)"
+out="$(msg send "${dialog}" "yes please" 2>&1)" && status=0 || status=$?
+check "a blocked agent is refused" test "${status}" -ne 0
+check "saying why" has "${out}" "is blocked on a dialog (Do you want to run this command?)"
+check "and its dialog gets nothing" same "$(got "${dialog}")" ""
+
+out="$(msg send "${shell}" "rm -rf /" 2>&1)" && status=0 || status=$?
+check "a pane with no agent is refused" test "${status}" -ne 0
+check "because the text would run there" has "${out}" "runs no agent"
+out="$(msg send %9999 "hi" 2>&1)" && status=0 || status=$?
+check "a pane that does not exist is refused" \
+    same "${status} ${out}" "1 agent-msg: no pane %9999"
+out="$(msg send "${orch}" "hi" 2>&1)" && status=0 || status=$?
+check "so is your own pane" same "${status} ${out}" "1 agent-msg: ${orch} is your own pane"
+out="$(msg send app-feat-x "hi" 2>&1)" && status=0 || status=$?
+check "and a session name, which tmux would resolve loosely" test "${status}" -ne 0
+out="$(msg send "${worker}" "   " 2>&1)" && status=0 || status=$?
+check "an empty message is refused" same "${status} ${out}" "1 agent-msg: the message is empty"
+out="$(TMUX_PANE="" agent-msg send "${worker}" "hi" 2>&1)" && status=0 || status=$?
+check "outside tmux there is nobody to answer" test "${status}" -ne 0
+check "none of those were logged" same "$(count)" "${before}"
+check "or pasted" same "$(got "${worker}" "${skip}")" \
+    $'\e[200~[msg 2 from orchestrator '"${orch}"$' · reply: agent-msg reply 2 "..."]\rline one\rline two;\e[201~\r'
+
+# --- reply ---
+
+out="$(as_worker reply 1 "fixed and committed")"
+check "reply names who will read it" \
+    same "${out}" "reply 3 logged for orchestrator ${orch}; they read it with agent-msg inbox"
+check "it goes to the original sender, answering the message" \
+    same "$(field 3 '[.kind, .from.pane, .to.pane, .reply_to]')" \
+    "[\"reply\",\"${worker}\",\"${orch}\",1]"
+check "and is never pasted into the sender's pane" same "$(got "${orch}")" ""
+out="$(as_worker reply 99 "hi" 2>&1)" && status=0 || status=$?
+check "a reply to no message is refused" same "${status} ${out}" "1 agent-msg: no message 99"
+
+# --- inbox ---
+
+out="$(msg inbox --unread)"
+check "the sender finds the reply in its inbox" has "${out}" "#3  "
+check "with who sent it and what it answers" \
+    has "${out}" "app-feat-x ${worker} → orchestrator ${orch}  re #1  unread"
+check "and its text" has "${out}" $'\n    fixed and committed'
+check "and nothing sent by it" same "$(grep -oE '^#[0-9]+' <<<"${out}")" "#3"
+
+msg inbox --unread --mark-read >/dev/null
+check "read, it leaves the unread inbox" \
+    same "$(msg inbox --unread)" "no unread messages for ${orch}"
+check "but stays in the inbox" has "$(msg inbox)" "#3  "
+check "read by the pane that read it" \
+    same "$(jq -c '[.id, .by]' "${XDG_STATE_HOME}/agent-sidebar/messages-read.jsonl")" \
+    "[3,\"${orch}\"]"
+check "the worker still has both its messages unread" \
+    same "$(as_worker inbox --unread --json | jq -c '[.[] | [.id, .unread]]')" \
+    '[[1,true],[2,true]]'
+check "inbox SESSION reads a session's messages" \
+    same "$(agent-msg inbox --json app-feat-x | jq -c 'map(.id)')" '[1,2]'
+
+# The orchestrator's session is killed and started again under its name:
+# a new pane id, and the old one gone.
+t kill-session -t orchestrator
+orch_before="${orch}"
+orch="$(start orchestrator claude)"
+wait_for "${orch}" '❯'
+as_worker reply 2 "both lines seen" >/dev/null
+check "a restarted session's pane inherits the mail of the pane it replaced" \
+    same "$(msg inbox --json | jq -c 'map(.id)')" '[3,4]'
+second="$(t split-window -d -t "${orch}" -c "${project}" -P -F '#{pane_id}' claude)"
+wait_for "${second}" '❯'
+msg send "${worker}" "status?" >/dev/null
+as_worker reply 5 "all green" >/dev/null
+check "mail to a pane that still lives is not another pane's in its session" \
+    same "$(TMUX_PANE="${second}" agent-msg inbox --json | jq -c 'map(.id)')" '[3,4]'
+check "while the pane it went to has it" \
+    same "$(msg inbox --json | jq -c 'map(.id)')" '[3,4,6]'
+
+# --- log ---
+
+out="$(agent-msg log)"
+check "log shows every message, oldest first" \
+    same "$(grep -oE '^#[0-9]+' <<<"${out}" | tr '\n' ' ')" "#1 #2 #3 #4 #5 #6 "
+check "log --thread follows a conversation from any message in it" \
+    same "$(agent-msg log --json --thread 3 | jq -c 'map(.id)')" '[1,3]'
+check "log --from takes a pane" \
+    same "$(agent-msg log --json --from "${orch_before}" | jq -c 'map(.id)')" '[1,2]'
+check "log --to takes a session" \
+    same "$(agent-msg log --json --to orchestrator | jq -c 'map(.id)')" '[3,4,6]'
+check "log --with takes either side" \
+    same "$(agent-msg log --json --with "${orch}" | jq -c 'map(.id)')" '[5,6]'
+check "log --last keeps the newest" \
+    same "$(agent-msg log --json --last 2 | jq -c 'map(.id)')" '[5,6]'
+check "and all of them when there are fewer" \
+    same "$(agent-msg log --json --last 50 | jq -c 'length')" '6'
+
+# tmux numbers panes from %0 again when its server restarts, so an old
+# message can name a pane id that now belongs to someone else.
+jq -nc --arg worker "${worker}" '{id: 7, time: "2026-01-01T00:00:00Z",
+    kind: "send", from: {pane: "%0", session: "old", project: "app", branch: "main"},
+    to: {pane: $worker, session: "before-restart", project: "app", branch: "main"},
+    reply_to: null, text: "old"}' >>"${messages}"
+check "a pane id used again in another session does not get the old pane's mail" \
+    same "$(as_worker inbox --json | jq -c 'map(.id)')" '[1,2,5]'
+
+# A line cut short by a crash is skipped, not fatal.
+printf '{"id":8,"time":"2026-' >>"${messages}"
+printf '\n' >>"${messages}"
+check "a broken line in the log is skipped" \
+    same "$(agent-msg log --json | jq -c 'length')" '7'
+
+# --- concurrency ---
+
+for i in $(seq 20); do
+    as_worker reply 1 "parallel ${i}" >/dev/null &
+    msg inbox --unread --mark-read >/dev/null &
+done
+wait
+check "concurrent writers never share an id" \
+    same "$(jq -cR 'fromjson? | .id' "${messages}" | sort -n | uniq -d)" ""
+check "or lose a message" \
+    same "$(agent-msg log --json | jq -c '[.[] | select(.text | startswith("parallel"))] | length')" '20'
+check "and every read mark is whole" \
+    same "$(jq -cR 'fromjson? | .id' "${XDG_STATE_HOME}/agent-sidebar/messages-read.jsonl" | wc -l)" \
+    "$(wc -l <"${XDG_STATE_HOME}/agent-sidebar/messages-read.jsonl")"
+check "and none marked twice" \
+    same "$(jq -cR 'fromjson? | .id' "${XDG_STATE_HOME}/agent-sidebar/messages-read.jsonl" | sort -n | uniq -d)" ""
+
+XDG_STATE_HOME="" msg send "${worker}" "hi" >/dev/null
+check "without XDG_STATE_HOME the log is in ~/.local/state" \
+    test -s "${HOME}/.local/state/agent-sidebar/messages.jsonl"
+
+printf '\n%s/%s passed\n' "$((total - failures))" "${total}"
+((failures == 0))
