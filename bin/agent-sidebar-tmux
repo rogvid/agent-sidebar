@@ -58,6 +58,14 @@
 # The sidebar's width, its command and the default harness are settings:
 # see agent-sidebar-config.
 #
+# tmux shows what a key's or hook's run-shell prints, and its exit status
+# when it fails, in view mode over your pane, and view mode then takes the
+# keys you press next: M-2 among them. So toggle, close and follow never
+# fail to tmux. A follow that fails is left for the next one, which the next
+# window event brings; a toggle or close says so on the status line. With
+# AGENT_SIDEBAR_LOG set in tmux's environment, each of them also appends
+# what went wrong, and where, to that file.
+#
 # Whether the sidebar is wanted is the global @agent-sidebar-open option.
 # The pane itself carries the pane option @agent-sidebar. Keeping the two
 # apart is what lets follow bring a fresh sidebar back after the old one
@@ -327,6 +335,30 @@ notify() {
     tmux display-message -d 5000 "agent-sidebar: $1"
 }
 
+# Keep COMMAND's failures out of view mode (see the top of this file).
+quietly() {
+    quiet_command="$1"
+    if [[ -n "${AGENT_SIDEBAR_LOG:-}" ]]; then
+        exec 2>>"${AGENT_SIDEBAR_LOG}"
+    fi
+    # errtrace, so the trap also fires inside functions.
+    set -o errtrace
+    trap 'logged_failure "${LINENO}" "${BASH_COMMAND}"' ERR
+    trap exit_quietly EXIT
+}
+
+logged_failure() {
+    echo "$(date +%T) ${quiet_command}: line $1: $2" >&2
+}
+
+exit_quietly() {
+    local status=$?
+    if ((status != 0)) && [[ "${quiet_command}" != follow ]]; then
+        notify "${quiet_command} failed (exit status ${status})" || true
+    fi
+    exit 0
+}
+
 # The variable a harness picks its account by, for the harnesses that keep
 # more than one. opencode keeps its logins in its share of XDG_DATA_HOME,
 # and moving that would move every other tool's data along with them.
@@ -588,6 +620,7 @@ need() {
 main() {
     case "${1:-}" in
     toggle | close | follow)
+        quietly "$1"
         locked "$1"
         ;;
     prune-resurrect)
