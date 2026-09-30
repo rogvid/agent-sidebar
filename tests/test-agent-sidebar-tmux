@@ -139,6 +139,7 @@ check() {
     local name="$1" _
     shift
     total=$((total + 1))
+    got=""
     for _ in $(seq 60); do
         if "$@" 2>/dev/null; then
             printf 'ok    %s\n' "${name}"
@@ -146,12 +147,16 @@ check() {
         fi
         sleep 0.05
     done
-    printf 'FAIL  %s\n' "${name}"
+    # equals leaves what it last saw in got.
+    printf 'FAIL  %s%s\n' "${name}" "${got:+  got=${got}}"
     failures=$((failures + 1))
 }
 
 not() { ! "$@"; }
-equals() { [[ "$($1)" == "$2" ]]; }
+equals() {
+    got="$($1)"
+    [[ "${got}" == "$2" ]]
+}
 open_flag() { t show-options -gqv @agent-sidebar-open; }
 active_pane() { t display-message -p -t "$(viewed)" '#{pane_id}'; }
 
@@ -194,11 +199,15 @@ t kill-window -t main:three
 check "killing its window brings a fresh one to where you land" in_place
 check "and only one" equals sidebar_count 1
 
-brief_window="$(t new-window -t main: -P -F '#{window_id}' 'sleep 1')"
+# It exits when told to rather than after a set time, which a busy machine
+# could overrun before the checks on it ran.
+brief_window="$(t new-window -t main: -P -F '#{window_id}' \
+    "while [ ! -e '${scratch}/brief-exit' ]; do sleep 0.05; done")"
 check "it follows into a short-lived window" in_place
 window_exists() { t list-windows -a -F '#{window_id}' | grep -qxF "$1"; }
 check "that window starts with the sidebar beside its pane" equals \
     "t display-message -p -t ${brief_window} #{window_panes}" 2
+touch "${scratch}/brief-exit"
 check "when the window's last pane exits, the window closes" not \
     window_exists "${brief_window}"
 check "and the sidebar lands where you do" in_place
