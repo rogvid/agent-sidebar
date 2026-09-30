@@ -1,24 +1,25 @@
 ---
 name: agent-sidebar
-description: Operate the tmux agent-sidebar ecosystem - discover agents with agent-scan, find sessions working on specific projects/branches, and send messages between tmux panes. Use whenever you need to locate agents, check what they are doing, message another session, spawn worktrees/sessions with a harness from an orchestrator, or keep work visible in tmux worktrees. Triggers on agent-sidebar, agent-scan, tmux pane/session, worktree orchestration, or inter-agent messaging.
+description: Operate the tmux agent-sidebar ecosystem - discover agents with agent-scan, find sessions working on specific projects/branches, and message other agents with agent-msg (send, reply, inbox, log). Use whenever you need to locate agents, check what they are doing, message another session, spawn worktrees/sessions with a harness from an orchestrator, or keep work visible in tmux worktrees. Triggers on agent-sidebar, agent-scan, tmux pane/session, worktree orchestration, agent-msg, or inter-agent messaging.
 ---
 
 # Agent Sidebar
 
 You have a sidebar, a scanner and plain tmux around them.
-The sidebar is for humans - you use `agent-scan`, `git-wt` and `tmux` directly.
+The sidebar is for humans - you use `agent-scan`, `agent-msg`, `git-wt` and `tmux` directly.
 
 ## The pieces
 
 | Tool | What it is | You use it for |
 |------|------------|----------------|
 | `agent-scan` | Scans every tmux pane for a harness process | Discovery - who exists, what state they are in |
+| `agent-msg` | Messages between agents, every one logged | Sending, answering and reading messages (section 3) |
 | `agent-sidebar` | Textual TUI down the left of the viewed window (M-2) | Not for you - the user sees it. You get the same data from `agent-scan --json` |
 | `agent-usage-tap` | Sits in front of Claude's statusline command and keeps each account's rate limits | Reading how much of an account's 5h and weekly limits is used (section 5) |
 | `agent-sidebar-tmux` | Moves the sidebar pane with the viewed window, and runs the sidebar's actions on panes | Spawning worktrees, killing panes; the rest are interactive popups for the human |
 | `agent-sidebar-config` | Reads the settings file for the other tools | Checking the settings (section 5) |
 | `git-wt` | Worktree and session naming | Creating/removing worktrees, finding a worktree's session |
-| `tmux send-keys / paste-buffer / capture-pane / list-panes` | tmux itself | Messaging and inspection |
+| `tmux capture-pane / list-panes / send-keys` | tmux itself | Inspection, and keys that are not a message |
 
 `git-wt` layout: a project folder holds `.bare` (shared by every worktree) and one folder per branch, folded to lowercase letters, digits and dashes.
 Branch `feat/x` lives at `<project-dir>/feat-x` with tmux session `<project>-feat-x`.
@@ -137,37 +138,77 @@ tmux list-panes -a -F '#{pane_id} #{session_name}:#{window_index}.#{pane_index} 
 
 Use `agent-scan` for *agent* state, `git-wt`/`tmux list-*` for *worktree/session existence*.
 
-## 3. Send messages to another pane
+## 3. Send messages to another agent
 
-The target is another pane's `pane_id`.
+Use `agent-msg`.
+It pastes into the other agent's input and submits it, whatever harness that agent runs, logs every message, and tells the receiver how to answer.
 
 ```bash
-# Short single-line message, submitted
-tmux send-keys -t "%42" -l "hello, continue with the fix"
-tmux send-keys -t "%42" Enter
+agent-msg send "%42" "also add a logout button"
 
-# Multiline: bracketed paste from stdin, not submitted until you send Enter
-tmux load-buffer -b agent-msg - <<'EOF'
-Fix the failing test in scripts/tests/test-agent-scan
-
-Details:
-- expected: blocked state
+# Multiline: from stdin, one paste, submitted once at the end
+agent-msg send "%42" <<'EOF'
+Review notes:
+- rename LoginForm to SignInForm
+- add a test for the lockout
 EOF
-tmux paste-buffer -p -d -b agent-msg -t "%42"
-tmux send-keys -t "%42" Enter
+# sent msg 17 to shop-feat-login %42
+```
+
+The agent in `%42` gets it under a header naming you and the command that answers:
+
+```text
+[msg 17 from orchestrator %137 · reply: agent-msg reply 17 "..."]
+also add a logout button
+```
+
+When a message with such a header reaches you, answer with the command it names, and put the whole answer in it:
+
+```bash
+agent-msg reply 17 "done: logout button added and committed on feat/login"
+agent-msg reply 17 <<'EOF'      # like send, the text can come on stdin
+done, with one question: ...
+EOF
+```
+
+A reply goes to the log only, never into a pane: the sender may be a pane the user dictates into.
+The sender reads it from its inbox:
+
+```bash
+agent-msg inbox --unread --mark-read   # new messages to you, then mark them read
+agent-msg inbox                        # every message to you
+agent-msg inbox orchestrator           # to anyone in a session
+agent-msg log                          # every message, oldest first
+agent-msg log --thread 17              # the conversation message 17 is in
+agent-msg log --with "%42" --last 5    # --from/--to/--with take a pane id or a session name
+agent-msg log --json                   # a JSON list; inbox --json adds "unread"
 ```
 
 Rules:
-- **Use `pane_id` (`%12`)**, never `session:window.pane` - indices move.
-- **Use `send-keys -l` for text.** Without `-l`, an argument that is a key name (`Enter`, `C-c`, `Escape`) is sent as that key.
-- **A trailing `;` is a tmux command separator**, even with `-l`: `send-keys -l "done;"` sends `done`, and without `-l` the call fails. Write `\;` or use a paste.
-- **Newlines need a paste.** `send-keys` turns each newline into Enter and submits early. `load-buffer -b NAME -` reads the text from stdin (`load-buffer` takes a file, not text); `set-buffer -b NAME "text"` also works.
-- `paste-buffer -p` pastes bracketed, so the target treats it as a paste, not keystrokes; `-d` deletes the buffer afterwards.
-- Read before you write: `tmux capture-pane -p -t "%42" | tail -n 40` and `agent-scan --json | jq '.[] | select(.pane_id=="%42")'`. Interrupting a `running` pane is expensive.
-- To interrupt: `tmux send-keys -t "%42" Escape` (or `C-c`) first, then paste.
+- **Address with `pane_id` (`%12`).** `send` takes nothing else.
+- `send` refuses, with a non-zero exit and the reason, a pane that is `blocked` (its dialog would take the paste as its answer), a pane `agent-scan` does not list (in a shell, Enter runs the text), and your own pane. Nothing is pasted or logged then.
+- **Blocked is not yours to answer.** Do not get round the refusal with raw tmux. Tell the user, or send once `agent-scan` shows the pane is no longer `blocked`.
+- Replies are not pushed to anyone. After sending something that wants an answer, check `agent-msg inbox --unread` once the other agent turns `done` in `agent-scan`.
+- Your inbox follows your tmux session: after your session is started again, with a new pane id, messages to the pane you had before are still yours.
+- Read before you write: `agent-scan --json | jq '.[] | select(.pane_id=="%42")'`, and its `message_full` for what it last said. A `running` agent gets your message in the middle of its turn.
 - After sending, poll `agent-scan` once after 1-2s to confirm the state changed.
 - **A harness you just started is not listening yet.** For its first seconds, keys sent to it are lost - text can land in its input with the Enter dropped. Give a new agent its task on its launch command line (section 4), not as a message after it.
-- Type a harness command into a pane only when its shell is in front: `tmux display-message -p -t "%42" '#{pane_current_command}'`. Typed into a running harness, it is just a message to that agent.
+- The log is `${XDG_STATE_HOME:-~/.local/state}/agent-sidebar/messages.jsonl`, one JSON message a line: `id`, `time`, `kind` (`send` or `reply`), `from` and `to` (`pane`, `session`, `project`, `branch`), `reply_to` and `text`.
+
+### Raw tmux, only for what agent-msg does not do
+
+Keys that are not a message, such as interrupting an agent, and commands typed into a plain shell.
+
+```bash
+tmux send-keys -t "%42" Escape            # interrupt (or C-c), then agent-msg send
+tmux send-keys -t "%42" -l "make test"    # a command into a shell
+tmux send-keys -t "%42" Enter
+```
+
+- **Use `send-keys -l` for text.** Without `-l`, an argument that is a key name (`Enter`, `C-c`, `Escape`) is sent as that key.
+- **A trailing `;` is a tmux command separator**, even with `-l`: `send-keys -l "done;"` sends `done`, and without `-l` the call fails. Write `\;`.
+- `send-keys` turns each newline into Enter and submits early.
+- Type a command into a pane only when its shell is in front: `tmux display-message -p -t "%42" '#{pane_current_command}'`. Typed into a running harness, it is an unlogged message to that agent.
 
 ## 4. Orchestrator pattern - one main session spawning workers
 
@@ -219,6 +260,9 @@ To bring the user to the worker only when they ask: `tmux switch-client -t "$wor
 ```bash
 # Who needs me?
 agent-scan --json | jq -r '.[] | "\(.state) \(.project)/\(.branch) \(.pane_id): \(.message)"'
+
+# What did they answer?
+agent-msg inbox --unread --mark-read
 
 # Queue top (most urgent first)
 next=$(agent-scan --json | jq -r '.[0].pane_id // empty')
@@ -325,7 +369,8 @@ agent-sidebar-config path           # where the file is
 - Never kill a session, window or pane you did not create for this task, and never the one holding `$TMUX_PANE` - that is the user's. When a `tmux` or `git-wt` command fails, stop and report; do not clean up by killing.
 - Do not parse the `agent-scan` table - use `--json`.
 - Do not address panes by `target` - it renumbers.
-- Do not `send-keys` text without `-l`, or multiline or `;`-ending text without a paste.
+- Do not message an agent with `tmux send-keys` or `paste-buffer` - use `agent-msg send`, which checks the pane and logs it. Do not answer a message by sending into its sender's pane - use `agent-msg reply`.
+- Do not `send-keys` text without `-l`, or multiline or `;`-ending text at all.
 - Do not poll `agent-scan` faster than 1s - it walks the process tree and captures every pane.
 - Do not judge a pane by its `message` - check `state`. Do not interrupt `running` unless you must.
 - Do not call popup actions (`new-worktree`, `review`, `git`, `pr`, `remove-worktree`, `open`) expecting silence - they take over the user's screen.

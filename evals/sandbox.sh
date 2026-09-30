@@ -62,11 +62,12 @@ EOF
 
     # Shells that keep the stubs first on PATH: zsh's rc files would put the
     # real claude back in front. PATH entries with spaces (Windows ones under
-    # WSL) would split the command, so they are left out.
+    # WSL) would split the command, so they are left out. The agent-sidebar
+    # state, agent-msg's log among it, stays in the sandbox.
     local path
     path="${dir}/stubs:$(tr : '\n' <<<"${PATH}" | grep -v ' ' | paste -sd:)"
-    printf 'set -g default-command "env PATH=%s bash --norc --noprofile"\n' "${path}" \
-        >"${dir}/tmux.conf"
+    printf 'set -g default-command "env PATH=%s XDG_STATE_HOME=%s bash --norc --noprofile"\n' \
+        "${path}" "${dir}/state" >"${dir}/tmux.conf"
     t -f "${dir}/tmux.conf" new-session -d -s shop -c "${dir}/projects/shop/main" -x 200 -y 50
     t new-session -d -s shop-feat-login -c "${dir}/projects/shop/feat-login" -x 200 -y 50
     t send-keys -t =shop-feat-login: claude Enter

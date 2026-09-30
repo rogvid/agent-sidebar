@@ -124,6 +124,7 @@ for task in "${tasks[@]}"; do
     while [[ -e "${out_root}/${task}-${n}" ]]; do n=$((n + 1)); done
     d="${out_root}/${task}-${n}"
     L="${d}/logs"
+    messages="${d}/state/agent-sidebar/messages.jsonl"
     sock="${d}/tmux/tmux-$(id -u)/default"
     bad=0
     "${here}/sandbox.sh" up "${d}"
@@ -145,10 +146,12 @@ for task in "${tasks[@]}"; do
     message)
         expect "the feat/login agent got it" has "${L}/1.in" "logout"
         expect "and it was submitted" submitted "${L}/1.in"
+        expect "sent with agent-msg" has "${messages}" "logout"
         expect "the blog agent was left alone" empty "${L}/2.in"
         ;;
     multiline)
         expect "one bracketed paste, then one Enter" one_paste "${L}/1.in"
+        expect "sent with agent-msg" has "${messages}" "SignInForm"
         expect "all three notes arrived" \
             bash -c "grep -qa SignInForm '${L}/1.in' && grep -qa current-password '${L}/1.in' && grep -qa lockout '${L}/1.in'"
         expect "the blog agent was left alone" empty "${L}/2.in"
