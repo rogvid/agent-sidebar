@@ -105,22 +105,23 @@ sidebar_pane() {
         awk '$2 == "1" { print $1; exit }'
 }
 
-# Whether a client process was started by the tmux server itself. A popup
-# that attaches a nested client (M-3) is a client too, and it is the most
+# Whether a client runs inside one of this server's popups. A popup that
+# attaches a nested client (M-1, M-3) is a client too, and it is the most
 # recently active one while it is open, but you are looking through the
 # client underneath it.
-spawned_by_server() {
-    local pid="$1" server_pid="$2" _
-    for _ in 1 2 3 4; do
-        pid="$(ps -o ppid= -p "${pid}" 2>/dev/null | tr -d ' ')"
-        if [[ -z "${pid}" || "${pid}" -le 1 ]]; then
-            return 1
-        fi
-        if [[ "${pid}" == "${server_pid}" ]]; then
-            return 0
-        fi
-    done
-    return 1
+#
+# A popup runs its command as the leader of a session of its own, on the
+# popup's terminal, so a client in it has a session leader the server
+# started. Asked of the session rather than of the client's parents: as a
+# popup closes its shell goes first, and for that moment the client, still
+# listed, has no parent that leads back to the server. Its session leader is
+# gone by then, and so is a client that has exited.
+in_popup() {
+    local pid="$1" server_pid="$2" leader parent
+    leader="$(ps -o sid= -p "${pid}" 2>/dev/null | tr -d ' ')"
+    [[ -n "${leader}" ]] || return 0
+    parent="$(ps -o ppid= -p "${leader}" 2>/dev/null | tr -d ' ')"
+    [[ -z "${parent}" || "${parent}" == "${server_pid}" ]]
 }
 
 # "<window_id> <zoomed>" for the window you are looking at, or nothing when
@@ -141,7 +142,7 @@ viewed_window() {
     )
     for client in "${clients[@]}"; do
         read -r _ pid window zoomed <<<"${client}"
-        if spawned_by_server "${pid}" "${server_pid}"; then
+        if in_popup "${pid}" "${server_pid}"; then
             continue
         fi
         echo "${window} ${zoomed}"
