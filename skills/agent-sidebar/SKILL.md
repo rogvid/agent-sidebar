@@ -359,8 +359,8 @@ They exist only when Claude's `statusLine.command` in settings.json runs through
 Check them before spawning a batch of workers on an account.
 
 Sidebar keys (for the human): `⏎` jump, `m` messages, `n` new worktree, `o` open project, `d` review, `g` git, `p` pr, `x` kill, `X` remove worktree, `h`/`l` collapse/expand project, `H`/`L` all, `c`/`C` one line for agent/all, `s` settings (config.toml in nvim), `r` rescan, `esc` back, `q` close, `?` help.
-`m` switches to the agent-msg log, newest first, where `⏎` jumps to the pane a message went to and `m` or `esc` goes back.
-`✉2` on an agent means two messages in its inbox are unread; the sidebar only reads the log, so only `agent-msg inbox --mark-read` clears it.
+`m` switches to the agent-msg log, newest first, where the highlighted message shows up to ten lines in place, `t` pages through all of it and its thread in a popup, `⏎` jumps to the pane it went to, and `m` or `esc` goes back.
+`✉2` on an agent means two messages in its inbox are unread; the sidebar only reads the log, so only its receiver clears it, with `agent-msg verify` or `agent-msg inbox --mark-read`.
 
 New-worktree dialog (`n`):
 - Branch name input, a harness list and a `yolo` checkbox. Tab moves between them, j/k move in the list, ⏎ creates from any field, esc cancels.

@@ -358,9 +358,9 @@ async def app_cases(mod) -> list[tuple[str, bool, str]]:
 
         titles = [c.title for c in app.get_system_commands(app.screen)]
         want = [f"{a.title} ({a.label})" for a in mod.ACTIONS
-                if a.name != "help"]
-        check("every action is in the command palette", titles == want,
-              titles)
+                if a.name != "help" and a.name not in mod.MESSAGE_ONLY]
+        check("every agents action is in the command palette",
+              titles == want, titles)
 
         before = len(fake.ran)
         fake.rows = [row("dotfiles", "%2", "blocked"), row("koyr", "%3"),
@@ -783,6 +783,59 @@ async def config_cases(mod) -> list[tuple[str, bool, str]]:
     return results
 
 
+async def help_cases(mod) -> list[tuple[str, bool, str]]:
+    """The help in a pane too short for it, and in each view."""
+    from textual.widgets import Static
+
+    results: list[tuple[str, bool, str]] = []
+
+    def check(name: str, ok: bool, detail: object) -> None:
+        results.append((name, ok, "" if ok else f"got={detail!r}"))
+
+    fake = Fake([row("koyr", "%1")], {"%1"})
+    app = mod.AgentSidebar(scan=fake.scan, panes_here=fake.panes_here,
+                           run=fake.run, pull_requests=fake.pull_requests,
+                           accounts=fake.list_accounts, panes=fake.list_panes,
+                           messages=Path(tempfile.mkdtemp()))
+
+    async def keys() -> list[str]:
+        await pilot.press("question_mark")
+        await pilot.pause(0.1)
+        shown = [line.split()[0] for line in
+                 plain(app.screen.query(Static)[1].content).splitlines()]
+        await pilot.press("escape")
+        await pilot.pause(0.1)
+        return shown
+
+    async with app.run_test(size=(36, 20)) as pilot:
+        await pilot.pause(0.3)
+        await pilot.press("question_mark")
+        await pilot.pause(0.1)
+        legend = app.screen.query_one(".legend", Static)
+        shown = legend.content.plain
+        check("in a short pane no legend line wraps",
+              legend.size.height == len(shown.splitlines()),
+              (legend.size, shown))
+        check("while the help scrolls",
+              app.screen.max_scroll_y > 0, app.screen.max_scroll_y)
+        await pilot.press("j", "j")
+        await pilot.pause(0.1)
+        check("with j", app.screen.scroll_y > 0, app.screen.scroll_y)
+        await pilot.press("escape")
+        await pilot.pause(0.1)
+
+        shown = await keys()
+        check("the agents' help has no message keys",
+              "x" in shown and "t" not in shown, shown)
+        await pilot.press("m")
+        await pilot.pause(0.1)
+        shown = await keys()
+        check("the messages' help has only theirs",
+              "t" in shown and "m" in shown and "x" not in shown
+              and "h/l" not in shown, shown)
+    return results
+
+
 def message(id: int, sender: tuple[str, str], to: tuple[str, str],
             text: str = "hello", reply_to: int | None = None,
             ago: float = 120) -> dict:
@@ -1050,6 +1103,9 @@ async def message_cases(mod) -> list[tuple[str, bool, str]]:
         await press("k", "k")
         check("k moves up a message", listing.highlighted_option.id == "3",
               listing.highlighted_option)
+        await press("t")
+        check("t pages through the message's thread",
+              fake.ran[-1] == (mod.GLUE, "thread", "3"), fake.ran[-1:])
         await press("enter")
         check("enter jumps to the pane it went to",
               fake.ran[-1] == ("tmux", "switch-client", "-t", "%2"),
@@ -1408,6 +1464,20 @@ def main() -> int:
         report("messages", name, ok, detail)
     for name, ok, detail in asyncio.run(message_cases(mod)):
         report("messages", name, ok, detail)
+    for name, ok, detail in asyncio.run(help_cases(mod)):
+        report("help", name, ok, detail)
+
+    long = message(1, ("a", "%1"), ("b", "%2"),
+                   "x" * 70 + "\n" + "\n".join(f"line {i}" for i in range(60)))
+    shown = [line.rstrip() for line in plain(
+        mod.message_prompt(long, False, time.time(), full=True),
+        width=35).splitlines()]
+    ok = (len(shown) == 2 + mod.EXPANDED + 1
+          and shown[2:5] == ["   " + "x" * 32, "   " + "x" * 32,
+                             "   xxxxxx"]
+          and shown[-1] == "   … 53 more lines, t shows all")
+    report("messages", "a long message shows ten lines in place, then how many more",
+           ok, "" if ok else f"got={shown!r}")
 
     for name, seconds, want in COUNTDOWN_CASES:
         got = mod.countdown(seconds)

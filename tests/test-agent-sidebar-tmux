@@ -59,6 +59,11 @@ cat >"${scratch}/bin/tv" <<EOF
 #!/bin/sh
 echo "\$*" >"${scratch}/tv-args"
 EOF
+cat >"${scratch}/bin/less" <<EOF
+#!/bin/sh
+echo "\$*" >"${scratch}/less-args"
+cat >"${scratch}/less-in"
+EOF
 # A harness that notes the account it was started on.
 cat >"${scratch}/bin/claude" <<'EOF'
 #!/bin/sh
@@ -330,6 +335,23 @@ check "kill kills the pane" not pane_alive "${main_agent}"
 
 act open
 check "open picks from the projects channel" equals "cat ${scratch}/tv-args" projects
+
+# A thread of two messages and one besides, as agent-msg logs them.
+state="${HOME}/.local/state/agent-sidebar"
+mkdir -p "${state}"
+for message in '1 null' '2 1' '3 null'; do
+    read -r id reply_to <<<"${message}"
+    jq -nc --argjson id "${id}" --argjson reply_to "${reply_to}" \
+        '{id: $id, time: "2026-09-30T12:00:00Z", kind: "send",
+          from: {pane: "%1", session: "a", project: "a", branch: "main"},
+          to: {pane: "%2", session: "b", project: "b", branch: "main"},
+          reply_to: $reply_to, text: "text \($id)"}'
+done >"${state}/messages.jsonl"
+paged() { grep -oE '^#[0-9]+' "${scratch}/less-in" | paste -sd ' '; }
+act thread 2
+check "thread pages the message's thread" equals paged "#1 #2"
+check "opened at the message" equals "cat ${scratch}/less-args" "-R +/^#2  "
+check "thread takes only a message id" not act thread '1; true'
 
 printf '\n%s/%s passed\n' "$((total - failures))" "${total}"
 ((failures == 0))

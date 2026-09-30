@@ -45,6 +45,8 @@
 #                            session (tv projects)
 #   config                   edit the settings file in nvim, in a popup
 #                            that closes when nvim does
+#   thread ID                agent-msg message ID and the rest of its
+#                            thread in less, in a popup, opened at ID
 #
 # An account is a harness's config folder next to its default one, named by
 # its suffix, when it holds a login: ~/.claude-NAME, ~/.codex-NAME,
@@ -76,6 +78,9 @@ usage() {
 # last `mise bootstrap` is not linked yet.
 config_reader="$(dirname "$(realpath "$0")")/agent-sidebar-config"
 readonly config_reader
+# agent-msg, from beside it the same way.
+messenger="$(dirname "$(realpath "$0")")/agent-msg"
+readonly messenger
 
 # One setting, from the variables, the config file and the defaults. Asked
 # only where it is needed: each ask starts Python.
@@ -304,6 +309,11 @@ edit_config() {
     file="$("${config_reader}" path)"
     mkdir -p "$(dirname "${file}")"
     popup "$(dirname "${file}")" nvim "${file}"
+}
+
+# A message's whole thread, oldest first, opened at the message itself.
+show_thread() {
+    "${messenger}" log --thread "$1" | less -R "+/^#$1  "
 }
 
 # Keep a popup open until a key is pressed, so its output can be read.
@@ -631,6 +641,11 @@ main() {
     config)
         edit_config
         ;;
+    thread)
+        need 2 "$@"
+        [[ "$2" =~ ^[0-9]+$ ]] || { usage >&2; exit 2; }
+        popup "${HOME}" "$0" _thread "$2"
+        ;;
     # Run inside the popups above.
     _worktree-add)
         worktree_add "$2"
@@ -640,6 +655,9 @@ main() {
         ;;
     _pull-request)
         pull_request
+        ;;
+    _thread)
+        show_thread "$2"
         ;;
     -h | --help | help)
         usage

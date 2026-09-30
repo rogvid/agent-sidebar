@@ -28,10 +28,11 @@ current window: `?` lists them and ctrl+p searches them. When an agent in
 another window stops and needs you, tmux says so on the status line.
 
 `m` switches to the messages agent-msg carries between agents, newest
-first, and back. The highlighted message shows in full, and `⏎` jumps to
-the pane it went to. `✉2` on an agent says two messages to it are unread.
-The sidebar only reads agent-msg's log; `agent-msg inbox --mark-read` is
-what marks a message read.
+first, and back. The highlighted message shows in place, up to ten lines;
+`t` pages through all of it and the rest of its thread in a popup, and `⏎`
+jumps to the pane it went to. `✉2` on an agent says two messages to it are
+unread. The sidebar only reads agent-msg's log: a message is marked read
+when its receiver verifies it or reads its inbox with --mark-read.
 
 With many agents open, `h` folds a project into one line that counts its
 agents by state, and `c` puts an agent on one line. Both are remembered in
@@ -121,6 +122,8 @@ USAGE_WARN, USAGE_HIGH = 60, 85
 UNREAD = "✉"
 # How many of the newest messages the messages view lists.
 LATEST = 100
+# How many lines of the highlighted message show in place; t shows the rest.
+EXPANDED = 10
 
 # Harness colours/icons are fixed; roles are the harness's --agent
 # (opencode's build/plan or any custom one) and get a stable colour
@@ -357,6 +360,8 @@ ACTIONS = (
            "Switch the agent between one line and three"),
     Action("compact_all", "C", "C", "One line for all",
            "Switch every agent between one line and three"),
+    Action("thread", "t", "t", "Thread",
+           "Read the message and the rest of its thread in a popup"),
     Action("config", "s", "s", "Settings",
            "Edit config.toml in nvim; the sidebar rescans when you quit"),
     Action("rescan", "r", "r", "Rescan", "Scan again now"),
@@ -370,8 +375,11 @@ ACTIONS = (
 # What still makes sense in the messages view; the rest act on the agent
 # under a cursor that is not on screen.
 MESSAGE_ACTIONS = frozenset(
-    {"jump", "messages", "open", "config", "rescan", "back", "close", "help"})
+    {"jump", "messages", "thread", "open", "config", "rescan", "back",
+     "close", "help"})
 AGENT_ACTIONS = frozenset(a.name for a in ACTIONS) - MESSAGE_ACTIONS
+# And what makes sense only there.
+MESSAGE_ONLY = frozenset({"thread"})
 
 
 # Opposites share a line in the help, so it still fits a short pane.
@@ -835,10 +843,27 @@ class Address:
         yield Text.assemble(session, (pane, MUTED))
 
 
+class Clipped:
+    """Text wrapped to the column it lands in, at most so many lines of it:
+    a long message would push every other one off the list."""
+
+    def __init__(self, text: Text, lines: int) -> None:
+        self.text = text
+        self.lines = lines
+
+    def __rich_console__(self, console: Any, options: Any) -> Iterable[Text]:
+        lines = self.text.wrap(console, options.max_width, overflow="fold")
+        yield from lines[:self.lines]
+        if len(lines) > self.lines:
+            yield Text(f"… {len(lines) - self.lines} more lines, t shows all",
+                       style=MUTED, no_wrap=True, overflow="ellipsis")
+
+
 def message_prompt(
     message: Row, unread: bool, now: float, full: bool = False,
 ) -> Group:
-    """Who sent it, to whom, and its first line, or all of it when full."""
+    """Who sent it, to whom, and its first line, or when full as much of
+    it as fits in place."""
     sent = sent_at(message)
     top = grid()
     top.add_row(
@@ -860,8 +885,8 @@ def message_prompt(
     body = Table.grid(expand=True)
     body.add_column(width=3, no_wrap=True)
     if full:
-        body.add_column(ratio=1, overflow="fold")
-        body.add_row(Text(""), Text(text))
+        body.add_column(ratio=1)
+        body.add_row(Text(""), Clipped(Text(text), EXPANDED))
     else:
         body.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
         body.add_row(Text(""), Text(text.split("\n")[0], style=MUTED))
@@ -1112,7 +1137,14 @@ class Confirm(ModalScreen[bool]):
 
 
 class Help(ModalScreen[None]):
-    BINDINGS = [Binding("escape,question_mark,q", "dismiss", "close")]
+    """The keys of the view on screen, and what the symbols mean. In a
+    short pane it scrolls, with j/k too."""
+
+    BINDINGS = [
+        Binding("escape,question_mark,q", "dismiss", "close"),
+        Binding("j,down", "scroll_down", "down", show=False),
+        Binding("k,up", "scroll_up", "up", show=False),
+    ]
 
     def compose(self) -> ComposeResult:
         keys = Table.grid(padding=(0, 2))
@@ -1122,6 +1154,8 @@ class Help(ModalScreen[None]):
         by_name = {action.name: action for action in ACTIONS}
         seconds = {second for second, _ in HELP_PAIRS.values()}
         for action in ACTIONS:
+            if not self.app.check_action(action.name, ()):
+                continue
             if action.name in HELP_PAIRS:
                 second, title = HELP_PAIRS[action.name]
                 keys.add_row(f"{action.label}/{by_name[second].label}", title)
@@ -1231,6 +1265,13 @@ class AgentSidebar(App[None]):
     ModalScreen {
         background: #181825;
         align: center middle;
+    }
+    /* A pane too short for the help scrolls it. A scrollbar one cell wide
+       still leaves room for the legend's longest line. */
+    Help {
+        scrollbar-size-vertical: 1;
+        scrollbar-background: #181825;
+        scrollbar-color: #45475a;
     }
     .dialog {
         width: 100%;
@@ -1367,7 +1408,11 @@ class AgentSidebar(App[None]):
                 )
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool:
-        return not (self._view == "messages" and action in AGENT_ACTIONS)
+        """Only the actions of the view on screen: its keys, the help and
+        the command palette all ask."""
+        if self._view == "messages":
+            return action not in AGENT_ACTIONS
+        return action not in MESSAGE_ONLY
 
     def compose(self) -> ComposeResult:
         yield Static(id="header")
@@ -1757,6 +1802,13 @@ class AgentSidebar(App[None]):
             self.bell()
             return
         await self._run("tmux", "switch-client", "-t", target)
+
+    def action_thread(self) -> None:
+        option = self.query_one("#messages", OptionList).highlighted_option
+        if option is None or option.id not in self._by_message:
+            self.bell()
+            return
+        self.glue("thread", option.id)
 
     def action_messages(self) -> None:
         self.show_view("agents" if self._view == "messages" else "messages")
