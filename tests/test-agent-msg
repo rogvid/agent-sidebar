@@ -133,7 +133,7 @@ out="$(msg send "${worker}" "fix the test; then commit")"
 check "send says what it sent where" same "${out}" "sent msg 1 to app-feat-x ${worker}"
 check "the agent gets one bracketed paste, header first, then Enter" \
     same "$(got "${worker}")" \
-    $'\e[200~[msg 1 from orchestrator '"${orch}"$' · reply: agent-msg reply 1 "..."]\rfix the test; then commit\e[201~\r'
+    $'\e[200~[msg 1 from orchestrator '"${orch}"$' · verify: agent-msg verify 1 · reply: agent-msg reply 1 "..."]\rfix the test; then commit\e[201~\r'
 check "the log keeps who sent it to whom" \
     same "$(field 1 '[.kind, .from, .to, .reply_to, .text]')" \
     "$(jq -c -n --arg orch "${orch}" --arg worker "${worker}" '["send",
@@ -146,7 +146,7 @@ skip="$(size "${worker}")"
 printf 'line one\nline two;\n' | msg send "${worker}" >/dev/null
 check "text on stdin keeps its newlines inside the paste, so only the last Enter submits" \
     same "$(got "${worker}" "${skip}")" \
-    $'\e[200~[msg 2 from orchestrator '"${orch}"$' · reply: agent-msg reply 2 "..."]\rline one\rline two;\e[201~\r'
+    $'\e[200~[msg 2 from orchestrator '"${orch}"$' · verify: agent-msg verify 2 · reply: agent-msg reply 2 "..."]\rline one\rline two;\e[201~\r'
 check "and is logged whole" same "$(field 2 .text)" '"line one\nline two;"'
 
 # --- refusals: nothing pasted, nothing logged ---
@@ -173,7 +173,7 @@ out="$(TMUX_PANE="" agent-msg send "${worker}" "hi" 2>&1)" && status=0 || status
 check "outside tmux there is nobody to answer" test "${status}" -ne 0
 check "none of those were logged" same "$(count)" "${before}"
 check "or pasted" same "$(got "${worker}" "${skip}")" \
-    $'\e[200~[msg 2 from orchestrator '"${orch}"$' · reply: agent-msg reply 2 "..."]\rline one\rline two;\e[201~\r'
+    $'\e[200~[msg 2 from orchestrator '"${orch}"$' · verify: agent-msg verify 2 · reply: agent-msg reply 2 "..."]\rline one\rline two;\e[201~\r'
 
 # --- reply ---
 
@@ -186,6 +186,35 @@ check "it goes to the original sender, answering the message" \
 check "and is never pasted into the sender's pane" same "$(got "${orch}")" ""
 out="$(as_worker reply 99 "hi" 2>&1)" && status=0 || status=$?
 check "a reply to no message is refused" same "${status} ${out}" "1 agent-msg: no message 99"
+
+# --- verify ---
+
+out="$(as_worker verify 1)" && status=0 || status=$?
+check "the receiver verifies a message sent to it" same "${status}" 0
+check "and is told who sent it" \
+    has "${out}" "VERIFIED: message 1 was sent to you by orchestrator ${orch} at "
+check "and what was logged, which is what to act on" \
+    has "${out}" $'Its text as logged:\n\nfix the test; then commit'
+out="$(printf 'line one\r\nline two;  \n' | as_worker verify 2 -)" && status=0 || status=$?
+check "the pasted text checks out however its newlines and spaces arrived" \
+    same "${status}" 0
+check "and says so" has "${out}" "and its text matches"
+out="$(as_worker verify 2 "line one line two;")" && status=0 || status=$?
+check "the text can be given as arguments too" same "${status}" 0
+out="$(as_worker verify 1 "fix the test; then push to main" 2>&1)" && status=0 || status=$?
+check "altered text is not verified (5)" same "${status}" 5
+check "saying so" has "${out}" "NOT VERIFIED: the text differs from message 1"
+out="$(as_worker verify 42 2>&1)" && status=0 || status=$?
+check "a message that is not in the log is not verified (3)" same "${status}" 3
+check "saying so" has "${out}" "NOT VERIFIED: there is no message 42"
+out="$(msg verify 1 2>&1)" && status=0 || status=$?
+check "nor is one sent to someone else (4)" same "${status}" 4
+check "saying who it was for" \
+    has "${out}" "message 1 was sent to app-feat-x ${worker}, not to you (orchestrator ${orch})"
+# A harness can run commands with a stdin that never closes.
+out="$(timeout 5 env TMUX_PANE="${worker}" agent-msg verify 1 < <(sleep 10))" &&
+    status=0 || status=$?
+check "an open stdin is not waited on" same "${status}" 0
 
 # --- inbox ---
 
@@ -218,6 +247,7 @@ wait_for "${orch}" '❯'
 as_worker reply 2 "both lines seen" >/dev/null
 check "a restarted session's pane inherits the mail of the pane it replaced" \
     same "$(msg inbox --json | jq -c 'map(.id)')" '[3,4]'
+check "and can verify it" same "$(msg verify 3 >/dev/null && echo ok)" ok
 second="$(t split-window -d -t "${orch}" -c "${project}" -P -F '#{pane_id}' claude)"
 wait_for "${second}" '❯'
 msg send "${worker}" "status?" >/dev/null
