@@ -67,6 +67,11 @@
 # its session inherits the mail of the one before it. The pane has to be in
 # the same session to match, so a reused pane id elsewhere matches nothing.
 # inbox SESSION shows everything sent to anyone in SESSION.
+#
+# agent-sidebar reads the log and the read marks itself, never writing
+# either, to list the messages and count each agent's unread ones. It has
+# this inbox rule in Python (MessageLog.inbox); test-agent-sidebar checks
+# the two agree, so a change to the rule here goes there too.
 
 set -euo pipefail
 
@@ -313,7 +318,7 @@ mailbox() {
 }
 
 # jq: whether the message in . is in the mailbox passed as $pane, $session
-# and $live.
+# and $live. agent-sidebar's MessageLog.inbox has the same rule.
 # shellcheck disable=SC2016
 readonly mine='
     .to.session == $session

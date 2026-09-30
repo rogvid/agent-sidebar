@@ -97,6 +97,13 @@ class Fake:
         self.usage: dict[str, dict] = {}
         self.usage_lookups = 0
         self.scans = 0
+        # Every pane's session, as tmux would list them.
+        self.panes: dict[str, str] = {}
+        self.pane_lookups = 0
+
+    async def list_panes(self):
+        self.pane_lookups += 1
+        return self.panes
 
     def list_accounts(self):
         return self.accounts
@@ -776,6 +783,366 @@ async def config_cases(mod) -> list[tuple[str, bool, str]]:
     return results
 
 
+def message(id: int, sender: tuple[str, str], to: tuple[str, str],
+            text: str = "hello", reply_to: int | None = None,
+            ago: float = 120) -> dict:
+    """A line of agent-msg's log, sent ago seconds before now."""
+    def end(address):
+        session, pane = address
+        return {"pane": pane, "session": session, "project": session,
+                "branch": "main"}
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - ago))
+    return {"id": id, "time": stamp, "kind": "reply" if reply_to else "send",
+            "from": end(sender), "to": end(to), "reply_to": reply_to,
+            "text": text}
+
+
+def append(path: Path, *lines: dict | str) -> None:
+    with path.open("a") as file:
+        for line in lines:
+            file.write((line if isinstance(line, str) else json.dumps(line))
+                       + "\n")
+
+
+def message_log_cases(mod) -> list[tuple[str, bool, str]]:
+    """MessageLog reads agent-msg's log as it grows, and finds each pane's
+    unread messages by agent-msg's inbox rule."""
+    results: list[tuple[str, bool, str]] = []
+
+    def check(name: str, ok: bool, detail: object) -> None:
+        results.append((name, ok, "" if ok else f"got={detail!r}"))
+
+    folder = Path(tempfile.mkdtemp())
+    sent, read = folder / "messages.jsonl", folder / "messages-read.jsonl"
+    log = mod.MessageLog(folder)
+    check("no log yet reads as no messages",
+          not log.refresh() and not log.latest and not log.unread,
+          (list(log.latest), log.unread))
+    check("and makes no file", list(folder.iterdir()) == [],
+          list(folder.iterdir()))
+
+    orch, work = ("orchestrator", "%1"), ("koyr", "%2")
+    append(sent, message(1, orch, work), "not json", '["a list"]',
+           message(2, work, orch, reply_to=1))
+    with sent.open("a") as file:
+        file.write(json.dumps(message(3, orch, work))[:20])
+    check("whole lines are read, the rest skipped",
+          log.refresh() and [m["id"] for m in log.latest] == [1, 2],
+          [m["id"] for m in log.latest])
+    check("a line still being written waits", 3 not in log.unread,
+          log.unread)
+    with sent.open("a") as file:
+        file.write(json.dumps(message(3, orch, work))[20:] + "\n")
+    log.refresh()
+    check("and is read once it is whole",
+          [m["id"] for m in log.latest] == [1, 2, 3],
+          [m["id"] for m in log.latest])
+    check("nothing added, nothing changed", not log.refresh(), None)
+    check("every message starts unread",
+          log.unread == {1: work, 2: orch, 3: work}, log.unread)
+
+    append(read, {"id": 1, "time": "2026-09-30T12:00:00Z", "by": "%2"})
+    log.refresh()
+    check("a read mark takes it off the unread",
+          log.unread == {2: orch, 3: work}, log.unread)
+    append(read, {"id": 9, "time": "2026-09-30T12:00:00Z", "by": "%2"})
+    append(sent, message(9, orch, work))
+    log.refresh()
+    check("even when the mark is read before the message", 9 not in log.unread,
+          log.unread)
+
+    append(sent, *(message(i, orch, work) for i in range(10, 10 + mod.LATEST)))
+    log.refresh()
+    check("only the newest are kept",
+          len(log.latest) == mod.LATEST and log.latest[-1]["id"] == 109
+          and log.latest[0]["id"] == 10,
+          (len(log.latest), log.latest[0]["id"]))
+    check("but every unread one is counted",
+          len(log.unread) == 2 + mod.LATEST, len(log.unread))
+
+    sent.write_text(json.dumps(message(1, work, orch)) + "\n")
+    check("a log started over is read again from its start",
+          log.refresh() and [m["id"] for m in log.latest] == [1]
+          and log.unread == {}, (list(log.latest), log.unread))
+    read.unlink()
+    log.refresh()
+    check("and so are its read marks", log.unread == {1: orch}, log.unread)
+
+    # agent-msg's inbox rule, on a log of its own.
+    folder = Path(tempfile.mkdtemp())
+    append(folder / "messages.jsonl",
+           message(1, orch, ("koyr", "%2")),
+           message(2, orch, ("koyr", "%5")),       # gone: koyr's mail
+           message(3, orch, ("hoyr", "%3")),
+           message(4, orch, ("gone", "%6")),       # a gone session
+           message(5, orch, ("hoyr", "%2")))       # %2 is koyr's now
+    log = mod.MessageLog(folder)
+    log.refresh()
+    got = log.inbox({"%2": "koyr", "%4": "koyr", "%3": "hoyr"})
+    want = {"%2": {1, 2}, "%4": {2}, "%3": {3, 5}}
+    check("a pane's inbox is agent-msg's: its own, its session's gone panes'",
+          got == want, got)
+    return results
+
+
+def inbox_agreement_cases(mod) -> list[tuple[str, bool, str]]:
+    """The sidebar counts unread messages the way `agent-msg inbox
+    --unread` lists them, on a throwaway tmux server: one rule, kept in
+    two languages."""
+    results: list[tuple[str, bool, str]] = []
+
+    def check(name: str, ok: bool, detail: object) -> None:
+        results.append((name, ok, "" if ok else f"got={detail!r}"))
+
+    socket = f"agent-sidebar-test-{os.getpid()}"
+
+    def t(*args: str) -> str:
+        return subprocess.run(["tmux", "-L", socket, *args], check=True,
+                              capture_output=True, text=True).stdout.strip()
+
+    folder = Path(os.environ["XDG_STATE_HOME"]) / "agent-sidebar"
+    folder.mkdir(parents=True, exist_ok=True)
+    saved = os.environ.get("TMUX")
+    try:
+        t("-f", "/dev/null", "new-session", "-d", "-s", "koyr")
+        t("new-session", "-d", "-s", "hoyr")
+        koyr = t("display-message", "-p", "-t", "=koyr:", "#{pane_id}")
+        other = t("split-window", "-d", "-t", koyr, "-P", "-F", "#{pane_id}")
+        gone = t("split-window", "-d", "-t", koyr, "-P", "-F", "#{pane_id}")
+        t("kill-pane", "-t", gone)
+        hoyr = t("display-message", "-p", "-t", "=hoyr:", "#{pane_id}")
+        os.environ["TMUX"] = t("display-message", "-p",
+                               "#{socket_path},#{pid},0")
+        orch = ("orchestrator", "%99")
+        (folder / "messages.jsonl").write_text("".join(
+            json.dumps(m) + "\n" for m in (
+                message(1, orch, ("koyr", koyr)),
+                message(2, orch, ("koyr", gone)),
+                message(3, orch, ("hoyr", hoyr)),
+                message(4, orch, ("hoyr", koyr)),
+                message(5, orch, ("koyr", other)),
+                message(6, orch, ("koyr", koyr)),
+            )))
+        (folder / "messages-read.jsonl").write_text(json.dumps(
+            {"id": 6, "time": "2026-09-30T12:00:00Z", "by": koyr}) + "\n")
+
+        log = mod.MessageLog(folder)
+        log.refresh()
+        ours = log.inbox(asyncio.run(mod.all_panes()))
+        for pane in (koyr, other, hoyr):
+            listed = subprocess.run(
+                [str(SCRIPT.with_name("agent-msg")), "inbox", "--unread",
+                 "--json", pane],
+                check=True, capture_output=True, text=True).stdout
+            theirs = {m["id"] for m in json.loads(listed)}
+            check(f"agent-msg and the sidebar agree on {pane}'s unread",
+                  ours.get(pane, set()) == theirs, (ours.get(pane), theirs))
+    finally:
+        if saved is None:
+            os.environ.pop("TMUX", None)
+        else:
+            os.environ["TMUX"] = saved
+        subprocess.run(["tmux", "-L", socket, "kill-server"],
+                       capture_output=True)
+        for name in ("messages.jsonl", "messages-read.jsonl", "messages.lock"):
+            (folder / name).unlink(missing_ok=True)
+    return results
+
+
+async def message_cases(mod) -> list[tuple[str, bool, str]]:
+    """The messages view, and unread messages on the agents."""
+    from textual.widgets import OptionList, Static
+
+    results: list[tuple[str, bool, str]] = []
+
+    def check(name: str, ok: bool, detail: object) -> None:
+        results.append((name, ok, "" if ok else f"got={detail!r}"))
+
+    folder = Path(tempfile.mkdtemp())
+    sent, read = folder / "messages.jsonl", folder / "messages-read.jsonl"
+    orch = ("orchestrator", "%9")
+    work = ("dotfiles-feat-sidebar-messages-and-more", "%2")
+    append(sent,
+           message(1, orch, ("koyr", "%1"), "Check the build\nand the tests",
+                   ago=3 * 3600),
+           message(2, ("koyr", "%1"), orch, "Green.", reply_to=1, ago=600),
+           message(3, orch, work, "Rebase onto main\nthen report back"),
+           message(4, orch, ("koyr", "%7"), "For a pane now gone"))
+    append(read, {"id": 2, "time": "2026-09-30T12:00:00Z", "by": "%9"})
+    fake = Fake([row("koyr", "%1"), row("dotfiles", "%2"),
+                 row("koyr", "%3", "running"), row("hoyr", "%4")], {"%2"})
+    panes = {"%1": "koyr", "%3": "koyr", "%9": "orchestrator",
+             "%2": work[0], "%4": "hoyr"}
+    fake.panes = panes
+    app = mod.AgentSidebar(scan=fake.scan, panes_here=fake.panes_here,
+                           run=fake.run, pull_requests=fake.pull_requests,
+                           accounts=fake.list_accounts, panes=fake.list_panes,
+                           messages=folder)
+
+    def files() -> dict[str, tuple[int, int]]:
+        return {path.name: (path.stat().st_size, path.stat().st_mtime_ns)
+                for path in folder.iterdir()}
+
+    before = files()
+    async with app.run_test(size=(36, 40)) as pilot:
+        await pilot.pause(0.3)
+        agents = app.query_one("#agents", OptionList)
+        listing = app.query_one("#messages", OptionList)
+
+        def lines(option_list, option_id: str) -> list[str]:
+            return [line.rstrip() for line in plain(
+                option_list.get_option(option_id).prompt).splitlines()]
+
+        def ids() -> list[str | None]:
+            return [listing.get_option_at_index(i).id
+                    for i in range(listing.option_count)]
+
+        def showing() -> str:
+            return app.query_one("ContentSwitcher").current
+
+        async def press(*keys: str) -> None:
+            await pilot.press(*keys)
+            await pilot.pause(0.1)
+
+        async def rescan() -> None:
+            app.action_rescan()
+            await pilot.pause(0.3)
+
+        check("an agent with unread messages says how many",
+              lines(agents, "%1")[0].endswith("✉2"), lines(agents, "%1"))
+        check("counting its session's gone panes' too",
+              lines(agents, "%3")[0].endswith("✉1"), lines(agents, "%3"))
+        check("and none when there are none",
+              "✉" not in "".join(lines(agents, "%4")), lines(agents, "%4"))
+
+        await press("m")
+        check("m shows the messages", showing() == "messages-view"
+              and listing.has_focus, (showing(), app.focused))
+        check("with their own header and hints",
+              plain(app.query_one("#header", Static).content).split()
+              == ["Messages", "✉", "3"]
+              and "m agents" in str(app.query_one("#footer", Static).render()),
+              plain(app.query_one("#header", Static).content))
+        check("newest first", ids() == ["4", "3", "2", "1"], ids())
+        check("with a rule between",
+              listing.virtual_size.height == 4 * 3 + 3, listing.virtual_size)
+        check("starting on the newest",
+              listing.highlighted_option.id == "4", listing.highlighted_option)
+        shown = lines(listing, "3")
+        check("sender, then receiver with its pane kept, then the text",
+              shown == [" ✉ orchestrator %9           #3 2m",
+                        " → dotfiles-feat-sidebar-messa… %2",
+                        "   Rebase onto main"], shown)
+        shown = lines(listing, "2")
+        check("a read reply has no mark, and says what it answers",
+              shown == ["   koyr %1                  #2 10m",
+                        " → orchestrator %9           re #1",
+                        "   Green."], shown)
+
+        await press("end")
+        shown = lines(listing, "1")
+        check("the highlighted message shows in full",
+              shown[2:] == ["   Check the build", "   and the tests"]
+              and shown[0].endswith("#1 3h"), shown)
+        check("and the one it left goes back to one line",
+              len(lines(listing, "4")) == 3, lines(listing, "4"))
+
+        await press("k", "k")
+        check("k moves up a message", listing.highlighted_option.id == "3",
+              listing.highlighted_option)
+        await press("enter")
+        check("enter jumps to the pane it went to",
+              fake.ran[-1] == ("tmux", "switch-client", "-t", "%2"),
+              fake.ran[-1:])
+        await press("home", "enter")
+        check("or to its session, where the pane is gone",
+              fake.ran[-1] == ("tmux", "switch-client", "-t", "=koyr"),
+              fake.ran[-1:])
+        fake.panes = {"%1": "hoyr"}
+        count = len(fake.ran)
+        await press("enter")
+        check("and nowhere when the session is gone too",
+              len(fake.ran) == count, fake.ran[count:])
+        fake.panes = panes
+
+        count = len(fake.ran)
+        await press("x", "y", "d", "g", "p", "X", "h", "H", "c", "C")
+        check("agent actions do nothing here",
+              len(fake.ran) == count and not app._compact
+              and not app._collapsed and not isinstance(app.screen, mod.Confirm),
+              fake.ran[count:])
+        titles = [c.title for c in app.get_system_commands(app.screen)]
+        check("nor are they in the command palette",
+              titles == [f"{a.title} ({a.label})" for a in mod.ACTIONS
+                         if a.name in mod.MESSAGE_ACTIONS and a.name != "help"],
+              titles)
+
+        append(sent, message(5, ("koyr", "%1"), orch, "Done.", reply_to=1,
+                             ago=0))
+        append(read, {"id": 1, "time": "2026-09-30T12:00:00Z", "by": "%1"})
+        await rescan()
+        check("a new message comes in on top", ids()[:2] == ["5", "4"], ids())
+        check("and the cursor stays on its message",
+              listing.highlighted_option.id == "4", listing.highlighted_option)
+        check("a message read loses its mark",
+              "✉" not in lines(listing, "1")[0], lines(listing, "1"))
+
+        await press("m")
+        check("m goes back to the agents",
+              showing() == "agents-view" and agents.has_focus,
+              (showing(), app.focused))
+        check("which lose the mark of a message read",
+              lines(agents, "%1")[0].endswith("✉1"), lines(agents, "%1"))
+        await press("m", "escape")
+        check("and so does esc", showing() == "agents-view", showing())
+        check("without leaving the sidebar",
+              not any(c[:2] == ("sh", "-c") for c in fake.ran), fake.ran)
+
+        await press("home", "c")
+        shown = lines(agents, "%1")
+        check("a one-line agent keeps its count",
+              shown[0].split()[-2:] == ["✉1", "done"], shown)
+        await press("H")
+        shown = lines(agents, "project:koyr")
+        check("and a folded project counts a message to both agents once",
+              "✉1 ●" in shown[0], shown)
+
+        append(read, *({"id": i, "time": "2026-09-30T12:00:00Z", "by": "%1"}
+                       for i in (3, 4, 5)))
+        written = files()
+        await press("m", "j", "enter", "m")
+        lookups = fake.pane_lookups
+        await rescan()
+        check("nothing unread, tmux is not asked for panes",
+              fake.pane_lookups == lookups, fake.pane_lookups)
+        check("the sidebar never writes the log or its read marks",
+              files() == written, (files(), written))
+    check("and made no file of its own", files().keys() == before.keys(),
+          files())
+
+    empty = Path(tempfile.mkdtemp())
+    app = mod.AgentSidebar(scan=fake.scan, panes_here=fake.panes_here,
+                           run=fake.run, pull_requests=fake.pull_requests,
+                           accounts=fake.list_accounts, panes=fake.list_panes,
+                           messages=empty)
+    async with app.run_test(size=(36, 30)) as pilot:
+        await pilot.pause(0.3)
+        await pilot.press("m")
+        await pilot.pause(0.1)
+        none = app.query_one("#no-messages", Static)
+        check("no log says there are no messages yet",
+              none.display and not app.query_one("#messages").display,
+              none.display)
+        count = len(fake.ran)
+        await pilot.press("enter")
+        await pilot.pause(0.1)
+        check("and enter there goes nowhere", len(fake.ran) == count,
+              fake.ran[count:])
+    check("nor makes a file", list(empty.iterdir()) == [],
+          list(empty.iterdir()))
+    return results
+
+
 def window(used: float, resets_in: float) -> dict:
     """A rate-limit window as agent-usage-tap keeps it, resetting in
     resets_in seconds (and 30 more, so a countdown taken a moment later
@@ -1035,6 +1402,12 @@ def main() -> int:
         report("usage", name, ok, detail)
     for name, ok, detail in usage_file_cases(mod):
         report("usage", name, ok, detail)
+    for name, ok, detail in message_log_cases(mod):
+        report("messages", name, ok, detail)
+    for name, ok, detail in inbox_agreement_cases(mod):
+        report("messages", name, ok, detail)
+    for name, ok, detail in asyncio.run(message_cases(mod)):
+        report("messages", name, ok, detail)
 
     for name, seconds, want in COUNTDOWN_CASES:
         got = mod.countdown(seconds)

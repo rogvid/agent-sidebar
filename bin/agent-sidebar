@@ -27,6 +27,12 @@ Actions work on the highlighted agent, mostly in a tmux popup over the
 current window: `?` lists them and ctrl+p searches them. When an agent in
 another window stops and needs you, tmux says so on the status line.
 
+`m` switches to the messages agent-msg carries between agents, newest
+first, and back. The highlighted message shows in full, and `⏎` jumps to
+the pane it went to. `✉2` on an agent says two messages to it are unread.
+The sidebar only reads agent-msg's log; `agent-msg inbox --mark-read` is
+what marks a message read.
+
 With many agents open, `h` folds a project into one line that counts its
 agents by state, and `c` puts an agent on one line. Both are remembered in
 $XDG_STATE_HOME/agent-sidebar/state.json for the next sidebar.
@@ -52,9 +58,10 @@ import json
 import os
 import subprocess
 import time
-from collections import Counter
+from collections import Counter, deque
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -65,7 +72,13 @@ from textual.app import App, ComposeResult, SystemCommand
 from textual.binding import Binding
 from textual.containers import Vertical
 from textual.screen import ModalScreen, Screen
-from textual.widgets import Checkbox, Input, OptionList, Static
+from textual.widgets import (
+    Checkbox,
+    ContentSwitcher,
+    Input,
+    OptionList,
+    Static,
+)
 from textual.widgets.option_list import Option
 
 Row = dict[str, Any]
@@ -104,6 +117,10 @@ TRACK = "bright_black"
 WINDOWS = (("five_hour", "5h"), ("seven_day", "wk"))
 # Where agent-scan starts warning about the weekly limit.
 USAGE_WARN, USAGE_HIGH = 60, 85
+# Unread messages, on an agent and in the messages view.
+UNREAD = "✉"
+# How many of the newest messages the messages view lists.
+LATEST = 100
 
 # Harness colours/icons are fixed; roles are the harness's --agent
 # (opencode's build/plan or any custom one) and get a stable colour
@@ -315,7 +332,10 @@ class Action:
 
 
 ACTIONS = (
-    Action("jump", "enter", "⏎", "Jump", "Go to the agent's pane"),
+    Action("jump", "enter", "⏎", "Jump",
+           "Go to the agent's pane, or the pane a message went to"),
+    Action("messages", "m", "m", "Messages",
+           "Switch between the agents and the messages between them"),
     Action("new_worktree", "n", "n", "New worktree",
            "Branch the project into a worktree with its own session and agent"),
     Action("open", "o", "o", "Open project",
@@ -340,10 +360,18 @@ ACTIONS = (
     Action("config", "s", "s", "Settings",
            "Edit config.toml in nvim; the sidebar rescans when you quit"),
     Action("rescan", "r", "r", "Rescan", "Scan again now"),
-    Action("back", "escape", "esc", "Back", "Return to the pane you came from"),
+    Action("back", "escape", "esc", "Back",
+           "Return to the pane you came from, or from messages to agents"),
     Action("close", "q", "q", "Close sidebar", "Close the sidebar until M-2"),
     Action("help", "question_mark", "?", "Help", "Show the keys"),
 )
+
+
+# What still makes sense in the messages view; the rest act on the agent
+# under a cursor that is not on screen.
+MESSAGE_ACTIONS = frozenset(
+    {"jump", "messages", "open", "config", "rescan", "back", "close", "help"})
+AGENT_ACTIONS = frozenset(a.name for a in ACTIONS) - MESSAGE_ACTIONS
 
 
 # Opposites share a line in the help, so it still fits a short pane.
@@ -435,10 +463,16 @@ def _changes_display(changes: str) -> Text:
     return text
 
 
+def mail(unread: int) -> Text:
+    """`✉2` for unread messages, with a space before it; none, nothing."""
+    return Text(f" {UNREAD}{unread}", style="bold") if unread else Text("")
+
+
 def agent_prompt(
-    row: Row, here: bool, pr: dict[str, Any] | None = None,
+    row: Row, here: bool, pr: dict[str, Any] | None = None, unread: int = 0,
 ) -> Group:
-    """Three lines: branch/changes, agent/harness with duration/context, state/message."""
+    """Three lines: branch/unread/changes, agent/harness with
+    duration/context, state/message."""
     color = STATE_COLOR.get(row["state"], "default")
     gutter = Text(HERE if here else " ", style="bold")
 
@@ -452,6 +486,7 @@ def agent_prompt(
     # A branch cut short would otherwise run into its changes.
     if changes.plain:
         changes = Text.assemble(" ", changes)
+    changes = Text.assemble(mail(unread), changes)
     top.add_row(
         gutter,
         Text("●", style=color),
@@ -509,8 +544,8 @@ def project_prompt(project: str, count: int) -> Table:
     return table
 
 
-def compact_prompt(row: Row, here: bool) -> Table:
-    """One line: the branch and its state."""
+def compact_prompt(row: Row, here: bool, unread: int = 0) -> Table:
+    """One line: the branch, its unread messages and its state."""
     color = STATE_COLOR.get(row["state"], "default")
     branch = Text(row["branch"])
     if row.get("flag", " ").strip():
@@ -520,13 +555,16 @@ def compact_prompt(row: Row, here: bool) -> Table:
         Text(HERE if here else " ", style="bold"),
         Text("●", style=color),
         branch,
-        Text(" " + row.get("state", ""), style=color),
+        Text.assemble(mail(unread), (" " + row.get("state", ""), color)),
     )
     return table
 
 
-def collapsed_prompt(project: str, group: list[Row], here: bool) -> Table:
-    """A folded project: its name, and its agents counted by state."""
+def collapsed_prompt(
+    project: str, group: list[Row], here: bool, unread: int = 0,
+) -> Table:
+    """A folded project: its name, its agents' unread messages, and its
+    agents counted by state."""
     table = Table.grid(expand=True)
     table.add_column(width=1, no_wrap=True)
     table.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
@@ -534,7 +572,7 @@ def collapsed_prompt(project: str, group: list[Row], here: bool) -> Table:
     table.add_row(
         Text(HERE if here else "", style="bold"),
         Text(project, style="bold"),
-        Text.assemble(" ", summary(group)),
+        Text.assemble(mail(unread), " ", summary(group)),
     )
     return table
 
@@ -657,6 +695,179 @@ def save_state(path: Path, collapsed: set[str], compact: set[str]) -> None:
         pass
 
 
+class Tail:
+    """A file only ever appended to, read a whole line at a time: each call
+    hands the lines added since the last, and a line still being written
+    waits for the next call."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.rewind()
+
+    def rewind(self) -> None:
+        self._file: tuple[int, int] | None = None
+        self._offset = 0
+
+    def lines(self) -> list[bytes] | None:
+        """The new lines, or None when the file was replaced or cut short
+        since the last call: it has to be read again from the start."""
+        try:
+            with self.path.open("rb") as file:
+                stat = os.fstat(file.fileno())
+                identity = (stat.st_dev, stat.st_ino)
+                if self._file is not None and (
+                        identity != self._file or stat.st_size < self._offset):
+                    return None
+                self._file = identity
+                if stat.st_size == self._offset:
+                    return []
+                file.seek(self._offset)
+                chunk = file.read(stat.st_size - self._offset)
+        except FileNotFoundError:
+            return None if self._file is not None else []
+        whole = chunk.rfind(b"\n") + 1
+        self._offset += whole
+        return chunk[:whole].splitlines()
+
+
+def json_objects(lines: Iterable[bytes]) -> Iterable[dict[str, Any]]:
+    """The lines that are a JSON object with an id, as agent-msg reads them."""
+    for line in lines:
+        try:
+            value = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(value, dict) and isinstance(value.get("id"), int):
+            yield value
+
+
+def address(end: Any) -> tuple[str, str]:
+    """A message's from or to as (session, pane)."""
+    if not isinstance(end, dict):
+        return "", ""
+    return str(end.get("session") or ""), str(end.get("pane") or "")
+
+
+class MessageLog:
+    """agent-msg's log, as the sidebar needs it: the newest messages, and
+    where the unread ones went. Read, never written: messages-read.jsonl is
+    agent-msg inbox's to keep. Each refresh reads only the lines added
+    since the last, so a long log costs once, when the sidebar starts."""
+
+    def __init__(self, folder: Path) -> None:
+        self._sent = Tail(folder / "messages.jsonl")
+        self._read = Tail(folder / "messages-read.jsonl")
+        self.clear()
+
+    def clear(self) -> None:
+        self.latest: deque[Row] = deque(maxlen=LATEST)
+        self.read: set[int] = set()
+        # Each unread message's recipient, by id.
+        self.unread: dict[int, tuple[str, str]] = {}
+
+    def refresh(self) -> bool:
+        """Take in what was added; whether anything was."""
+        sent, read = self._sent.lines(), self._read.lines()
+        if sent is None or read is None:
+            self._sent.rewind()
+            self._read.rewind()
+            self.clear()
+            sent, read = self._sent.lines() or [], self._read.lines() or []
+            changed = True
+        else:
+            changed = bool(sent or read)
+        for message in json_objects(sent):
+            self.latest.append(message)
+            if message["id"] not in self.read:
+                self.unread[message["id"]] = address(message.get("to"))
+        for mark in json_objects(read):
+            self.read.add(mark["id"])
+            self.unread.pop(mark["id"], None)
+        return changed
+
+    def inbox(self, panes: dict[str, str]) -> dict[str, set[int]]:
+        """The unread messages in each live pane's inbox, given every
+        pane's session: by agent-msg's own rule (its `mine`), what was sent
+        to the pane in its session, and what was sent to a pane of its
+        session that is gone. test-agent-sidebar checks the two agree."""
+        live: dict[str, set[str]] = {}
+        for pane, session in panes.items():
+            live.setdefault(session, set()).add(pane)
+        inbox: dict[str, set[int]] = {}
+        for message, (session, pane) in self.unread.items():
+            if panes.get(pane) == session:
+                inbox.setdefault(pane, set()).add(message)
+            else:
+                for heir in live.get(session, ()):
+                    inbox.setdefault(heir, set()).add(message)
+        return inbox
+
+
+def age(seconds: float) -> str:
+    """`<1m`, `5m`, `3h`, `2d` since a message was sent."""
+    minutes = int(seconds // 60)
+    if minutes < 1:
+        return "<1m"
+    if minutes < 60:
+        return f"{minutes}m"
+    return f"{minutes // 60}h" if minutes < 24 * 60 else f"{minutes // 1440}d"
+
+
+def sent_at(message: Row) -> float | None:
+    try:
+        return datetime.fromisoformat(message["time"]).timestamp()
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+class Address:
+    """`session %pane`, the session cut short so the pane always shows."""
+
+    def __init__(self, end: Any, style: str = "") -> None:
+        self.session, self.pane = address(end)
+        self.style = style
+
+    def __rich_console__(self, console: Any, options: Any) -> Iterable[Text]:
+        pane = f" {self.pane}" if self.pane else ""
+        session = Text(self.session or "?", style=self.style)
+        session.truncate(max(1, options.max_width - len(pane)),
+                         overflow="ellipsis")
+        yield Text.assemble(session, (pane, MUTED))
+
+
+def message_prompt(
+    message: Row, unread: bool, now: float, full: bool = False,
+) -> Group:
+    """Who sent it, to whom, and its first line, or all of it when full."""
+    sent = sent_at(message)
+    top = grid()
+    top.add_row(
+        Text(""),
+        Text(UNREAD, style="bold") if unread else Text(""),
+        Address(message.get("from"), style="bold" if unread else ""),
+        Text(f" #{message['id']}" + (f" {age(now - sent)}" if sent else ""),
+             style=MUTED),
+    )
+    middle = grid()
+    reply_to = message.get("reply_to")
+    middle.add_row(
+        Text(""),
+        Text("→", style=MUTED),
+        Address(message.get("to")),
+        Text(f" re #{reply_to}" if reply_to else "", style=MUTED),
+    )
+    text = str(message.get("text") or "").strip()
+    body = Table.grid(expand=True)
+    body.add_column(width=3, no_wrap=True)
+    if full:
+        body.add_column(ratio=1, overflow="fold")
+        body.add_row(Text(""), Text(text))
+    else:
+        body.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
+        body.add_row(Text(""), Text(text.split("\n")[0], style=MUTED))
+    return Group(top, middle, body)
+
+
 def summary(rows: list[Row]) -> Text:
     """One coloured count per state that has agents in it."""
     counts = Counter(row["state"] for row in rows)
@@ -722,6 +933,14 @@ async def panes_here() -> set[str]:
         return set()
     out = await tmux("list-panes", "-t", pane, "-F", "#{pane_id}")
     return set(out.split()) if out else set()
+
+
+async def all_panes() -> dict[str, str]:
+    """Every pane's session, by pane id."""
+    out = await tmux("list-panes", "-a", "-F", "#{pane_id}\t#{session_name}")
+    return dict(
+        line.split("\t", 1) for line in (out or "").splitlines() if "\t" in line
+    )
 
 
 async def pull_requests(cwd: str) -> PullRequests | None:
@@ -920,6 +1139,7 @@ class Help(ModalScreen[None]):
             ("400k", CONTEXT_COLOR["rot"]), " tokens\n",
             ("▌", "bold"), "    in this window\n",
             ("!", "bold red"), "    shares a working tree\n",
+            (f"{UNREAD}2", "bold"), "   unread messages\n",
         )
         # Drawn the way rows draw them so the legend cannot drift.
         first, *others = HARNESS_ICON
@@ -987,7 +1207,10 @@ class AgentSidebar(App[None]):
             color: ansi_bright_black;
         }
     }
-    #empty {
+    ContentSwitcher, #agents-view, #messages-view {
+        height: 1fr;
+    }
+    #empty, #no-messages {
         height: 1fr;
         padding: 1 1;
         color: ansi_bright_black;
@@ -1093,6 +1316,8 @@ class AgentSidebar(App[None]):
         usage: Callable[[], Awaitable[dict[str, dict[str, Any]]]] = usage,
         config_error: Callable[[], str | None] = config_error,
         state: Path | None = None,
+        panes: Callable[[], Awaitable[dict[str, str]]] = all_panes,
+        messages: Path | None = None,
     ) -> None:
         super().__init__(ansi_color=True)
         self._scan = scan
@@ -1116,6 +1341,16 @@ class AgentSidebar(App[None]):
         self._prs_checked: dict[str, float] = {}
         self._state = state or state_path()
         self._collapsed, self._compact = load_state(self._state)
+        self._panes = panes
+        self._log = MessageLog(messages or self._state.parent)
+        # The unread messages in each agent's inbox.
+        self._inbox: dict[str, set[int]] = {}
+        self._view = "agents"
+        self._messages_shown: str | None = None
+        # The messages listed, by option id, and which of them are unread.
+        self._by_message: dict[str, Row] = {}
+        self._unread_listed: set[str] = set()
+        self._expanded: str | None = None
 
     def get_css_variables(self) -> dict[str, str]:
         # catppuccin mocha's surface0, the theme the terminal and tmux use.
@@ -1125,18 +1360,26 @@ class AgentSidebar(App[None]):
 
     def get_system_commands(self, screen: Screen) -> Iterable[SystemCommand]:
         for action in ACTIONS:
-            if action.name != "help":
+            if action.name != "help" and self.check_action(action.name, ()):
                 yield SystemCommand(
                     f"{action.title} ({action.label})", action.help,
                     getattr(self, f"action_{action.name}"),
                 )
 
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool:
+        return not (self._view == "messages" and action in AGENT_ACTIONS)
+
     def compose(self) -> ComposeResult:
         yield Static(id="header")
         yield Static("─" * 200, id="header-rule")
         yield Static(id="config-error")
-        yield OptionList(id="agents")
-        yield Static("No agents running", id="empty")
+        with ContentSwitcher(initial="agents-view"):
+            with Vertical(id="agents-view"):
+                yield OptionList(id="agents")
+                yield Static("No agents running", id="empty")
+            with Vertical(id="messages-view"):
+                yield OptionList(id="messages")
+                yield Static("No messages yet", id="no-messages")
         yield Static("─" * 200, id="usage-rule")
         yield Static(id="usage")
         yield Static(id="footer")
@@ -1145,6 +1388,8 @@ class AgentSidebar(App[None]):
         self.query_one("#agents").display = False
         self.query_one("#config-error").display = False
         self.query_one("#empty").display = False
+        self.query_one("#messages").display = False
+        self.query_one("#no-messages").display = False
         self.query_one("#usage-rule").display = False
         self.query_one("#usage").display = False
         self.show_header([], ok=True)
@@ -1160,7 +1405,15 @@ class AgentSidebar(App[None]):
                 pass
 
     async def rescan(self) -> None:
-        rows, here = await asyncio.gather(self._scan(), self._panes_here())
+        rows, here, _ = await asyncio.gather(
+            self._scan(), self._panes_here(),
+            asyncio.to_thread(self._log.refresh),
+        )
+        # Whose inbox a message is in takes every pane's session, which is
+        # worth asking tmux for only while something is unread.
+        self._inbox = (self._log.inbox(await self._panes())
+                       if self._log.unread else {})
+        self.show_messages()
         self.show_config_error(self._config_error())
         if rows is None:
             # Keep what is on screen; a list that blinks empty on one bad
@@ -1258,9 +1511,17 @@ class AgentSidebar(App[None]):
         title = Table.grid(expand=True)
         title.add_column(ratio=1, no_wrap=True)
         title.add_column(justify="right", no_wrap=True)
-        title.add_row(Text("Agents", style="bold"), summary(rows))
+        if self._view == "messages":
+            unread = len(self._log.unread)
+            title.add_row(
+                Text("Messages", style="bold"),
+                Text(f"{UNREAD} {unread}" if unread else "", style="bold"),
+            )
+            hints = "⏎ jump  m agents  ? help"
+        else:
+            title.add_row(Text("Agents", style="bold"), summary(rows))
+            hints = "⏎ jump  m messages  ? help"
         self.query_one("#header", Static).update(title)
-        hints = "⏎ jump  ? help  q close"
         self.query_one("#footer", Static).update(
             hints if ok else Text("scan failed, retrying", style="yellow")
         )
@@ -1272,7 +1533,8 @@ class AgentSidebar(App[None]):
         rows, here = self._rows, self._here
         key = json.dumps(
             [rows, sorted(here), self._prs, sorted(self._collapsed),
-             sorted(self._compact)],
+             sorted(self._compact),
+             {pane: sorted(ids) for pane, ids in self._inbox.items()}],
             sort_keys=True,
         )
         if key == self._shown:
@@ -1304,6 +1566,10 @@ class AgentSidebar(App[None]):
                     collapsed_prompt(
                         project, group,
                         any(row["pane_id"] in here for row in group),
+                        # A message to a gone pane is in the inbox of every
+                        # agent in its session, and counts once here.
+                        len(set().union(*(self._inbox.get(row["pane_id"], ())
+                                          for row in group))),
                     ),
                     id=project_id,
                 ))
@@ -1337,9 +1603,79 @@ class AgentSidebar(App[None]):
             agents.highlighted = agents.get_option_index(line[target])
 
     def agent_prompt(self, row: Row, here: bool) -> Group | Table:
+        unread = len(self._inbox.get(row["pane_id"], ()))
         if row["pane_id"] in self._compact:
-            return compact_prompt(row, here)
-        return agent_prompt(row, here, self.pull_request(row))
+            return compact_prompt(row, here, unread)
+        return agent_prompt(row, here, self.pull_request(row), unread)
+
+    def show_view(self, view: str) -> None:
+        self._view = view
+        self.query_one(ContentSwitcher).current = f"{view}-view"
+        # Start on the newest message each time.
+        self._messages_shown = None
+        self._expanded = None
+        self.query_one("#messages", OptionList).highlighted = None
+        self.show_messages()
+        self.show_header(self._rows, ok=True)
+        self.query_one(f"#{view}", OptionList).focus()
+
+    def show_messages(self) -> None:
+        """The newest messages first, the highlighted one in full."""
+        if self._view != "messages":
+            return
+        now = time.time()
+        messages: dict[str, Row] = {}
+        for message in reversed(self._log.latest):
+            messages.setdefault(str(message["id"]), message)
+        unread = {key for key in messages if int(key) not in self._log.read}
+        # Redraw when a message comes, is read, or ages a minute.
+        key = json.dumps([[key, key in unread, sent_at(message) and
+                           age(now - sent_at(message))]
+                          for key, message in messages.items()])
+        if key == self._messages_shown:
+            return
+        self._messages_shown = key
+        self._by_message, self._unread_listed = messages, unread
+
+        listing = self.query_one("#messages", OptionList)
+        listing.display = bool(messages)
+        self.query_one("#no-messages").display = not messages
+        previous = listing.highlighted_option
+        target = previous.id if previous is not None else None
+        if target not in messages:
+            target = next(iter(messages), None)
+        self._expanded = target
+        options: list[Option | None] = []
+        for key, message in messages.items():
+            # A rule between messages, or the three lines of each run into
+            # the next.
+            if options:
+                options.append(None)
+            options.append(Option(message_prompt(message, key in unread, now,
+                                                 full=key == target), id=key))
+        listing.set_options(options)
+        if target is not None:
+            listing.highlighted = listing.get_option_index(target)
+
+    def message_option(self, key: str, full: bool) -> None:
+        message = self._by_message.get(key)
+        if message is not None:
+            self.query_one("#messages", OptionList).replace_option_prompt(
+                key, message_prompt(message, key in self._unread_listed,
+                                    time.time(), full=full))
+
+    def on_option_list_option_highlighted(
+        self, event: OptionList.OptionHighlighted,
+    ) -> None:
+        key = event.option.id
+        if event.option_list.id != "messages" or key == self._expanded:
+            return
+        if self._expanded is not None:
+            self.message_option(self._expanded, full=False)
+        self._expanded = key
+        if key is not None:
+            self.message_option(key, full=True)
+            self.call_after_refresh(event.option_list.scroll_to_highlight)
 
     def selected(self) -> Row | None:
         option = self.query_one("#agents", OptionList).highlighted_option
@@ -1386,11 +1722,19 @@ class AgentSidebar(App[None]):
             control_id = event.control.id  # type: ignore[attr-defined]
         except AttributeError:
             control_id = None
-        if control_id is not None and control_id != "agents":
+        if control_id is not None and control_id not in ("agents", "messages"):
             return
         self.action_jump()
 
     def action_jump(self) -> None:
+        if self._view == "messages":
+            option = self.query_one("#messages", OptionList).highlighted_option
+            message = option and option.id and self._by_message.get(option.id)
+            if not message:
+                self.bell()
+                return
+            self.run_worker(self.jump_to(message))
+            return
         if self.selected() is None and self.project() in self._collapsed:
             self.action_expand()
             return
@@ -1399,6 +1743,23 @@ class AgentSidebar(App[None]):
         self.on_agent(lambda row: self.run_worker(
             self._run("tmux", "switch-client", "-t", row["pane_id"])
         ))
+
+    async def jump_to(self, message: Row) -> None:
+        """To the pane a message went to; when that is gone, to its session,
+        which by agent-msg's rule has its mail."""
+        session, pane = address(message.get("to"))
+        panes = await self._panes()
+        if panes.get(pane) == session:
+            target = pane
+        elif session in panes.values():
+            target = f"={session}"
+        else:
+            self.bell()
+            return
+        await self._run("tmux", "switch-client", "-t", target)
+
+    def action_messages(self) -> None:
+        self.show_view("agents" if self._view == "messages" else "messages")
 
     def action_new_worktree(self) -> None:
         def ask(row: Row) -> None:
@@ -1497,11 +1858,11 @@ class AgentSidebar(App[None]):
         self.push_screen(Help())
 
     def action_cursor(self, direction: str) -> None:
-        agents = self.query_one("#agents", OptionList)
+        listing = self.query_one(f"#{self._view}", OptionList)
         if direction == "down":
-            agents.action_cursor_down()
+            listing.action_cursor_down()
         else:
-            agents.action_cursor_up()
+            listing.action_cursor_up()
 
     def action_config(self) -> None:
         async def edit() -> None:
@@ -1514,6 +1875,9 @@ class AgentSidebar(App[None]):
         self._wake.set()
 
     async def action_back(self) -> None:
+        if self._view == "messages":
+            self.show_view("agents")
+            return
         pane = os.environ.get("TMUX_PANE", "")
         await self._run(
             "sh", "-c",
