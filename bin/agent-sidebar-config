@@ -19,6 +19,13 @@ Every setting is optional, and so is the file:
   width      the sidebar's width in columns
   command    what runs in the sidebar pane
 
+  [orchestrator]
+  account    the claude account agent-orchestrator starts on, a name
+             from `agent-sidebar-tmux accounts`; unset, the tmux
+             server's own
+
+A setting in a table is named with a dot: `get orchestrator.account`.
+
 For each setting the first of these that has it wins: the project's
 `git config agent-sidebar.harness` / `agent-sidebar.yolo` (agent and yolo,
 in the sidebar's dialog only), its AGENT_SIDEBAR_<NAME> variable (not
@@ -56,6 +63,11 @@ DEFAULTS: dict[str, Any] = {
     "yolo": True,
     "width": 36,
     "command": "agent-sidebar",
+    "orchestrator.account": None,
+}
+# What the settings that default to unset take, when set.
+UNSET_KINDS: dict[str, type] = {
+    "orchestrator.account": str,
 }
 # hide has no variable: it names sessions, and which sessions are yours is
 # a thing to write down once, not to export.
@@ -86,8 +98,10 @@ def path(env: Mapping[str, str] = os.environ) -> Path:
 def _check(key: str, value: Any) -> None:
     """Raise ConfigError unless value is what key takes."""
     if key not in DEFAULTS:
+        if any(name.startswith(f"{key}.") for name in DEFAULTS):
+            raise ConfigError(f"{key} must be a table, [{key}]")
         raise ConfigError(f"unknown setting {key!r}")
-    kind = type(DEFAULTS[key])
+    kind = UNSET_KINDS.get(key) or type(DEFAULTS[key])
     if kind is list:
         if not isinstance(value, list) or not all(
             isinstance(item, str) and item for item in value
@@ -107,6 +121,21 @@ def _check(key: str, value: Any) -> None:
         raise ConfigError(f"{key} must be one line of text")
 
 
+def _flatten(data: Mapping[str, Any]) -> dict[str, Any]:
+    """A table's settings under dotted names: [orchestrator] account is
+    orchestrator.account. A table no setting belongs to stays whole, for
+    _check to turn down."""
+    flat: dict[str, Any] = {}
+    for key, value in data.items():
+        if isinstance(value, dict) and any(
+                name.startswith(f"{key}.") for name in DEFAULTS):
+            for name, inner in value.items():
+                flat[f"{key}.{name}"] = inner
+        else:
+            flat[key] = value
+    return flat
+
+
 def read(file: Path | None = None) -> dict[str, Any]:
     """The file's settings; none when there is no file. Raises ConfigError
     when it is broken, naming the file and what is wrong."""
@@ -118,6 +147,7 @@ def read(file: Path | None = None) -> dict[str, Any]:
         return {}
     except (OSError, tomllib.TOMLDecodeError) as error:
         raise ConfigError(f"{file}: {error}") from None
+    data = _flatten(data)
     try:
         for key, value in data.items():
             _check(key, value)
@@ -219,7 +249,9 @@ def main() -> int:
             print(f"agent-sidebar-config: ignoring {error}", file=sys.stderr)
         for name in names:
             value = get(name, settings=settings)
-            if isinstance(value, bool):
+            if value is None:
+                value = ""
+            elif isinstance(value, bool):
                 value = "true" if value else "false"
             elif isinstance(value, list):
                 value = " ".join(value)

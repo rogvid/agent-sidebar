@@ -68,6 +68,20 @@ READ_CASES = (
     ("an empty agent", 'agent = ""\n', None, "one line of text"),
     ("a command over two lines", 'command = "a\\nb"\n', None,
      "one line of text"),
+    ("a table's setting by its dotted name",
+     'width = 40\n[orchestrator]\naccount = "personal"\n',
+     {"width": 40, "orchestrator.account": "personal"}, None),
+    ("an empty table is no settings", "[orchestrator]\n", {}, None),
+    ("an unknown setting in a table", '[orchestrator]\nhost = "x"\n',
+     None, "unknown setting 'orchestrator.host'"),
+    ("an unknown table", '[sidebar]\nwidth = 40\n', None,
+     "unknown setting 'sidebar'"),
+    ("a table's name as a setting", 'orchestrator = "personal"\n', None,
+     "orchestrator must be a table"),
+    ("an empty account", '[orchestrator]\naccount = ""\n', None,
+     "one line of text"),
+    ("an account as a list", '[orchestrator]\naccount = ["a"]\n', None,
+     "one line of text"),
 )
 
 # (name, git config in the project, variables, file, key, want). Per
@@ -97,6 +111,11 @@ GET_CASES = (
      {"AGENT_SIDEBAR_WIDTH": "wide"}, {"width": 40}, "width", 40),
     ("hide has no variable", {}, {"AGENT_SIDEBAR_HIDE": "x"}, {}, "hide",
      []),
+    ("the orchestrator's account is unset by default", {}, {}, {},
+     "orchestrator.account", None),
+    ("the orchestrator's account from the file", {}, {},
+     {"orchestrator.account": "personal"}, "orchestrator.account",
+     "personal"),
 )
 
 # Session names against hide = ["orchestrator", "scratch-*"].
@@ -158,12 +177,16 @@ def main() -> int:
     report("shipped", "the linked config is valid", error is None,
            "" if error is None else error)
     # Each setting is there, commented out at its default, so uncommenting
-    # one is where to start.
+    # one is where to start. One that is unset by default cannot be shown.
     commented = re.findall(r"^# (\w+ = .*)$", SHIPPED.read_text(), re.M)
     shown = tomllib.loads("\n".join(commented))
-    ok = shown == mod.DEFAULTS
+    ok = shown == {key: value for key, value in mod.DEFAULTS.items()
+                   if value is not None}
     report("shipped", "shows every setting at its default", ok,
            "" if ok else f"got={shown!r}")
+    ok = settings.get("orchestrator.account") == "personal"
+    report("shipped", "starts the orchestrator on personal", ok,
+           "" if ok else f"got={settings!r}")
 
     got = mod.path({"XDG_CONFIG_HOME": "/cfg"})
     want = Path("/cfg/agent-sidebar/config.toml")
@@ -223,6 +246,18 @@ def main() -> int:
     ok = (out.returncode == 0 and out.stdout == "36\n"
           and "ignoring" in out.stderr and str(config) in out.stderr)
     report("cli", "get on a broken file still answers, the defaults", ok,
+           "" if ok else f"got={out!r}")
+
+    config.write_text('[orchestrator]\naccount = "work"\n')
+    out = cli(home, "get", "orchestrator.account", "width")
+    ok = out.returncode == 0 and out.stdout == "work\n36\n"
+    report("cli", "get a table's setting by its dotted name", ok,
+           "" if ok else f"got={out!r}")
+
+    config.unlink()
+    out = cli(home, "get", "orchestrator.account", "width")
+    ok = out.returncode == 0 and out.stdout == "\n36\n"
+    report("cli", "get of an unset setting is an empty line", ok,
            "" if ok else f"got={out!r}")
 
     out = cli(home, "get", "colour")

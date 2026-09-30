@@ -29,3 +29,10 @@
 
 # What runs in the sidebar pane.
 # command = "agent-sidebar"
+
+# Keep this table last: a setting below it would belong to it.
+[orchestrator]
+# The claude account agent-orchestrator (M-1) starts the orchestrator on, a
+# name from `agent-sidebar-tmux accounts`. Where there is no such account,
+# M-1 says so and starts nothing. Unset, it starts on the tmux server's own.
+account = "personal"
