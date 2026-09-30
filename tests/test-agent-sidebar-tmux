@@ -164,6 +164,10 @@ dump_state() {
             echo "      client ${pid} ${rest} sid=$(ps -o sid= -p "${pid}" | tr -d ' ') leader-parent=$(ps -o ppid= -p "$(ps -o sid= -p "${pid}" | tr -d ' ')" | tr -d ' ')"
         done
     t list-panes -a -F '      pane #{pane_id} #{session_name}:#{window_id} #{pane_width}x#{pane_height} sidebar=#{@agent-sidebar} #{pane_current_command}'
+    echo "      open flag: $(open_flag)  M-2: $(t list-keys -T root M-2)"
+    echo "      tmux messages:"
+    t show-messages 2>&1 | grep -E 'key |run-shell|returned|error|fail' |
+        head -n 25 | sed 's/^/        /'
     echo "      still running:"
     pgrep -af 'bin/agent-sidebar-(tmux|config)' | sed 's/^/        /' || true
     echo "      toggle, traced:"
