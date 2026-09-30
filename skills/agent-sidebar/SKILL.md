@@ -338,6 +338,7 @@ agent-sidebar-tmux pr <pane_id>               # gh pr view, or offer gh pr creat
 agent-sidebar-tmux kill <pane_id>             # kill-pane, no popup
 agent-sidebar-tmux remove-worktree <pane_id>  # git-wt-remove -d (asks), then kills the pane if the worktree is gone
 agent-sidebar-tmux open                       # tv projects picker
+agent-sidebar-tmux config                     # nvim on config.toml in a popup that closes with nvim
 
 # The sidebar pane itself
 agent-sidebar-tmux toggle    # M-2
@@ -356,7 +357,7 @@ jq -c . "${XDG_STATE_HOME:-$HOME/.local/state}"/agent-sidebar/usage/claude-*.jso
 They exist only when Claude's `statusLine.command` in settings.json runs through it (`agent-usage-tap ccstatusline`), and they are as fresh as the last response any agent on that account got.
 Check them before spawning a batch of workers on an account.
 
-Sidebar keys (for the human): `⏎` jump, `n` new worktree, `o` open project, `d` review, `g` git, `p` pr, `x` kill, `X` remove worktree, `r` rescan, `esc` back, `q` close, `?` help.
+Sidebar keys (for the human): `⏎` jump, `n` new worktree, `o` open project, `d` review, `g` git, `p` pr, `x` kill, `X` remove worktree, `h`/`l` collapse/expand project, `H`/`L` all, `c`/`C` one line for agent/all, `s` settings (config.toml in nvim), `r` rescan, `esc` back, `q` close, `?` help.
 
 New-worktree dialog (`n`):
 - Branch name input, a harness list and a `yolo` checkbox. Tab moves between them, j/k move in the list, ⏎ creates from any field, esc cancels.

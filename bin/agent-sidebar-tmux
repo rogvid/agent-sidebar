@@ -43,6 +43,8 @@
 #                            first), then PANE
 #   open                     pick a git repository to open in its own
 #                            session (tv projects)
+#   config                   edit the settings file in nvim, in a popup
+#                            that closes when nvim does
 #
 # An account is a harness's config folder next to its default one, named by
 # its suffix, when it holds a login: ~/.claude-NAME, ~/.codex-NAME,
@@ -294,6 +296,14 @@ popup() {
     # display-popup hands its command to a shell, so quote each word.
     tmux display-popup -E -d "${dir}" -w 90% -h 90% "$(printf '%q ' "$@")" ||
         true
+}
+
+# nvim creates the file on write, but not its folder.
+edit_config() {
+    local file
+    file="$("${config_reader}" path)"
+    mkdir -p "$(dirname "${file}")"
+    popup "$(dirname "${file}")" nvim "${file}"
 }
 
 # Keep a popup open until a key is pressed, so its output can be read.
@@ -617,6 +627,9 @@ main() {
         ;;
     open)
         open_project
+        ;;
+    config)
+        edit_config
         ;;
     # Run inside the popups above.
     _worktree-add)

@@ -337,6 +337,8 @@ ACTIONS = (
            "Switch the agent between one line and three"),
     Action("compact_all", "C", "C", "One line for all",
            "Switch every agent between one line and three"),
+    Action("config", "s", "s", "Settings",
+           "Edit config.toml in nvim; the sidebar rescans when you quit"),
     Action("rescan", "r", "r", "Rescan", "Scan again now"),
     Action("back", "escape", "esc", "Back", "Return to the pane you came from"),
     Action("close", "q", "q", "Close sidebar", "Close the sidebar until M-2"),
@@ -1496,6 +1498,13 @@ class AgentSidebar(App[None]):
             agents.action_cursor_down()
         else:
             agents.action_cursor_up()
+
+    def action_config(self) -> None:
+        async def edit() -> None:
+            await self._run(GLUE, "config")
+            # What changed shows now, not at the next tick.
+            self._wake.set()
+        self.run_worker(edit())
 
     def action_rescan(self) -> None:
         self._wake.set()
