@@ -531,12 +531,27 @@ open_project() {
 
 # Hooks fire in bursts - one window change is several events - and two runs
 # that each see no sidebar would each open one.
+#
+# A burst is also coalesced: a follow already waiting its turn looks at
+# where you are when it runs, not when it fired, so it covers every follow
+# fired after it, and those leave. Queued one behind another they would
+# hold up the M-2 pressed after them for seconds.
 locked() {
     local socket lock
     socket="${TMUX%%,*}"
     lock="${TMPDIR:-/tmp}/agent-sidebar-$(id -u)-$(basename "${socket:-default}").lock"
+    if [[ "$1" == follow ]]; then
+        exec 8>"${lock}.waiting"
+        if ! flock -n 8; then
+            return 0
+        fi
+    fi
     exec 9>"${lock}"
     flock -w 5 9
+    if [[ "$1" == follow ]]; then
+        # Running now, so the next follow fired waits in its place.
+        exec 8>&-
+    fi
     "$@"
 }
 
