@@ -187,6 +187,9 @@ def main() -> int:
     ok = settings.get("orchestrator.account") == "personal"
     report("shipped", "starts the orchestrator on personal", ok,
            "" if ok else f"got={settings!r}")
+    ok = settings.get("hide") == ["orchestrator"]
+    report("shipped", "hides the orchestrator", ok,
+           "" if ok else f"got={settings!r}")
 
     got = mod.path({"XDG_CONFIG_HOME": "/cfg"})
     want = Path("/cfg/agent-sidebar/config.toml")
