@@ -197,6 +197,11 @@ HINT_RE = re.compile(r"^\s{0,2}(?:[^·\s][^·]*·\s+)*Esc to cancel\b")
 # row `┃   Allow once   Allow always   Reject`.
 BUTTONS_RE = re.compile(r"Allow once\s{2,}Allow always\s{2,}Reject")
 PERMISSION_RE = re.compile(r"^\s*[│┃|]?\s*[^\w\s]\s*Permission required")
+# pi's selectors - the trust prompt at launch, /login, /model - close with
+# `↑↓ navigate  enter select  escape/ctrl+c cancel` and take the place of
+# its editor, so a live one has a single rule between it and pi's footer,
+# where the idle editor sits between two.
+PI_HINT_RE = re.compile(r"^\s{0,2}↑↓ navigate\s{2,}enter select\b")
 # Plain shell-style confirmations, for agents that do not draw a menu.
 YESNO_RE = re.compile(r"\[y/n\]|\(y/n\)\s*[?:]?\s*$", re.IGNORECASE | re.MULTILINE)
 # The input bar under the prompt box: claude's permission-mode hint and
@@ -582,14 +587,18 @@ def waiting_dialog(dialog: list[str]) -> bool:
     for i, line in enumerate(dialog):
         if ((CHOICE_RE.match(line) and corroborated)
                 or HINT_RE.match(line)
+                or PI_HINT_RE.match(line)
                 or BUTTONS_RE.search(line)
                 or PERMISSION_RE.match(line)
                 or YESNO_RE.search(line)):
             last_marker = i
     if last_marker < 0:
         return False
-    return not any(INPUT_BAR_RE.search(line)
-                   for line in dialog[last_marker + 1:])
+    below = dialog[last_marker + 1:]
+    if (PI_HINT_RE.match(dialog[last_marker])
+            and sum(bool(BORDER_RE.match(line)) for line in below) > 1):
+        return False
+    return not any(INPUT_BAR_RE.search(line) for line in below)
 
 
 def cells(text: str) -> int:
@@ -749,9 +758,25 @@ def claude_question(lines: list[str]) -> str | None:
     return None
 
 
+def pi_question(lines: list[str]) -> str | None:
+    """The title of a live pi selector: the first line under the rule above
+    it, such as `Trust project folder?`."""
+    start = max(len(lines) - DIALOG_LINES, 0)
+    hint = next((i for i in range(len(lines) - 1, start - 1, -1)
+                 if PI_HINT_RE.match(lines[i])), None)
+    if hint is None:
+        return None
+    for i in range(hint - 1, -1, -1):
+        if BORDER_RE.match(lines[i]):
+            title = next((line for line in lines[i + 1:hint] if line.strip()),
+                         None)
+            return clean(title) if title else None
+    return None
+
+
 def dialog_message(lines: list[str]) -> str:
     """What the dialog is asking for."""
-    question = claude_question(lines)
+    question = claude_question(lines) or pi_question(lines)
     if question:
         return question
     dialog = lines[-DIALOG_LINES:]

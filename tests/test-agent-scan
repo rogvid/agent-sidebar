@@ -12,7 +12,8 @@
 
 Every sample below is a real `tmux capture-pane` tail, trimmed to the live
 UI region: claude 2.1.247/2.1.248/2.1.250/2.1.270/2.1.284 and opencode
-1.18.23/1.18.31 across the five states.
+1.18.23/1.18.31 across the five states, and pi 0.79.0 idle and in its
+selectors.
 They are the regression net for the patterns in agent-scan, which are the
 only thing standing between a status row and a plausible lie.
 
@@ -265,6 +266,56 @@ OPENCODE_WAITING = """  ┃  △ Permission required
   ┃   Allow once   Allow always   Reject
   ┃"""
 
+# pi's selectors take the editor's place, between the transcript's last
+# rule and pi's footer. The trust prompt comes up on launch in a project
+# folder with instructions pi has not been told to trust.
+PI_TRUST = """────────────────────────────────────────────────────────────
+ Trust project folder?
+ ~/projects/app
+ This allows pi to read project instructions (AGENTS.md/CLAUDE.md), load .pi settings and resources, install missing project packages, and execute project
+ extensions.
+ → Trust
+   Trust (this session only)
+   Do not trust
+   Do not trust (this session only)
+ ↑↓ navigate  enter select  escape/ctrl+c cancel
+────────────────────────────────────────────────────────────
+~/projects/app (main)
+0.0%/0 (auto)                                                        unknown"""
+
+PI_SELECTOR = """ Update Available
+ New version 0.99.1 is available. Run pi update
+ Changelog: https://pi.dev/changelog
+────────────────────────────────────────────────────────────
+────────────────────────────────────────────────────────────
+ Select authentication method:
+ → Use a subscription
+   Use an API key
+ ↑↓ navigate  enter select  escape/ctrl+c cancel
+────────────────────────────────────────────────────────────
+~/projects/app (main)
+0.0%/0 (auto)                                                        unknown"""
+
+# Idle, the empty editor sits between two rules above the footer.
+PI_IDLE = """ Update Available
+ New version 0.99.1 is available. Run pi update
+ Changelog: https://pi.dev/changelog
+────────────────────────────────────────────────────────────
+────────────────────────────────────────────────────────────
+
+────────────────────────────────────────────────────────────
+~/projects/app (main)
+0.0%/0 (auto)                                                        unknown"""
+
+# pi's own transcript quoting its selector's key hints, editor below.
+PI_QUOTED_HINT = """ The selector closes with this row:
+ ↑↓ navigate  enter select  escape/ctrl+c cancel
+────────────────────────────────────────────────────────────
+
+────────────────────────────────────────────────────────────
+~/projects/app (main)
+0.0%/0 (auto)                                                        unknown"""
+
 # A pane displaying someone else's dialog, with its own input bar below it.
 QUOTED_CLAUDE_DIALOG = CLAUDE_WAITING_EDIT + "\n" + CLAUDE_IDLE
 QUOTED_OPENCODE_DIALOG = OPENCODE_WAITING + "\n" + CLAUDE_IDLE
@@ -312,6 +363,10 @@ STATE_CASES = (
     ("opencode done", OPENCODE_IDLE, "done"),
     ("opencode running", OPENCODE_RUNNING, "running"),
     ("opencode blocked", OPENCODE_WAITING, "blocked"),
+    ("pi done", PI_IDLE, "done"),
+    ("pi blocked (trust dialog)", PI_TRUST, "blocked"),
+    ("pi blocked (selector)", PI_SELECTOR, "blocked"),
+    ("pi pane quoting its key hints", PI_QUOTED_HINT, "done"),
     ("done pane quoting claude dialog", QUOTED_CLAUDE_DIALOG, "done"),
     ("done pane quoting opencode dialog", QUOTED_OPENCODE_DIALOG, "done"),
     ("done pane quoting a question", QUOTED_ASK_DIALOG, "done"),
@@ -536,6 +591,11 @@ MESSAGE_CASES = (
      "How should the step registry get populated?"),
     ("blocked shows opencode's action", "blocked", OPENCODE_WAITING,
      "Edit note.txt"),
+    # The title, not the option the arrow is on.
+    ("blocked shows pi's question", "blocked", PI_TRUST,
+     "Trust project folder?"),
+    ("blocked shows pi's selector title", "blocked", PI_SELECTOR,
+     "Select authentication method:"),
     ("delegated shows what the delegate is doing", "delegated",
      CLAUDE_DELEGATED, "Re-seeding demo.db"),
     ("delegated names each of them", "delegated", CLAUDE_DELEGATED_PAIR,
