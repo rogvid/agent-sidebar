@@ -38,6 +38,13 @@ With many agents open, `h` folds a project into one line that counts its
 agents by state, and `c` puts an agent on one line. Both are remembered in
 $XDG_STATE_HOME/agent-sidebar/state.json for the next sidebar.
 
+Whenever the agents running change, the sidebar saves what it takes to
+start them again - each one's tmux session, folder, account, command line
+and conversation - to $XDG_STATE_HOME/agent-sidebar/saves.json, and keeps
+the last three saves, ten minutes or more apart. After a crash, `R` lists
+them: pick one and every agent in it that is not running is started again
+where it was, claude in the conversation it was in.
+
 Settings, and a `hide` list of tmux sessions whose agents it leaves out,
 are in ${XDG_CONFIG_HOME:-~/.config}/agent-sidebar/config.toml (see
 agent-sidebar-config). When that file is broken it says so in red and runs
@@ -57,6 +64,8 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import re
+import shlex
 import subprocess
 import time
 from collections import Counter, deque
@@ -93,6 +102,11 @@ PR_INTERVAL = 120.0
 # agent-usage-tap rewrites an account's limits at most every few seconds,
 # and a percent a few seconds late costs nothing.
 USAGE_INTERVAL = 10.0
+# How many saves of the running agents are kept, and how far apart. Apart,
+# because agents dying one after another are each a change: saves kept one
+# per change would all be of the dying.
+SAVE_KEEP = 3
+SAVE_SPACING = 600.0
 
 # agent-scan's colours, as terminal palette names so the sidebar reads in
 # the same theme as the panes beside it.
@@ -362,6 +376,8 @@ ACTIONS = (
            "Switch every agent between one line and three"),
     Action("thread", "t", "t", "Thread",
            "Read the message and the rest of its thread in a popup"),
+    Action("restore", "R", "R", "Restore agents",
+           "Start the agents of a save again, where they were"),
     Action("config", "s", "s", "Settings",
            "Edit config.toml in nvim; the sidebar rescans when you quit"),
     Action("rescan", "r", "r", "Rescan", "Scan again now"),
@@ -703,6 +719,189 @@ def save_state(path: Path, collapsed: set[str], compact: set[str]) -> None:
         pass
 
 
+def saves_path(state: Path) -> Path:
+    """The saves, beside the state file."""
+    return state.with_name("saves.json")
+
+
+def saved_agents(rows: list[Row]) -> list[Row]:
+    """What it takes to start each agent again, in an order that does not
+    depend on agent-scan's: a save is rewritten only when this changes."""
+    agents = [
+        {
+            # tmux allows no colon in a session's name.
+            "session": row["target"].split(":", 1)[0],
+            "cwd": row.get("cwd") or "",
+            "project": row["project"],
+            "branch": row["branch"],
+            "harness": row.get("harness") or row["agent"],
+            "account": row.get("account") or "",
+            "argv": list(row.get("argv") or ()),
+            "session_id": row.get("session_id") or "",
+        }
+        for row in rows
+    ]
+    return sorted(agents, key=lambda a: (a["session"], a["cwd"],
+                                         a["session_id"], a["argv"]))
+
+
+def load_saves(path: Path) -> list[Row]:
+    """The saves, newest first; none when the file is missing or not one
+    this wrote."""
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return []
+    saves = data.get("saves") if isinstance(data, dict) else None
+    if not isinstance(saves, list):
+        return []
+    return [
+        save for save in saves
+        if isinstance(save, dict)
+        and isinstance(save.get("since"), (int, float))
+        and isinstance(save.get("saved_at"), (int, float))
+        and isinstance(save.get("agents"), list)
+        and all(isinstance(agent, dict) for agent in save["agents"])
+    ][:SAVE_KEEP]
+
+
+def with_save(saves: list[Row], agents: list[Row], now: float) -> list[Row] | None:
+    """The saves once these agents are saved, None when there is nothing
+    new to save.
+
+    The newest save takes every change for SAVE_SPACING after it was
+    started; only then does a change start a new one and push the oldest
+    out. So the saves behind the newest are of states that lasted, however
+    fast the changes come. No agents is never saved: that is what a
+    sidebar sees after a crash, with the saves it is there to keep.
+    """
+    if not agents or (saves and saves[0]["agents"] == agents):
+        return None
+    save = {"since": now, "saved_at": now, "agents": agents}
+    if saves and now - saves[0]["since"] < SAVE_SPACING:
+        return [save | {"since": saves[0]["since"]}, *saves[1:]]
+    return [save, *saves][:SAVE_KEEP]
+
+
+def write_saves(path: Path, saves: list[Row]) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Replaced whole: a crash mid-write must not cost the saves.
+        partial = path.with_suffix(".partial")
+        partial.write_text(json.dumps({"saves": saves}, indent=1) + "\n")
+        partial.replace(path)
+    except OSError:
+        pass
+
+
+def not_running(agents: list[Row], rows: list[Row]) -> list[Row]:
+    """The saved agents that are not among the running ones: by their
+    conversation where the harness names it, else by harness and folder."""
+    conversations = {row.get("session_id") for row in rows} - {"", None}
+    places = {(row.get("harness") or row["agent"], row.get("cwd"))
+              for row in rows}
+    return [
+        agent for agent in agents
+        if (agent.get("session_id") not in conversations
+            if agent.get("session_id")
+            else (agent.get("harness"), agent.get("cwd")) not in places)
+    ]
+
+
+# claude's options that pick or make the conversation or the place to have
+# it in. A restored agent has both already.
+RESUME_DROPPED = frozenset({
+    "-r", "--resume", "-c", "--continue", "--session-id", "--fork-session",
+    "--from-pr", "--teleport", "-w", "--worktree", "--tmux",
+})
+_OPTION_LINE = re.compile(r"^  (-\S.*?)(?:\s{2,}.*)?$")
+_OPTION_VALUE = re.compile(r" ([<\[]).*$")
+_OPTION_NAME = re.compile(r"(?<![\w-])--?[A-Za-z][\w-]*")
+
+
+def option_kinds(help_text: str) -> dict[str, str]:
+    """What each option in a `--help` takes after it: "" nothing,
+    "required" (`<value>`), "optional" (`[value]`) or "variadic"
+    (`<values...>`). Options are the lines indented by two spaces; what
+    wraps under them is indented further."""
+    kinds: dict[str, str] = {}
+    for line in help_text.splitlines():
+        match = _OPTION_LINE.match(line)
+        if match is None:
+            continue
+        spec = match.group(1)
+        value = _OPTION_VALUE.search(spec)
+        names = spec[:value.start()] if value else spec
+        if value is None:
+            kind = ""
+        elif "..." in value.group():
+            kind = "variadic"
+        else:
+            kind = "required" if value.group(1) == "<" else "optional"
+        for name in _OPTION_NAME.findall(names):
+            kinds[name] = kind
+    return kinds
+
+
+def resume_argv(
+    argv: list[str], session_id: str, kinds: dict[str, str],
+) -> list[str]:
+    """claude's command line for going on with a conversation: the options
+    it was started with, read the way claude reads them, without the ones
+    that picked the conversation and without the prompt it was started
+    with - which would be sent again."""
+    program, rest = argv[0], argv[1:]
+    kept: list[str] = []
+    i = 0
+    while i < len(rest):
+        word = rest[i]
+        i += 1
+        if word == "--":
+            # Everything after it is the prompt.
+            break
+        if not word.startswith("-") or word == "-":
+            continue
+        name = word.split("=", 1)[0] if word.startswith("--") else word
+        group = [word]
+        kind = kinds.get(name, "") if "=" not in word[len(name):] else ""
+        if kind == "required" and i < len(rest):
+            group.append(rest[i])
+            i += 1
+        elif kind in ("optional", "variadic"):
+            while i < len(rest) and not rest[i].startswith("-"):
+                group.append(rest[i])
+                i += 1
+                if kind == "optional":
+                    break
+        if name not in RESUME_DROPPED:
+            kept += group
+    return [program, *kept, "--resume", session_id]
+
+
+def resume_command(agent: Row, kinds: dict[str, str] | None) -> str:
+    """The shell command that starts a saved agent again. claude goes on
+    with its conversation; with no option table to read its command line by,
+    with nothing but that. Any other harness, or a claude whose conversation
+    was not known, starts the way it was started."""
+    argv = [str(word) for word in agent.get("argv") or ()] or [agent["harness"]]
+    session_id = agent.get("session_id")
+    if agent.get("harness") == "claude" and session_id:
+        argv = (resume_argv(argv, session_id, kinds) if kinds
+                else [argv[0], "--resume", session_id])
+    return shlex.join(argv)
+
+
+def save_title(save: Row, now: float) -> str:
+    """When a save was made, as short as says it."""
+    at = datetime.fromtimestamp(save["saved_at"])
+    today = datetime.fromtimestamp(now).date()
+    if at.date() == today:
+        return at.strftime("%H:%M")
+    if (today - at.date()).days < 7:
+        return at.strftime("%a %H:%M")
+    return at.strftime("%d %b %H:%M")
+
+
 class Tail:
     """A file only ever appended to, read a whole line at a time: each call
     hands the lines added since the last, and a line still being written
@@ -1005,6 +1204,19 @@ async def run(*command: str) -> None:
     await proc.wait()
 
 
+async def program_help(program: str) -> str:
+    """A program's `--help`, "" when it cannot be had."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            program, "--help",
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), 10)
+    except (OSError, TimeoutError):
+        return ""
+    return out.decode(errors="replace") if proc.returncode == 0 else ""
+
+
 class NewWorktreePrompt(ModalScreen[dict | None]):
     """Single modal: branch + harness + yolo.
 
@@ -1134,6 +1346,56 @@ class Confirm(ModalScreen[bool]):
 
     def action_answer(self, yes: bool) -> None:
         self.dismiss(yes)
+
+
+class Restore(ModalScreen[list | None]):
+    """The saves, newest first. ⏎ hands back the agents of the highlighted
+    one that are not running."""
+
+    BINDINGS = [
+        Binding("escape,q", "cancel", "cancel"),
+        Binding("enter", "restore", "restore", priority=True),
+        Binding("j", "cursor_down", "down", show=False),
+        Binding("k", "cursor_up", "up", show=False),
+    ]
+
+    def __init__(self, saves: list[Row], rows: list[Row], now: float) -> None:
+        super().__init__()
+        self._missing = [not_running(save["agents"], rows) for save in saves]
+        self._options = []
+        for index, (save, missing) in enumerate(zip(saves, self._missing)):
+            count = len(save["agents"])
+            self._options.append(Option(Text.assemble(
+                (save_title(save, now), "bold"),
+                f"  {count} agent{'s' if count != 1 else ''}\n",
+                # The hint's grey: the muted one cannot be read on the
+                # highlight.
+                (f"{len(missing)} to start" if missing else "all running",
+                 "#a6adc8"),
+            ), id=str(index)))
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="dialog"):
+            yield Static("Restore agents", classes="dialog-title")
+            yield OptionList(*self._options, id="save-list")
+            yield Static("j/k move  ⏎ restore\nesc cancel", classes="hint")
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def action_cursor_down(self) -> None:
+        self.query_one("#save-list", OptionList).action_cursor_down()
+
+    def action_cursor_up(self) -> None:
+        self.query_one("#save-list", OptionList).action_cursor_up()
+
+    def action_restore(self) -> None:
+        index = self.query_one("#save-list", OptionList).highlighted
+        missing = self._missing[index] if index is not None else []
+        if not missing:
+            self.app.bell()
+            return
+        self.dismiss(missing)
 
 
 class Help(ModalScreen[None]):
@@ -1300,6 +1562,16 @@ class AgentSidebar(App[None]):
         max-height: 10;
         margin-bottom: 1;
     }
+    #save-list {
+        height: auto;
+        max-height: 8;
+        margin-top: 1;
+        background: #181825;
+    }
+    #save-list > .option-list--option-highlighted {
+        color: #cdd6f4;
+        background: #585b70;
+    }
     #harness-list:focus {
         border-left: thick #89b4fa;
         padding-left: 1;
@@ -1359,6 +1631,7 @@ class AgentSidebar(App[None]):
         state: Path | None = None,
         panes: Callable[[], Awaitable[dict[str, str]]] = all_panes,
         messages: Path | None = None,
+        help: Callable[[str], Awaitable[str]] = program_help,
     ) -> None:
         super().__init__(ansi_color=True)
         self._scan = scan
@@ -1382,6 +1655,11 @@ class AgentSidebar(App[None]):
         self._prs_checked: dict[str, float] = {}
         self._state = state or state_path()
         self._collapsed, self._compact = load_state(self._state)
+        self._help = help
+        self._saves_path = saves_path(self._state)
+        self._saves = load_saves(self._saves_path)
+        # Every agent of the last scan, the hidden ones too.
+        self._scanned: list[Row] = []
         self._panes = panes
         self._log = MessageLog(messages or self._state.parent)
         # The unread messages in each agent's inbox.
@@ -1465,6 +1743,8 @@ class AgentSidebar(App[None]):
             # scan is worse than one that is a second old.
             self.show_header(self._rows, ok=False)
             return
+        self._scanned = rows
+        self.save(rows)
         # Hidden agents are left out before anything else looks: the
         # header's counts, the announcements, the usage overview.
         rows = [row for row in rows if not row.get("hidden")]
@@ -1475,6 +1755,12 @@ class AgentSidebar(App[None]):
         self.show_rows()
         self.refresh_usage()
         self.show_usage()
+
+    def save(self, rows: list[Row]) -> None:
+        saves = with_save(self._saves, saved_agents(rows), time.time())
+        if saves is not None:
+            self._saves = saves
+            write_saves(self._saves_path, saves)
 
     def announce(self, rows: list[Row], here: set[str]) -> None:
         """Say on the status line when an agent elsewhere stops for you."""
@@ -1856,6 +2142,52 @@ class AgentSidebar(App[None]):
             )
             self.push_screen(Confirm(question), kill)
         self.on_agent(ask)
+
+    def action_restore(self) -> None:
+        if not self._saves:
+            self.say("no saves to restore from yet")
+            return
+
+        def restore(agents: list | None) -> None:
+            if agents:
+                self.run_worker(self.restore(agents))
+
+        self.push_screen(
+            Restore(self._saves, self._scanned, time.time()), restore)
+
+    async def restore(self, agents: list[Row]) -> None:
+        """Start saved agents again, one after another: two for one
+        session would otherwise both find it missing and both make it."""
+        tables: dict[str, dict[str, str]] = {}
+        started = gone = 0
+        for agent in agents:
+            if not os.path.isdir(agent.get("cwd") or ""):
+                gone += 1
+                continue
+            kinds = None
+            if agent.get("harness") == "claude" and agent.get("argv"):
+                program = agent["argv"][0]
+                if program not in tables:
+                    tables[program] = option_kinds(await self._help(program))
+                kinds = tables[program]
+            await self._run(
+                GLUE, "resume", agent["session"], agent["cwd"],
+                agent["harness"], agent.get("account") or "",
+                resume_command(agent, kinds),
+            )
+            started += 1
+        said = f"started {started} agent{'s' if started != 1 else ''}"
+        if gone:
+            said += f", {gone} whose folder is gone left out"
+        self.say(said)
+        self._wake.set()
+
+    def say(self, text: str) -> None:
+        """On tmux's status line; the sidebar has no line to spare."""
+        self.run_worker(self._run(
+            "tmux", "display-message", "-d", "5000",
+            f"agent-sidebar: {text}".replace("#", "##"),
+        ))
 
     def action_remove_worktree(self) -> None:
         self.on_agent(lambda row: self.glue("remove-worktree", row["pane_id"]))

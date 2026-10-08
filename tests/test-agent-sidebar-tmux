@@ -64,10 +64,11 @@ cat >"${scratch}/bin/less" <<EOF
 echo "\$*" >"${scratch}/less-args"
 cat >"${scratch}/less-in"
 EOF
-# A harness that notes the account it was started on.
+# A harness that notes the account it was started on, and with what.
 cat >"${scratch}/bin/claude" <<'EOF'
 #!/bin/sh
 echo "${CLAUDE_CONFIG_DIR:-default}" >claude-account
+echo "$*" >claude-args
 EOF
 chmod +x "${scratch}/bin/"*
 
@@ -400,6 +401,25 @@ check "then the agent's pane" not pane_alive "${wt_agent}"
 
 act kill "${main_agent}"
 check "kill kills the pane" not pane_alive "${main_agent}"
+
+# Restoring a save: each of its agents is started again with resume.
+mkdir -p "${scratch}/saved" "${scratch}/saved-too"
+windows() { t list-windows -t "=$1" -F x | wc -l | tr -d ' '; }
+act resume back "${scratch}/saved" claude "${home}/.claude-work" \
+    "claude --model 'a b' --resume 1234" >/dev/null
+check "resume starts the command in a session of that name" equals \
+    "cat ${scratch}/saved/claude-args" "--model a b --resume 1234"
+check "in the saved folder" equals \
+    "t display-message -p -t =back: #{pane_current_path}" "${scratch}/saved"
+check "on the saved account" equals "on_account ${scratch}/saved" \
+    "${home}/.claude-work"
+act resume back "${scratch}/saved-too" claude "" "claude --resume 5678" >/dev/null
+check "a session that is there gets a window more" equals "windows back" 2
+check "on the default account when none was saved" equals \
+    "on_account ${scratch}/saved-too" default
+check "resume refuses a folder that is gone" not act resume gone \
+    "${scratch}/nowhere" claude "" claude
+check "and starts no session for it" not t has-session -t "=gone"
 
 act open
 check "open picks from the projects channel" equals "cat ${scratch}/tv-args" projects

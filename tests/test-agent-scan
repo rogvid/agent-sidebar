@@ -834,6 +834,11 @@ def program(command: str) -> str:
 HARNESS_STAND_IN = "#!/bin/bash\ntimeout 3600 sleep 3600\n"
 # A session the agent-sidebar config hides, with an agent in it.
 HIDDEN_SESSION = "orchestrator"
+# A claude started with options and a prompt, on an account that records
+# the conversation it is in the way claude does.
+RESUMABLE = "resumable"
+RESUMABLE_ARGS = ["--model", "opus", "do it"]
+RESUMABLE_SESSION = "0d5c1a2e-0000-4000-8000-000000000001"
 
 
 def scan_real_panes(root: Path) -> tuple[dict[str, dict | None], str]:
@@ -884,9 +889,18 @@ def scan_real_panes(root: Path) -> tuple[dict[str, dict | None], str]:
             "new-session", "-d", "-P", "-F", "#{pane_id}",
             "-s", HIDDEN_SESSION, "-c", str(root / HIDDEN_SESSION), "claude",
         )
+        account = root / "account"
+        (account / "sessions").mkdir(parents=True)
+        (root / RESUMABLE).mkdir()
+        panes[RESUMABLE] = tmux(
+            "new-window", "-d", "-P", "-F", "#{pane_id}", "-t", "scan:",
+            "-c", str(root / RESUMABLE), "-e", f"CLAUDE_CONFIG_DIR={account}",
+            "claude", *RESUMABLE_ARGS,
+        )
         cases = [(name, command, want)
                  for name, _tree, command, want in PANE_CASES]
         cases.append((HIDDEN_SESSION, "claude", True))
+        cases.append((RESUMABLE, "claude", True))
         # Every pane is running its program, and every harness its tool.
         pids = {
             pane_id: int(pid) for pane_id, pid in (
@@ -915,6 +929,11 @@ def scan_real_panes(root: Path) -> tuple[dict[str, dict | None], str]:
                     for name, *_ in cases
                 ))
             time.sleep(0.1)
+        pane = psutil.Process(pids[panes[RESUMABLE]])
+        claude = next(p for p in [pane, *pane.children(True)]
+                      if p.name() == "claude")
+        (account / "sessions" / f"{claude.pid}.json").write_text(
+            json.dumps({"pid": claude.pid, "sessionId": RESUMABLE_SESSION}))
         socket_path = tmux("display-message", "-p", "#{socket_path}")
 
         def scan(flag: str) -> str:
@@ -1201,6 +1220,41 @@ def main() -> int:
         print(f"{'ok  ' if ok else 'FAIL'}  pane     {name:36} "
               f"want={want} got={got}")
 
+    with tempfile.TemporaryDirectory() as tmp:
+        sessions = Path(tmp) / "sessions"
+        sessions.mkdir()
+        started = 1_790_000_000.0
+
+        def recorded(harness: str = "claude", **record: object) -> str:
+            (sessions / "7.json").write_text(json.dumps(record))
+            return mod.harness_session(mod.Agent(harness, 7, started), tmp)
+
+        for name, got, want in (
+            ("a conversation recorded by this process",
+             recorded(sessionId="new", startedAt=started * 1000 + 800), "new"),
+            ("not one left by an earlier process with its pid",
+             recorded(sessionId="old", startedAt=(started - 3600) * 1000), ""),
+            ("not a file that is not claude's", recorded(other=1), ""),
+            ("only claude records one", recorded("codex", sessionId="x"), ""),
+        ):
+            ok = got == want
+            failures += not ok
+            print(f"{'ok  ' if ok else 'FAIL'}  session  {name:36} "
+                  f"want={want!r} got={got!r}")
+
+    resumable = scanned[RESUMABLE]
+    got = resumable and (resumable["session_id"], resumable["argv"][-3:])
+    ok = got == (RESUMABLE_SESSION, RESUMABLE_ARGS)
+    failures += not ok
+    print(f"{'ok  ' if ok else 'FAIL'}  pane     {'claude says its conversation and command':36} "
+          f"{'ok' if ok else f'got={got}'}")
+    plain = scanned["tool run is not the role"]
+    got = plain and plain["session_id"]
+    ok = got == ""
+    failures += not ok
+    print(f"{'ok  ' if ok else 'FAIL'}  pane     {'no conversation where none is recorded':36} "
+          f"{'ok' if ok else f'got={got}'}")
+
     hidden = scanned[HIDDEN_SESSION]
     ok = hidden is not None and hidden["hidden"] is True
     failures += not ok
@@ -1222,7 +1276,7 @@ def main() -> int:
              + len(IDENTITY_CASES) + len(FIT_CASES) + 1
              + len(TARGET_CASES) + 1 + 4 + len(CONTEXT_LEVEL_CASES)
              + len(TMUX_CASES) + len(TMUX_HIDDEN_CASES) + 3
-             + len(PANE_CASES) + 2)
+             + len(PANE_CASES) + 8)
     print(f"\n{total - failures}/{total} passed")
     return 1 if failures else 0
 

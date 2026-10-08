@@ -31,6 +31,13 @@
 #                            failures exit non-zero; prints the new
 #                            session's pane id. Without --account the
 #                            session keeps the caller's accounts.
+#   resume SESSION DIR HARNESS FOLDER COMMAND
+#                            start COMMAND in DIR again, in a new window of
+#                            SESSION, or in a new SESSION when there is
+#                            none, on the account HARNESS keeps in FOLDER
+#                            ("" for its default); prints the new pane's id.
+#                            What the sidebar's restore runs for each agent
+#                            of a save.
 #   accounts                 list each harness's accounts besides its
 #                            default: harness, name and folder, tab
 #                            separated
@@ -516,6 +523,38 @@ spawn() {
     echo "${new}"
 }
 
+# Start a saved agent again. The command comes from the sidebar, which made
+# it from the agent's own command line.
+resume() {
+    local session="$1" dir="$2" harness="$3" folder="$4" command="$5"
+    local variable pane
+    local -a env=()
+    if [[ ! -d "${dir}" ]]; then
+        echo "agent-sidebar-tmux: ${dir} is gone" >&2
+        return 1
+    fi
+    if variable="$(account_variable "${harness}")"; then
+        if [[ -n "${folder}" ]]; then
+            env=(-e "${variable}=${folder}")
+        else
+            # A window in a session started on an account inherits it.
+            command="env -u ${variable} ${command}"
+        fi
+    fi
+    if tmux has-session -t "=${session}" 2>/dev/null; then
+        pane="$(tmux new-window -d -P -F '#{pane_id}' -t "=${session}:" \
+            -c "${dir}" "${env[@]}")"
+    else
+        pane="$(tmux new-session -d -P -F '#{pane_id}' -s "${session}" \
+            -c "${dir}" "${env[@]}")"
+    fi
+    # Typed into the shell rather than run as the pane's command, so the
+    # pane outlives the agent.
+    tmux send-keys -t "${pane}" -l "${command}"
+    tmux send-keys -t "${pane}" Enter
+    echo "${pane}"
+}
+
 worktree_add() {
     if ! git-wt-add "$1"; then
         hold "git-wt-add failed. Press any key to close"
@@ -645,6 +684,10 @@ main() {
             exit 2
         fi
         "${command//-/_}" "${args[0]}" "${args[1]}" "${args[2]:-}" "${account}"
+        ;;
+    resume)
+        need 6 "$@"
+        resume "$2" "$3" "$4" "$5" "$6"
         ;;
     accounts)
         accounts

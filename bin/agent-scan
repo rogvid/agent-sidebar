@@ -486,6 +486,26 @@ def harness_account(harness: Agent) -> str:
         return ""
 
 
+def harness_session(harness: Agent, account: str) -> str:
+    """The id of the conversation a claude is in, "" when it cannot be
+    read or for another harness. claude keeps it, per process, in its
+    account's sessions/<pid>.json, and moves it on at /clear."""
+    if harness.name != "claude":
+        return ""
+    folder = account or os.path.expanduser("~/.claude")
+    try:
+        with open(os.path.join(folder, "sessions", f"{harness.pid}.json")) as f:
+            record = json.load(f)
+        session, started = record.get("sessionId"), record.get("startedAt")
+    except (OSError, ValueError, AttributeError):
+        return ""
+    # A claude that was killed leaves its file behind, and the pid comes
+    # round again: a file from before this process is another one's.
+    if isinstance(started, (int, float)) and started / 1000 < harness.started_at - 5:
+        return ""
+    return session if isinstance(session, str) else ""
+
+
 def _agent_from_cmdline(cmdline: list[str]) -> str | None:
     """Extract --agent value from a harness cmdline, if present."""
     for i, arg in enumerate(cmdline):
@@ -1175,6 +1195,11 @@ class Row:
     # In a session the config's hide names: out of the sidebar and the
     # status bar, still here for agents looking for it.
     hidden: bool = False
+    # What it takes to start the agent again where it left off: the
+    # harness's command line, and the id of the conversation it is in ("" when
+    # the harness does not say; see harness_session).
+    argv: tuple[str, ...] = ()
+    session_id: str = ""
 
 
 def sort_key(row: Row) -> tuple[int, int, float, str]:
@@ -1221,6 +1246,7 @@ def collect_rows(hide: Sequence[str] = ()) -> list[Row]:
         since = state_seconds(state, lines, now)
         project, branch = identities[pane.cwd]
         changes = parse_changes(lines) or git_changes(pane.cwd) or "-"
+        account = harness_account(harness_agent)
         message, message_full = messages(state, lines)
         rows.append(Row(
             state=state,
@@ -1242,8 +1268,10 @@ def collect_rows(hide: Sequence[str] = ()) -> list[Row]:
             message_full=message_full,
             flag=SHARED_TREE if trees[pane.cwd] > 1 else " ",
             changes=changes,
-            account=harness_account(harness_agent),
+            account=account,
             hidden=config.hidden(pane.session, hide),
+            argv=tuple(info[harness_agent.pid][1]),
+            session_id=harness_session(harness_agent, account),
         ))
 
     rows.sort(key=sort_key)
