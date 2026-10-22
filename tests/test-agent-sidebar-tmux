@@ -3,14 +3,15 @@
 #
 # The sidebar follows the window a client is looking at, so a real client
 # is attached: it runs inside a second throwaway server, and keys are typed
-# into it the way a terminal would. The binding and hooks come straight out
-# of tmux.conf, so the test and the config cannot drift apart.
+# into it the way a terminal would. The binding and hooks come from the
+# plugin's own agent-sidebar.tmux, run as TPM runs it, so the test and the
+# plugin cannot drift apart.
 #
-# Run: scripts/tests/test-agent-sidebar-tmux     (or `mise run test`)
+# Run: tests/test-agent-sidebar-tmux     (or `mise run test`)
 
 set -euo pipefail
 
-repo="$(cd "$(dirname "$0")/../.." && pwd)"
+repo="$(cd "$(dirname "$0")/.." && pwd)"
 readonly repo
 readonly socket="agent-sidebar-test-$$"
 readonly host="agent-sidebar-host-$$"
@@ -21,11 +22,13 @@ readonly scratch
 cleanup() {
     tmux -L "${socket}" kill-server 2>/dev/null || true
     tmux -L "${host}" kill-server 2>/dev/null || true
+    # tmux leaves the sockets of a killed server behind.
+    rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/"{"${socket}","${host}"}
     rm -rf "${scratch}"
 }
 trap cleanup EXIT
 
-grep -F 'agent-sidebar-tmux' "${repo}/tmux/.tmux.conf" >"${scratch}/tmux.conf"
+echo "run-shell '${repo}/agent-sidebar.tmux'" >"${scratch}/tmux.conf"
 # Without it a typed M-2 waits half a second to be told apart from Escape.
 echo 'set -g escape-time 0' >>"${scratch}/tmux.conf"
 # Panes here only run stand-ins; a login shell's rc files would only slow
@@ -87,9 +90,10 @@ git -C "${main}" -c user.name=t -c user.email=t@t -c commit.gpgsign=false \
 
 t() { tmux -L "${socket}" "$@"; }
 
-# The test server's jobs - the hooks - inherit this environment. The sidebar
-# itself is a stand-in: this checks where the pane goes, not what it draws.
-export PATH="${scratch}/bin:${repo}/scripts/.local/bin:${PATH}"
+# The test server's jobs - the hooks - inherit this environment, with the
+# plugin's bin put in front by agent-sidebar.tmux. The sidebar itself is a
+# stand-in: this checks where the pane goes, not what it draws.
+export PATH="${scratch}/bin:${PATH}"
 export AGENT_SIDEBAR_COMMAND="sleep 3600"
 export AGENT_SIDEBAR_AGENT="touch agent-started"
 unset TMUX TMUX_PANE
@@ -189,7 +193,7 @@ dump_state() {
     pgrep -af 'bin/agent-sidebar-(tmux|config)' | sed 's/^/        /' || true
     echo "      toggle, traced:"
     TMUX="$(t display-message -p '#{socket_path},#{pid},0')" \
-        bash -x "${repo}/scripts/.local/bin/agent-sidebar-tmux" toggle 2>&1 |
+        bash -x "${repo}/bin/agent-sidebar-tmux" toggle 2>&1 |
         tail -n 60 | sed 's/^/        /'
 }
 
@@ -310,7 +314,7 @@ check "and closes it again" equals sidebar_count 0
 printf 'pane\tmain\t1\t1\t:*\t0\tagent-sidebar\t:/home\t0\tsleep\t:\n' >"${scratch}/save"
 printf 'pane\tmain\t1\t1\t:*\t1\tzsh\t:/home\t1\tzsh\t:\n' >>"${scratch}/save"
 printf 'window\tmain\t1\t:one\t1\t:*\tlayout\t:\n' >>"${scratch}/save"
-agent-sidebar-tmux prune-resurrect "${scratch}/save"
+"${repo}/bin/agent-sidebar-tmux" prune-resurrect "${scratch}/save"
 pruned() { [[ "$(cut -f1,7 "${scratch}/save" | tr '\t\n' ' ;')" == "pane zsh;window layout;" ]]; }
 check "resurrect saves leave the sidebar out" pruned
 

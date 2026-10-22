@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# Checks for agent-sidebar.tmux, the plugin entry point, on throwaway tmux
+# servers: what it binds, what it puts in front of status-right and PATH,
+# its options, and that running it again (a re-source) stacks nothing.
+#
+# test-agent-sidebar-tmux drives the sidebar the plugin sets up; this only
+# checks the setting up.
+#
+# Run: tests/test-agent-sidebar-plugin     (or `mise run test`)
+
+set -euo pipefail
+
+repo="$(cd "$(dirname "$0")/.." && pwd)"
+readonly repo plugin="${repo}/agent-sidebar.tmux"
+scratch="$(mktemp -d)"
+readonly scratch
+readonly servers=(plain own nokey)
+
+cleanup() {
+    local server
+    for server in "${servers[@]}"; do
+        tmux -L "agent-sidebar-plugin-${server}-$$" kill-server 2>/dev/null || true
+        rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/agent-sidebar-plugin-${server}-$$"
+    done
+    rm -rf "${scratch}"
+}
+trap cleanup EXIT
+
+unset TMUX TMUX_PANE
+# Copies of the tools installed elsewhere (~/.local/bin) would answer for
+# the plugin's own.
+PATH="$(tr ':' '\n' <<<"${PATH}" | grep -vxF -e "${HOME}/.local/bin" -e "${repo}/bin" | paste -sd:)"
+export PATH
+
+failures=0
+total=0
+
+check() {
+    local name="$1"
+    shift
+    total=$((total + 1))
+    if "$@" 2>/dev/null; then
+        printf 'ok    %s\n' "${name}"
+    else
+        printf 'FAIL  %s\n' "${name}"
+        failures=$((failures + 1))
+    fi
+}
+
+not() { ! "$@"; }
+same() { [[ "$1" == "$2" ]]; }
+contains() { [[ "$1" == *"$2"* ]]; }
+count() { grep -oF -- "$2" <<<"$1" | wc -l | tr -d ' '; }
+
+# server NAME CONFIG-LINE...: a fresh server whose config is the lines, then
+# the plugin, as TPM's `run` at the end of tmux.conf would.
+server() {
+    local name="agent-sidebar-plugin-$1-$$" conf="${scratch}/$1.conf"
+    shift
+    printf '%s\n' "$@" "run-shell '${plugin}'" >"${conf}"
+    tmux -L "${name}" -f "${conf}" new-session -d -s main
+    printf '%s\n' "${name}"
+}
+
+t() { local name="$1"; shift; tmux -L "${name}" "$@"; }
+key() { t "$1" list-keys -T root "$2" 2>/dev/null; }
+
+plain="$(server plain 'set -g status-right "theirs"')"
+check "M-2 toggles the sidebar" contains "$(key "${plain}" M-2)" "${repo}/bin/agent-sidebar-tmux' toggle"
+check "a hook follows the viewed window" \
+    contains "$(t "${plain}" show-hooks -g session-window-changed)" "${repo}/bin/agent-sidebar-tmux' follow"
+check "the agent counts go in front of status-right" \
+    same "$(t "${plain}" show-options -gv status-right)" "#('${repo}/bin/agent-scan' --tmux)theirs"
+check "bin goes on the server's PATH" \
+    contains ":$(t "${plain}" show-environment -g PATH | sed 's/^PATH=//'):" ":${repo}/bin:"
+check "a job finds the tools by name" \
+    same "$(t "${plain}" run-shell 'command -v agent-scan')" "${repo}/bin/agent-scan"
+check "tmux-resurrect leaves the sidebar out of its saves" \
+    contains "$(t "${plain}" show-options -gqv @resurrect-hook-post-save-layout)" "prune-resurrect"
+
+t "${plain}" run-shell "${plugin}"
+check "a re-source adds no second count" \
+    same "$(count "$(t "${plain}" show-options -gv status-right)" agent-scan)" 1
+check "nor a second PATH entry" \
+    same "$(count "$(t "${plain}" show-environment -g PATH)" "${repo}/bin")" 1
+check "nor a second hook" \
+    same "$(t "${plain}" show-hooks -g client-attached | grep -c agent-sidebar-tmux)" 1
+
+own="$(server own \
+    'set -g @agent-sidebar-key M-s' \
+    'set -g @agent-sidebar-status off' \
+    'set -g status-right "theirs"' \
+    'set -g @resurrect-hook-post-save-layout "my-hook"')"
+check "@agent-sidebar-key moves the key" contains "$(key "${own}" M-s)" "agent-sidebar-tmux' toggle"
+check "and M-2 is left free" not contains "$(key "${own}" M-2)" agent-sidebar
+check "@agent-sidebar-status off leaves status-right alone" \
+    same "$(t "${own}" show-options -gv status-right)" theirs
+check "a resurrect hook of its own is kept" \
+    same "$(t "${own}" show-options -gqv @resurrect-hook-post-save-layout)" my-hook
+
+nokey="$(server nokey 'set -g @agent-sidebar-key off')"
+check "@agent-sidebar-key off binds no key" \
+    not contains "$(t "${nokey}" list-keys -T root)" agent-sidebar-tmux
+
+printf '\n%s/%s passed\n' "$((total - failures))" "${total}"
+((failures == 0))
