@@ -7,7 +7,7 @@
 # direnv and mise are stand-ins on PATH that log how they were called, so the
 # checks can tell "called only when relevant" apart from "not installed".
 #
-# Run: scripts/tests/test-git-wt-bootstrap     (or `mise run test`)
+# Run: tests/test-git-wt-bootstrap     (or `mise run test`)
 
 set -euo pipefail
 
@@ -17,7 +17,7 @@ while IFS= read -r name; do
     unset "${name}"
 done < <(env | sed -n 's/^\(GIT_[A-Za-z0-9_]*\)=.*/\1/p')
 
-repo="$(cd "$(dirname "$0")/../.." && pwd)"
+repo="$(cd "$(dirname "$0")/.." && pwd)"
 readonly repo
 scratch="$(mktemp -d)"
 readonly scratch
@@ -37,7 +37,7 @@ git config --global init.defaultBranch main
 readonly stubs="${scratch}/stubs"
 readonly calls="${scratch}/calls"
 mkdir -p "${stubs}"
-export PATH="${stubs}:${repo}/scripts/.local/bin:${PATH}"
+export PATH="${stubs}:${repo}/bin:${PATH}"
 
 failures=0
 total=0
@@ -250,7 +250,7 @@ put "${main}" .envrc "use mise"
 wt="${scratch}/nomise/projects/app/one"
 git -C "${main}" worktree add -q -b one "${wt}"
 check "without direnv or mise installed it still succeeds" \
-    quiet env PATH="${bare}" "${repo}/scripts/.local/bin/git-wt-bootstrap" "${wt}"
+    quiet env PATH="${bare}" "${repo}/bin/git-wt-bootstrap" "${wt}"
 
 # --- git-wt-add ---------------------------------------------------------------
 

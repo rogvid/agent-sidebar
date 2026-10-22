@@ -2,11 +2,11 @@
 # Checks for git-projects: which directories count as projects, and their
 # order.
 #
-# Run: scripts/tests/test-git-projects     (or `mise run test`)
+# Run: tests/test-git-projects     (or `mise run test`)
 
 set -euo pipefail
 
-repo="$(cd "$(dirname "$0")/../.." && pwd)"
+repo="$(cd "$(dirname "$0")/.." && pwd)"
 readonly repo
 scratch="$(mktemp -d)"
 readonly scratch
@@ -54,7 +54,7 @@ touch -d "2022-01-01" "${root}/projects/fresh/.git"
 mkdir -p "${root}/projects/plain"
 project "${scratch}/.hidden-root/inside" "2026-01-01"
 
-list="$(PATH="${repo}/scripts/.local/bin:${PATH}" git-projects "${root}")"
+list="$(PATH="${repo}/bin:${PATH}" git-projects "${root}")"
 
 failures=0
 total=0
@@ -96,7 +96,7 @@ want="$(printf '%s\n' \
 same_order() { [[ "${list}" == "${want}" ]]; }
 check "most recently used first" same_order
 
-hidden_root="$(PATH="${repo}/scripts/.local/bin:${PATH}" git-projects "${scratch}/.hidden-root")"
+hidden_root="$(PATH="${repo}/bin:${PATH}" git-projects "${scratch}/.hidden-root")"
 check "a hidden root asked for by name is searched" \
     [ "${hidden_root}" == "${scratch}/.hidden-root/inside" ]
 

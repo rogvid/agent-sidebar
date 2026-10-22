@@ -17,10 +17,10 @@ scratch TMUX_TMPDIR, so the user's own server is never touched.
 The bootstrap copy/link rules themselves live in test-git-wt-bootstrap; only
 the rule that a linked path never shows up in git status is checked here.
 
-Run: scripts/tests/test-git-wt                      (or `mise run test`)
-     scripts/tests/test-git-wt --only remove        sections whose name matches
-     scripts/tests/test-git-wt --via-wrappers       every check through git-wt-<cmd>
-     TEST_GIT_WT_KEEP=1 scripts/tests/test-git-wt   keep the scratch dir
+Run: tests/test-git-wt                      (or `mise run test`)
+     tests/test-git-wt --only remove        sections whose name matches
+     tests/test-git-wt --via-wrappers       every check through git-wt-<cmd>
+     TEST_GIT_WT_KEEP=1 tests/test-git-wt   keep the scratch dir
 """
 
 from __future__ import annotations
@@ -39,8 +39,8 @@ import traceback
 from dataclasses import dataclass
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[2]
-BIN = REPO / "scripts" / ".local" / "bin"
+REPO = Path(__file__).resolve().parents[1]
+BIN = REPO / "bin"
 
 USAGE = "Usage: test-git-wt [--via-wrappers] [--only SECTION]..."
 
