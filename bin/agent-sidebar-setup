@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# agent-sidebar-setup - set up the parts of agent-sidebar that live outside
+# tmux. Safe to re-run; run it again after moving the plugin.
+#
+#   agent-sidebar-setup            make the changes
+#   agent-sidebar-setup --check    say what it would change, touch nothing
+#
+# It does two things:
+#
+#   - Links the agent-sidebar skill, which tells agents how to use
+#     agent-scan and agent-msg, into ~/.agents/skills (Codex, OpenCode and
+#     Pi read it there) and into the skills folder of every Claude Code
+#     config folder (~/.claude and each ~/.claude-* profile). It is a link
+#     to this plugin's copy, so it always matches the tools.
+#
+#   - Puts agent-usage-tap in front of each Claude Code statusline, in the
+#     settings.json of each of those folders, so the sidebar can show how
+#     much of each account's 5 hour and weekly limits is used. Claude Code
+#     hands those only to its statusline. settings.json is Claude Code's
+#     own, so only statusLine changes, and folders that link one
+#     settings.json share one edit. Claude Code also runs outside tmux,
+#     where this plugin is not on PATH, so the tap goes in by its path.
+set -euo pipefail
+
+bin="$(dirname "$(realpath "$0")")"
+readonly bin
+skill="$(dirname "${bin}")/skills/agent-sidebar"
+readonly skill
+# The shell Claude Code runs the statusline in expands a leading ~.
+readonly tap="${bin/#"${HOME}"/\~}/agent-usage-tap"
+CHECK=0
+case "${1:-}" in
+    --check) CHECK=1 ;;
+    "") ;;
+    *) echo "Usage: agent-sidebar-setup [--check]" >&2; exit 2 ;;
+esac
+
+say() { printf '  %s\n' "$*"; }
+head_() { printf '\n%s\n' "$*"; }
+would() { ((CHECK)) && { say "would: $*"; return 1; }; return 0; }
+
+claude_dirs() {
+    local cfg
+    for cfg in "${HOME}/.claude" "${HOME}"/.claude-*/; do
+        cfg="${cfg%/}"
+        [[ -d "${cfg}" ]] && printf '%s\n' "${cfg}"
+    done
+}
+
+link_skill() {
+    head_ "skill -> ~/.agents/skills and Claude Code config folders"
+    local dir link changed=0 dirs
+    mapfile -t dirs < <(claude_dirs | sed 's|$|/skills|')
+    for dir in "${HOME}/.agents/skills" "${dirs[@]}"; do
+        link="${dir}/agent-sidebar"
+        [[ -L "${link}" && "$(realpath "${link}")" == "$(realpath "${skill}")" ]] && continue
+        if [[ -e "${link}" && ! -L "${link}" ]]; then
+            say "skipped  ${link} - not a link; remove it to use the plugin's"
+            continue
+        fi
+        changed=1
+        would "link ${link}" || continue
+        mkdir -p "${dir}"
+        ln -sfn "${skill}" "${link}"
+        say "linked   ${link}"
+    done
+    ((changed)) || say "every skills folder links the plugin's skill"
+}
+
+wire_usage_tap() {
+    head_ "agent-usage-tap -> Claude Code statusline"
+    command -v jq >/dev/null || { say "skipped - needs jq"; return 0; }
+    local cfg settings real current command first updated changed=0
+    local -A seen=()
+    while IFS= read -r cfg; do
+        settings="${cfg}/settings.json"
+        real="$(realpath -m "${settings}")"
+        [[ -n "${seen[${real}]:-}" ]] && continue
+        seen[${real}]=1
+        current="$(cat "${real}" 2>/dev/null || echo '{}')"
+        command="$(jq -r '.statusLine.command // ""' <<<"${current}" 2>/dev/null)" || {
+            say "skipped  ${settings} - not valid JSON"
+            continue
+        }
+        first="${command%% *}"
+        [[ "${first}" == "${tap}" ]] && continue
+        # A tap from elsewhere, or from where this plugin was before.
+        if [[ "${first}" == agent-usage-tap || "${first}" == */agent-usage-tap ]]; then
+            command="${command#"${first}"}"
+            command="${command# }"
+        fi
+        # The tap execs its arguments, so only a plain command line survives
+        # the prefix.
+        if [[ -n "${command}" && ! "${command}" =~ ^[][A-Za-z0-9_./~=:@%+,\ -]+$ ]]; then
+            say "skipped  ${settings} - put agent-usage-tap in front of its statusLine.command by hand"
+            continue
+        fi
+        if [[ -z "${command}" && -e "${cfg}/statusline.sh" ]]; then
+            command="${cfg/#"${HOME}"/\~}/statusline.sh"
+        fi
+        changed=1
+        command="${tap}${command:+ }${command}"
+        would "statusLine.command in ${settings}: ${command}" || continue
+        updated="$(jq --arg command "${command}" '
+            .statusLine = ({type: "command", padding: 1, refreshInterval: 10}
+                           + (.statusLine // {}) + {command: $command})' <<<"${current}")"
+        mkdir -p "$(dirname "${real}")"
+        printf '%s\n' "${updated}" >"${real}.partial" && mv -f "${real}.partial" "${real}"
+        say "wired    ${settings}"
+    done < <(claude_dirs)
+    ((changed)) || say "every Claude Code statusline runs through agent-usage-tap"
+}
+
+((CHECK)) && echo "check mode - nothing will be modified"
+link_skill
+wire_usage_tap

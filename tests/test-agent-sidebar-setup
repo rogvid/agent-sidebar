@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# End-to-end checks for agent-sidebar-setup on a throwaway HOME with four
+# Claude Code config folders:
+#
+#   ~/.claude           a statusline script and a hook in settings.json
+#   ~/.claude-personal  links ~/.claude's settings.json; a skill of its own
+#                       named agent-sidebar
+#   ~/.claude-work      no settings.json yet, a statusline script; a tap
+#                       from where the plugin was before
+#   ~/.claude-odd       a statusline that is a shell pipeline
+#
+# Run: tests/test-agent-sidebar-setup     (or `mise run test`)
+
+set -euo pipefail
+
+repo="$(cd "$(dirname "$0")/.." && pwd)"
+readonly repo setup="${repo}/bin/agent-sidebar-setup"
+scratch="$(mktemp -d)"
+readonly scratch
+trap 'rm -rf "${scratch}"' EXIT
+
+export HOME="${scratch}/home"
+readonly skill="${repo}/skills/agent-sidebar"
+# The path the setup writes: the plugin's bin, as Claude Code's shell reads it.
+readonly tap="${repo}/bin/agent-usage-tap"
+
+mkdir -p "${HOME}/.claude" "${HOME}/.claude-personal/skills/agent-sidebar" \
+    "${HOME}/.claude-work" "${HOME}/.claude-odd"
+printf '{"hooks": {"Stop": []}, "statusLine": {"type": "command", "command": "~/.claude/statusline.sh", "padding": 0}}\n' \
+    >"${HOME}/.claude/settings.json"
+ln -s ../.claude/settings.json "${HOME}/.claude-personal/settings.json"
+printf 'own\n' >"${HOME}/.claude-personal/skills/agent-sidebar/SKILL.md"
+printf '#!/bin/sh\n' >"${HOME}/.claude-work/statusline.sh"
+printf '{"statusLine": {"type": "command", "command": "ccstatusline | head -1"}}\n' \
+    >"${HOME}/.claude-odd/settings.json"
+
+failures=0
+total=0
+
+check() {
+    local name="$1"
+    shift
+    total=$((total + 1))
+    if "$@" 2>/dev/null; then
+        printf 'ok    %s\n' "${name}"
+    else
+        printf 'FAIL  %s\n' "${name}"
+        failures=$((failures + 1))
+    fi
+}
+
+not() { ! "$@"; }
+same() { [[ "$1" == "$2" ]]; }
+contains() { [[ "$1" == *"$2"* ]]; }
+links_to_skill() { [[ -L "$1" && "$(realpath "$1")" == "$(realpath "${skill}")" ]]; }
+statusline() { jq -r ".statusLine.$2" "${HOME}/$1/settings.json"; }
+
+out="$("${setup}" --check 2>&1)"
+check "--check reports the skill link" contains "${out}" "would: link ${HOME}/.agents/skills/agent-sidebar"
+check "--check links nothing" not test -e "${HOME}/.agents/skills/agent-sidebar"
+check "--check reports the statusline" \
+    contains "${out}" "would: statusLine.command in ${HOME}/.claude/settings.json: ${tap} ~/.claude/statusline.sh"
+# shellcheck disable=SC2088 # the literal tilde settings.json holds
+check "--check wires nothing" same "$(statusline .claude command)" "~/.claude/statusline.sh"
+check "--check creates no settings" not test -e "${HOME}/.claude-work/settings.json"
+
+out="$("${setup}" 2>&1)"
+check "the skill goes in ~/.agents/skills" links_to_skill "${HOME}/.agents/skills/agent-sidebar"
+check "and in each Claude Code config folder" links_to_skill "${HOME}/.claude/skills/agent-sidebar"
+check "a skill of the folder's own is not replaced" \
+    same "$(cat "${HOME}/.claude-personal/skills/agent-sidebar/SKILL.md")" own
+check "and the run says why" contains "${out}" "skipped  ${HOME}/.claude-personal/skills/agent-sidebar - not a link"
+
+check "the tap goes in front of the statusline, by its path" \
+    same "$(statusline .claude command)" "${tap} ~/.claude/statusline.sh"
+check "the statusline keeps its own settings" same "$(statusline .claude padding)" 0
+check "and refreshes for the tap" same "$(statusline .claude refreshInterval)" 10
+check "the rest of settings.json is kept" same "$(jq -c .hooks "${HOME}/.claude/settings.json")" '{"Stop":[]}'
+check "a linked settings.json stays a link" test -L "${HOME}/.claude-personal/settings.json"
+check "and is wired once" not contains "${out}" "wired    ${HOME}/.claude-personal/settings.json"
+check "a folder without settings gets its own statusline through the tap" \
+    same "$(statusline .claude-work command)" "${tap} ~/.claude-work/statusline.sh"
+check "a shell pipeline is left alone" same "$(statusline .claude-odd command)" "ccstatusline | head -1"
+check "and the run says to wire it by hand" contains "${out}" "skipped  ${HOME}/.claude-odd/settings.json"
+
+out="$("${setup}" 2>&1)"
+check "a second run links nothing" contains "${out}" "every skills folder links the plugin's skill"
+check "and wires nothing" contains "${out}" "every Claude Code statusline runs through agent-usage-tap"
+
+# The plugin moved, or the tap was wired by hand by its bare name.
+printf '{"statusLine": {"command": "/old/plugin/bin/agent-usage-tap ~/.claude-work/statusline.sh"}}\n' \
+    >"${HOME}/.claude-work/settings.json"
+printf '{"statusLine": {"command": "agent-usage-tap"}}\n' >"${HOME}/.claude-odd/settings.json"
+"${setup}" >/dev/null 2>&1
+check "a tap from elsewhere is pointed at this one" \
+    same "$(statusline .claude-work command)" "${tap} ~/.claude-work/statusline.sh"
+check "a bare tap too" same "$(statusline .claude-odd command)" "${tap}"
+
+check "an unknown option is refused" not "${setup}" --force
+
+printf '\n%s/%s passed\n' "$((total - failures))" "${total}"
+((failures == 0))
