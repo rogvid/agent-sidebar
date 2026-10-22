@@ -21,7 +21,7 @@ The last group is the adversarial one. An agent pane whose transcript
 quotes another agent's dialog or spinner - which happens constantly while
 working on this repo - must still read as idle.
 
-Run: scripts/tests/test-agent-scan     (or `mise run test`)
+Run: tests/test-agent-scan     (or `mise run test`)
 """
 
 from __future__ import annotations
@@ -40,9 +40,8 @@ from pathlib import Path
 
 import psutil
 
-SCRIPT = Path(__file__).resolve().parents[1] / ".local" / "bin" / "agent-scan"
-CHANNEL = (SCRIPT.parents[3] / "television" / ".config" / "television"
-           / "cable" / "agents.toml")
+SCRIPT = Path(__file__).resolve().parents[1] / "bin" / "agent-scan"
+CHANNEL = SCRIPT.parents[1] / "extras" / "television" / "agents.toml"
 AGENT_SCAN = None
 
 

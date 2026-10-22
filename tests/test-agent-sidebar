@@ -13,7 +13,7 @@ headless against scans it is handed instead of agent-scan's.
 
 Where the pane goes is agent-sidebar-tmux's job and has its own test.
 
-Run: scripts/tests/test-agent-sidebar     (or `mise run test`)
+Run: tests/test-agent-sidebar     (or `mise run test`)
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ from pathlib import Path
 
 from rich.console import Console
 
-SCRIPT = Path(__file__).resolve().parents[1] / ".local" / "bin" / "agent-sidebar"
+SCRIPT = Path(__file__).resolve().parents[1] / "bin" / "agent-sidebar"
 
 
 def load_agent_sidebar():

@@ -8,11 +8,11 @@
 # bracketed paste on and records every byte it is sent, one sits on a
 # permission dialog.
 #
-# Run: scripts/tests/test-agent-msg     (or `mise run test`)
+# Run: tests/test-agent-msg     (or `mise run test`)
 
 set -euo pipefail
 
-repo="$(cd "$(dirname "$0")/../.." && pwd)"
+repo="$(cd "$(dirname "$0")/.." && pwd)"
 readonly repo
 readonly socket="agent-msg-test-$$"
 scratch="$(mktemp -d)"
@@ -48,7 +48,7 @@ while IFS= read -r var; do unset "${var}"; done < <(env | awk -F= '/^GIT_/ { pri
 readonly project="${scratch}/app"
 git init -q -b main "${project}"
 
-export PATH="${scratch}/bin:${repo}/scripts/.local/bin:${PATH}"
+export PATH="${scratch}/bin:${repo}/bin:${PATH}"
 # agent-scan is a uv script: keep uv's Python and cache out of the fake
 # home, or every run downloads them again.
 UV_CACHE_DIR="$(uv cache dir)" UV_PYTHON_INSTALL_DIR="$(uv python dir)"

@@ -2,13 +2,13 @@
 # Checks for agent-usage-tap: what it keeps of each account's rate limits
 # from the statusline input, and that the statusline it wraps never notices.
 #
-# Run: scripts/tests/test-agent-usage-tap     (or `mise run test`)
+# Run: tests/test-agent-usage-tap     (or `mise run test`)
 
 set -euo pipefail
 
-repo="$(cd "$(dirname "$0")/../.." && pwd)"
+repo="$(cd "$(dirname "$0")/.." && pwd)"
 readonly repo
-readonly tap="${repo}/scripts/.local/bin/agent-usage-tap"
+readonly tap="${repo}/bin/agent-usage-tap"
 scratch="$(mktemp -d)"
 readonly scratch
 trap 'chmod -R u+w "${scratch}"; rm -rf "${scratch}"' EXIT
