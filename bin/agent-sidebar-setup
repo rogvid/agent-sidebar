@@ -5,13 +5,17 @@
 #   agent-sidebar-setup            make the changes
 #   agent-sidebar-setup --check    say what it would change, touch nothing
 #
-# It does two things:
+# It does three things:
 #
 #   - Links the agent-sidebar skill, which tells agents how to use
 #     agent-scan and agent-msg, into ~/.agents/skills (Codex, OpenCode and
 #     Pi read it there) and into the skills folder of every Claude Code
 #     config folder (~/.claude and each ~/.claude-* profile). It is a link
 #     to this plugin's copy, so it always matches the tools.
+#
+#   - Links the television channels into television's cable folder:
+#     `tv agents` lists the agents, `tv projects` the git repositories to
+#     open (the sidebar's o). Only when television is installed.
 #
 #   - Puts agent-usage-tap in front of each Claude Code statusline, in the
 #     settings.json of each of those folders, so the sidebar can show how
@@ -26,6 +30,9 @@ bin="$(dirname "$(realpath "$0")")"
 readonly bin
 skill="$(dirname "${bin}")/skills/agent-sidebar"
 readonly skill
+channels="$(dirname "${bin}")/extras/television"
+readonly channels
+readonly cable="${XDG_CONFIG_HOME:-${HOME}/.config}/television/cable"
 # The shell Claude Code runs the statusline in expands a leading ~.
 readonly tap="${bin/#"${HOME}"/\~}/agent-usage-tap"
 CHECK=0
@@ -49,22 +56,41 @@ claude_dirs() {
 
 link_skill() {
     head_ "skill -> ~/.agents/skills and Claude Code config folders"
-    local dir link changed=0 dirs
+    local dir changed=0 dirs
     mapfile -t dirs < <(claude_dirs | sed 's|$|/skills|')
     for dir in "${HOME}/.agents/skills" "${dirs[@]}"; do
-        link="${dir}/agent-sidebar"
-        [[ -L "${link}" && "$(realpath "${link}")" == "$(realpath "${skill}")" ]] && continue
-        if [[ -e "${link}" && ! -L "${link}" ]]; then
-            say "skipped  ${link} - not a link; remove it to use the plugin's"
-            continue
-        fi
-        changed=1
-        would "link ${link}" || continue
-        mkdir -p "${dir}"
-        ln -sfn "${skill}" "${link}"
-        say "linked   ${link}"
+        link_to "${skill}" "${dir}/agent-sidebar"
     done
     ((changed)) || say "every skills folder links the plugin's skill"
+}
+
+# link_to SOURCE LINK: link LINK to SOURCE, unless something of the user's
+# own is there. Sets changed when it had something to do.
+link_to() {
+    local source="$1" link="$2"
+    [[ -L "${link}" && "$(realpath "${link}")" == "$(realpath "${source}")" ]] && return 0
+    if [[ -e "${link}" && ! -L "${link}" ]]; then
+        say "skipped  ${link} - not a link; remove it to use the plugin's"
+        return 0
+    fi
+    changed=1
+    would "link ${link}" || return 0
+    mkdir -p "$(dirname "${link}")"
+    ln -sfn "${source}" "${link}"
+    say "linked   ${link}"
+}
+
+link_channels() {
+    head_ "television channels -> ${cable}"
+    if ! command -v tv >/dev/null; then
+        say "skipped - television (tv) is not installed"
+        return 0
+    fi
+    local channel changed=0
+    for channel in "${channels}"/*.toml; do
+        link_to "${channel}" "${cable}/$(basename "${channel}")"
+    done
+    ((changed)) || say "every channel is linked"
 }
 
 wire_usage_tap() {
@@ -113,4 +139,5 @@ wire_usage_tap() {
 
 ((CHECK)) && echo "check mode - nothing will be modified"
 link_skill
+link_channels
 wire_usage_tap

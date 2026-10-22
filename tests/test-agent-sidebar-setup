@@ -23,6 +23,13 @@ export HOME="${scratch}/home"
 readonly skill="${repo}/skills/agent-sidebar"
 # The path the setup writes: the plugin's bin, as Claude Code's shell reads it.
 readonly tap="${repo}/bin/agent-usage-tap"
+readonly cable="${HOME}/.config/television/cable"
+# television is a stand-in; a channel of the user's own is already there.
+mkdir -p "${scratch}/stubs" "${cable}"
+printf '#!/bin/sh\n' >"${scratch}/stubs/tv"
+chmod +x "${scratch}/stubs/tv"
+export PATH="${scratch}/stubs:${PATH}"
+printf 'own\n' >"${cable}/projects.toml"
 
 mkdir -p "${HOME}/.claude" "${HOME}/.claude-personal/skills/agent-sidebar" \
     "${HOME}/.claude-work" "${HOME}/.claude-odd"
@@ -52,7 +59,8 @@ check() {
 not() { ! "$@"; }
 same() { [[ "$1" == "$2" ]]; }
 contains() { [[ "$1" == *"$2"* ]]; }
-links_to_skill() { [[ -L "$1" && "$(realpath "$1")" == "$(realpath "${skill}")" ]]; }
+links_to() { [[ -L "$1" && "$(realpath "$1")" == "$(realpath "$2")" ]]; }
+links_to_skill() { links_to "$1" "${skill}"; }
 statusline() { jq -r ".statusLine.$2" "${HOME}/$1/settings.json"; }
 
 out="$("${setup}" --check 2>&1)"
@@ -70,6 +78,9 @@ check "and in each Claude Code config folder" links_to_skill "${HOME}/.claude/sk
 check "a skill of the folder's own is not replaced" \
     same "$(cat "${HOME}/.claude-personal/skills/agent-sidebar/SKILL.md")" own
 check "and the run says why" contains "${out}" "skipped  ${HOME}/.claude-personal/skills/agent-sidebar - not a link"
+check "the agents channel goes in television's cable folder" \
+    links_to "${cable}/agents.toml" "${repo}/extras/television/agents.toml"
+check "a channel of the user's own is not replaced" same "$(cat "${cable}/projects.toml")" own
 
 check "the tap goes in front of the statusline, by its path" \
     same "$(statusline .claude command)" "${tap} ~/.claude/statusline.sh"
@@ -85,6 +96,7 @@ check "and the run says to wire it by hand" contains "${out}" "skipped  ${HOME}/
 
 out="$("${setup}" 2>&1)"
 check "a second run links nothing" contains "${out}" "every skills folder links the plugin's skill"
+check "no channel either" contains "${out}" "every channel is linked"
 check "and wires nothing" contains "${out}" "every Claude Code statusline runs through agent-usage-tap"
 
 # The plugin moved, or the tap was wired by hand by its bare name.
@@ -97,6 +109,10 @@ check "a tap from elsewhere is pointed at this one" \
 check "a bare tap too" same "$(statusline .claude-odd command)" "${tap}"
 
 check "an unknown option is refused" not "${setup}" --force
+
+rm "${scratch}/stubs/tv"
+out="$(PATH="$(tr ':' '\n' <<<"${PATH}" | while read -r d; do [[ -x "${d}/tv" ]] || echo "${d}"; done | paste -sd:)" "${setup}" 2>&1)"
+check "without television no channel is linked" contains "${out}" "skipped - television (tv) is not installed"
 
 printf '\n%s/%s passed\n' "$((total - failures))" "${total}"
 ((failures == 0))
