@@ -53,8 +53,8 @@ as if there were none.
 At the bottom, each Claude account a running agent is on shows how much of
 its 5 hour and weekly limits is used, and when each resets. Claude Code
 hands those only to its statusline, so agent-usage-tap has to sit in front
-of the statusline command to keep them; without it every account says it
-has seen no usage yet.
+of the statusline command to keep them (agent-setup puts it there);
+without it every account says it has seen no usage yet.
 """
 
 from __future__ import annotations

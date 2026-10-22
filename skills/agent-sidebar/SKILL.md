@@ -355,7 +355,7 @@ jq -c . "${XDG_STATE_HOME:-$HOME/.local/state}"/agent-sidebar/usage/claude-*.jso
 # {"harness":"claude","folder":"/home/u/.claude-personal","five_hour":{"used_percentage":25,"resets_at":1790703000},"seven_day":{"used_percentage":69,"resets_at":1790942400}}
 ```
 
-They exist only when Claude's `statusLine.command` in settings.json runs through it (`agent-usage-tap ccstatusline`), and they are as fresh as the last response any agent on that account got.
+They exist only when Claude's `statusLine.command` in settings.json runs through it (`agent-usage-tap ccstatusline`; `agent-setup` wires it), and they are as fresh as the last response any agent on that account got.
 Check them before spawning a batch of workers on an account.
 
 Sidebar keys (for the human): `⏎` jump, `m` messages, `n` new worktree, `o` open project, `d` review, `g` git, `p` pr, `x` kill, `X` remove worktree, `h`/`l` collapse/expand project, `H`/`L` all, `c`/`C` one line for agent/all, `s` settings (config.toml in nvim), `r` rescan, `esc` back, `q` close, `?` help.
