@@ -20,6 +20,9 @@ readonly scratch
 trap 'rm -rf "${scratch}"' EXIT
 
 export HOME="${scratch}/home"
+# CI runners set these to the runner's own folders.
+export XDG_CONFIG_HOME="${HOME}/.config"
+unset XDG_BIN_HOME
 readonly skill="${repo}/skills/agent-sidebar"
 # The path the setup writes: the plugin's bin, as Claude Code's shell reads it.
 readonly tap="${repo}/bin/agent-usage-tap"
