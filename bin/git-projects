@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# git-projects - list the git repositories you can open as projects, most
+# recently used first.
+#
+# Usage: git-projects [ROOT...]      (default: $HOME)
+#
+# A project is a directory holding a .git directory, a plain clone, or
+# git-wt's layout: a .bare directory next to a .git file, with a folder per
+# worktree. Worktrees and submodules hold only a .git file, so they are
+# left out. So is anything under a hidden directory - plugin clones in
+# ~/.tmux and ~/.oh-my-zsh, tool caches - and node_modules. A repository
+# nested inside another is a project of its own.
+#
+# Most recently used means a HEAD moved most recently, in any of the
+# project's worktrees: a commit, a checkout or a pull. That puts what you
+# are working on at the top.
+
+set -euo pipefail
+
+usage() {
+    sed -n '2,/^$/s/^# \{0,1\}//p' "$0"
+}
+
+case "${1:-}" in
+-h | --help)
+    usage
+    exit 0
+    ;;
+esac
+
+roots=("$@")
+if [[ ${#roots[@]} -eq 0 ]]; then
+    roots=("${HOME}")
+fi
+
+# -mindepth 1 keeps a root from pruning itself when it is hidden: asking for
+# ~/.config by name means looking inside it. Pruning each git dir stops the
+# walk from going through a repository's own objects.
+for root in "${roots[@]}"; do
+    find "${root}" -mindepth 1 \
+        \( -name node_modules -o \( -name '.*' ! -name .git ! -name .bare \) \) -prune \
+        -o -type d \( -name .git -o -name .bare \) -print -prune 2>/dev/null || true
+done |
+    while IFS= read -r git_dir; do
+        project="${git_dir%/*}"
+        if [[ "${git_dir}" == */.bare && ! -f "${project}/.git" ]]; then
+            continue
+        fi
+        # logs/HEAD is written whenever HEAD moves; each worktree of a
+        # project keeps its own. A repository without a commit has none
+        # yet; it counts from when it was made.
+        # stat still prints what it found when some of them are missing.
+        stamp="$({ stat -c %Y "${git_dir}/logs/HEAD" \
+            "${git_dir}"/worktrees/*/logs/HEAD 2>/dev/null || true; } |
+            sort -nr | head -1)"
+        if [[ -z "${stamp}" ]]; then
+            stamp="$(stat -c %Y "${git_dir}")"
+        fi
+        printf '%s\t%s\n' "${stamp}" "${project}"
+    done |
+    sort -t $'\t' -k1,1nr -k2,2 |
+    cut -f2-
