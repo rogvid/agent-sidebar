@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# claude-worktree-create: `git-wt claude-hook` under the name git aliases, the agent sidebar and
+# Claude Code settings already use. See git-wt.
+exec "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/git-wt" claude-hook "$@"
