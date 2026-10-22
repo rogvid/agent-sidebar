@@ -50,6 +50,9 @@
 #                            first), then PANE
 #   open                     pick a git repository to open in its own
 #                            session (tv projects)
+#   open-project DIR         switch to DIR's session, starting it first if
+#                            there is none: git-wt's session for a git-wt
+#                            project or worktree, else one named after DIR
 #   config                   edit the settings file in nvim, in a popup
 #                            that closes when nvim does
 #   thread ID                agent-msg message ID and the rest of its
@@ -621,6 +624,28 @@ open_project() {
         true
 }
 
+# git-wt names a project's sessions and knows its main worktree, which is
+# where the project folder itself opens. Anything else is named after its
+# folder; tmux reads `.` and `:` in a target as window and pane separators.
+open_session() {
+    local dir="$1" name session
+    if session="$(session_of "${dir}")" && [[ -n "${session}" ]]; then
+        name="${session%%$'\t'*}"
+        dir="${session#*$'\t'}"
+    else
+        name="$(basename "${dir}" | tr .: __)"
+    fi
+    if ! tmux has-session -t "=${name}" 2>/dev/null; then
+        tmux new-session -ds "${name}" -c "${dir}"
+    fi
+    # switch-client needs a client to switch; from a plain shell, attach one.
+    if [[ -n "${TMUX:-}" ]]; then
+        tmux switch-client -t "=${name}"
+    else
+        tmux attach-session -t "=${name}"
+    fi
+}
+
 # Hooks fire in bursts - one window change is several events - and two runs
 # that each see no sidebar would each open one.
 #
@@ -714,6 +739,10 @@ main() {
         ;;
     open)
         open_project
+        ;;
+    open-project)
+        need 2 "$@"
+        open_session "$2"
         ;;
     config)
         edit_config

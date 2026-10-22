@@ -90,10 +90,11 @@ git -C "${main}" -c user.name=t -c user.email=t@t -c commit.gpgsign=false \
 
 t() { tmux -L "${socket}" "$@"; }
 
-# The test server's jobs - the hooks - inherit this environment, with the
-# plugin's bin put in front by agent-sidebar.tmux. The sidebar itself is a
-# stand-in: this checks where the pane goes, not what it draws.
-export PATH="${scratch}/bin:${PATH}"
+# The test server's jobs - the hooks - inherit this environment. bin goes
+# first so copies of the tools installed elsewhere do not answer for these
+# (agent-sidebar.tmux puts it first on the server too). The sidebar itself is
+# a stand-in: this checks where the pane goes, not what it draws.
+export PATH="${scratch}/bin:${repo}/bin:${PATH}"
 export AGENT_SIDEBAR_COMMAND="sleep 3600"
 export AGENT_SIDEBAR_AGENT="touch agent-started"
 unset TMUX TMUX_PANE
@@ -427,6 +428,23 @@ check "and starts no session for it" not t has-session -t "=gone"
 
 act open
 check "open picks from the projects channel" equals "cat ${scratch}/tv-args" projects
+
+mkdir -p "${scratch}/plain.dir"
+session_path() { t display-message -p -t "=$1:" '#{pane_current_path}'; }
+app_path() { session_path app; }
+plain_path() { session_path plain_dir; }
+app_sessions() { t list-sessions -F '#{session_name}' | grep -c '^app$'; }
+act open-project "${project}"
+check "open-project starts a git-wt project in the session git-wt names" \
+    equals app_path "${main}"
+check "and switches to it" equals client_session app
+act open-project "${scratch}/plain.dir"
+check "any other folder gets a session named after it" \
+    equals plain_path "${scratch}/plain.dir"
+act open-project "${project}"
+check "a session that is there is switched to, not started again" \
+    equals app_sessions 1
+t switch-client -t =main
 
 # A thread of two messages and one besides, as agent-msg logs them.
 state="${HOME}/.local/state/agent-sidebar"

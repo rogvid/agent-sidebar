@@ -1,7 +1,7 @@
 [metadata]
 name = "projects"
 description = "Open a git repository in its own tmux session, most recently used first"
-requirements = ["git-projects", "tmux-sessionizer"]
+requirements = ["git-projects", "agent-sidebar-tmux"]
 
 [source]
 command = "git-projects"
@@ -21,8 +21,7 @@ enter = "actions:open"
 
 [actions.open]
 description = "Switch to the project's tmux session, starting one if needed"
-# tmux-sessionizer opens a git-wt project in its main worktree, in the
-# session git-wt names, as the agent sidebar does, so a project opened
-# either way is one session.
-command = "tmux-sessionizer {}"
+# A git-wt project opens in its main worktree, in the session git-wt names,
+# so a project opened any way is one session.
+command = "agent-sidebar-tmux open-project {}"
 mode = "execute"
