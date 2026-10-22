@@ -1,0 +1,8 @@
+# Pinned so a hook, CI, and a developer's global ruff config cannot disagree.
+# Deliberately a correctness-only set: these are hand-written tools,
+# not a package, and style churn across them buys nothing. Widen when the
+# existing findings under a broader set are worth fixing.
+line-length = 88
+
+[lint]
+select = ["E4", "E9", "F"]

@@ -1,0 +1,68 @@
+# Run by prek (https://github.com/j178/prek), a drop-in pre-commit runner.
+#
+#   mise run hooks    # install into .git/hooks
+#   mise run lint     # run everything against every file, as CI does
+#
+# Tool versions come from mise.toml so a hook and CI cannot disagree about
+# what "clean" means.
+
+default_install_hook_types: [pre-commit, commit-msg]
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: detect-private-key
+      - id: check-added-large-files
+        args: [--maxkb=512]
+      - id: check-merge-conflict
+      - id: check-case-conflict
+      - id: check-symlinks
+      - id: destroyed-symlinks
+      - id: check-json
+      - id: check-yaml
+      - id: check-toml
+      - id: check-executables-have-shebangs
+      - id: check-shebang-scripts-are-executable
+
+  - repo: https://github.com/compilerla/conventional-pre-commit
+    rev: v4.4.0
+    hooks:
+      - id: conventional-pre-commit
+        stages: [commit-msg]
+
+  # These resolve their tool through mise so a commit from any shell - or
+  # from an editor that never sourced a profile - uses the pinned version
+  # instead of failing on PATH.
+  - repo: local
+    hooks:
+      - id: gitleaks
+        name: gitleaks (staged changes)
+        entry: mise exec -- gitleaks git --staged --redact --no-banner
+        language: system
+        pass_filenames: false
+
+      - id: shellcheck
+        name: shellcheck
+        entry: mise exec -- shellcheck --severity=warning
+        language: system
+        types: [shell]
+
+      # Not types-based: identify cannot tell that a file whose shebang is
+      # `uv run --script` is python.
+      - id: ruff
+        name: ruff (.py and uv scripts)
+        entry: mise run lint-python
+        language: system
+        pass_filenames: false
+        files: ^(.*\.pyi?|(bin|tests)/[^/]+)$
+
+      # Each test drives the real tools, most of them through one another,
+      # so any change under bin/, the plugin entry point or the channels
+      # runs them all. About two minutes.
+      - id: tests
+        name: tests
+        entry: mise run test
+        language: system
+        pass_filenames: false
+        files: ^(bin/|tests/|extras/|agent-sidebar\.tmux$|config\.example\.toml$)

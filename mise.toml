@@ -1,0 +1,47 @@
+# Development environment for agent-sidebar. CI installs the same versions
+# via jdx/mise-action, so local hooks and the pipeline run identical tools.
+
+[tools]
+gitleaks = "latest"
+jq = "latest"
+# agent-scan's tests open a real lazygit pane to check it is not an agent.
+lazygit = "latest"
+prek = "latest"
+ruff = "latest"
+shellcheck = "latest"
+uv = "latest"
+
+[settings]
+# Skip releases younger than two weeks: a compromised release is usually
+# caught and yanked within days.
+minimum_release_age = "14d"
+
+[tasks.hooks]
+description = "Install the prek git hooks into .git/hooks"
+run = "prek install --install-hooks"
+
+[tasks.lint]
+description = "Run every hook against every file, as CI does"
+run = "prek run --all-files --show-diff-on-failure"
+
+[tasks.lint-python]
+description = "ruff over the uv-script tools, which identify cannot tag"
+# `#!/usr/bin/env -S uv run --script` contains no "python", so identify tags
+# those files as plain text and a types-based hook silently skips them.
+run = '''
+{ git ls-files -- '*.py' '*.pyi'
+  git ls-files | while IFS= read -r f; do
+    [ -f "$f" ] || continue
+    head -1 "$f" 2>/dev/null | grep -qE '^#!.*(python|uv run --script)' \
+      && printf '%s\n' "$f"
+  done
+} | sort -u | xargs -r ruff check --force-exclude
+'''
+
+[tasks.test]
+description = "Run every test"
+run = "for t in tests/test-*; do echo \"== ${t}\"; \"${t}\" || exit 1; done"
+
+[tasks.secrets]
+description = "Scan the full git history for secrets"
+run = "gitleaks git --no-banner --redact --verbose ."
