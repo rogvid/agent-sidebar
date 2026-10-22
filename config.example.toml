@@ -1,5 +1,6 @@
 # agent-sidebar settings, read by agent-scan, agent-sidebar and
-# agent-sidebar-tmux through agent-sidebar-config.
+# agent-sidebar-tmux through agent-sidebar-config. Copy this file to
+# ${XDG_CONFIG_HOME:-~/.config}/agent-sidebar/config.toml to change any.
 #
 # Every setting is optional. For each one the first of these that has it
 # wins: the project's `git config agent-sidebar.harness` / `agent-sidebar.yolo`
@@ -14,8 +15,6 @@
 # agent-scan --json and its table still list them, marked hidden. Shell
 # globs match too.
 # hide = []
-# The orchestrator has its own popup (M-1).
-hide = ["orchestrator"]
 
 # The harnesses the new-worktree dialog offers.
 # harnesses = ["claude", "codex", "opencode", "pi"]
@@ -31,10 +30,3 @@ hide = ["orchestrator"]
 
 # What runs in the sidebar pane.
 # command = "agent-sidebar"
-
-# Keep this table last: a setting below it would belong to it.
-[orchestrator]
-# The claude account agent-orchestrator (M-1) starts the orchestrator on, a
-# name from `agent-sidebar-tmux accounts`. Where there is no such account,
-# M-1 says so and starts nothing. Unset, it starts on the tmux server's own.
-account = "personal"
