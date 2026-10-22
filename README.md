@@ -6,6 +6,10 @@ It lists every agent running in any tmux pane, grouped by project, with what eac
 It follows you from window to window, and from it you jump to an agent, start a new one in a fresh git worktree, review its changes, open its pull request or kill it.
 Agents get tools of their own: `agent-scan` to find one another, and `agent-msg` to send each other messages that are logged and can be verified.
 
+![The sidebar beside an agent: agents grouped by project and state, a jump to a blocked agent that then finishes, and a new worktree with an agent in it](docs/demo.gif)
+
+<sub>The agents in it are stand-ins, from [`demo/`](demo/); `mise run demo` records it again.</sub>
+
 ## Requirements
 
 - tmux 3.3 or newer

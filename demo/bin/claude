@@ -1,0 +1,110 @@
+#!/bin/bash
+# A stand-in claude for the demo: it draws the screen a real one would show,
+# close enough that agent-scan reads its state the same way, and never talks
+# to anything. Its name is what makes agent-scan take it for claude.
+#
+# AGENT_DEMO_SCENE picks the screen:
+#
+#   running   works on AGENT_DEMO_TASK, at AGENT_DEMO_STEP, for
+#             AGENT_DEMO_SECONDS (default 12), then finishes with
+#             AGENT_DEMO_REPLY
+#   blocked   asks to make an edit, and waits; 1 or 2 says yes, and it
+#             goes on at AGENT_DEMO_NEXT_STEP and finishes with
+#             AGENT_DEMO_NEXT_REPLY
+#   done      has finished with AGENT_DEMO_REPLY
+#
+# Started with no scene - as the sidebar's new worktree starts it - it runs
+# a short task of its own and finishes.
+
+scene="${AGENT_DEMO_SCENE:-running}"
+task="${AGENT_DEMO_TASK:-look around the new worktree}"
+reply="${AGENT_DEMO_REPLY:-Ready. The worktree builds and its tests pass.}"
+step="${AGENT_DEMO_STEP:-Reading the code this touches}"
+seconds="${AGENT_DEMO_SECONDS:-12}"
+branch="$(git branch --show-current 2>/dev/null)"
+started="${SECONDS}"
+frames=('·' '✢' '✳' '✶' '✻' '✽')
+
+# Not tr: it swaps bytes, and ─ is three of them.
+rule() {
+    local line
+    printf -v line '%*s' "$(tput cols)" ''
+    printf '\e[2m%s\e[0m\n' "${line// /─}"
+}
+
+footer() {
+    rule
+    printf '\e[1m❯\e[0m\n'
+    rule
+    printf '  \e[2m⎇ %s | (+%s,-%s)   Model: Opus 5 | Ctx: %s\e[0m\n' \
+        "${branch:-main}" "$1" "$2" "$3"
+    printf '  \e[2m⏵⏵ bypass permissions on (shift+tab to cycle)\e[0m\n'
+}
+
+prompt() {
+    printf '\e[2J\e[H'
+    printf '\e[1m❯\e[0m %s\n\n' "${task}"
+}
+
+draw_running() {
+    local elapsed=$((SECONDS - started)) frame
+    frame="${frames[elapsed % ${#frames[@]}]}"
+    prompt
+    printf '\e[1m●\e[0m %s\n' "${step}"
+    printf '  \e[2m⎿  Read 4 files\e[0m\n\n'
+    printf '\e[38;5;209m%s Working… (%ss · ↓ %s.%sk tokens)\e[0m\n' \
+        "${frame}" "${elapsed}" "$((elapsed / 3 + 1))" "$((elapsed % 10))"
+    footer "$((elapsed * ${#task} / 5))" "$((elapsed * ${#step} / 9))" "$((40 + elapsed)).2k"
+}
+
+draw_done() {
+    prompt
+    printf '\e[1m●\e[0m %s\n\n' "${reply}"
+    printf '\e[2m✻ Worked for 3m 12s · done %s\e[0m\n' "$(date '+%-I:%M %p')"
+    # Changes and context that differ from one agent to the next.
+    footer "$((${#reply} * 3))" "$((${#task} / 2))" "$((${#reply} + 20)).4k"
+}
+
+draw_blocked() {
+    prompt
+    printf '\e[1m●\e[0m The limiter goes in front of every public route.\n\n'
+    rule
+    printf ' \e[1mEdit file\e[0m\n'
+    printf ' src/middleware/limits.ts\n'
+    printf ' \e[31m 12 -  return next();\e[0m\n'
+    printf ' \e[32m 12 +  return limiter.check(req) ? next() : tooMany(res);\e[0m\n'
+    printf ' Do you want to make this edit to limits.ts?\n'
+    printf ' \e[38;5;117m❯ 1. Yes\e[0m\n'
+    printf '   2. Yes, and switch to accept edits for this session (shift+tab)\n'
+    printf '   3. No\n'
+    printf ' \e[2mEsc to cancel · Tab to amend\e[0m\n'
+}
+
+draw() {
+    case "${scene}" in
+    running) draw_running ;;
+    blocked) draw_blocked ;;
+    *) draw_done ;;
+    esac
+}
+
+printf '\e[?25l'
+trap draw WINCH
+while :; do
+    if [[ "${scene}" == running ]] && ((SECONDS - started >= seconds)); then
+        scene="done"
+    fi
+    draw
+    # A running screen ticks; the rest wait for a key, and redraw on resize.
+    key=""
+    if [[ "${scene}" == running ]]; then
+        read -rsn1 -t 1 key || true
+    else
+        read -rsn1 key || true
+    fi
+    if [[ "${scene}" == blocked && "${key}" == [12] ]]; then
+        scene=running started="${SECONDS}" seconds=6
+        step="${AGENT_DEMO_NEXT_STEP:-Applying the edit}"
+        reply="${AGENT_DEMO_NEXT_REPLY:-Done.}"
+    fi
+done

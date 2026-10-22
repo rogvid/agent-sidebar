@@ -45,3 +45,8 @@ run = "for t in tests/test-*; do echo \"== ${t}\"; \"${t}\" || exit 1; done"
 [tasks.secrets]
 description = "Scan the full git history for secrets"
 run = "gitleaks git --no-banner --redact --verbose ."
+
+[tasks.demo]
+description = "Record the README's GIF, docs/demo.gif (see demo/demo.tape)"
+tools = { vhs = "latest", ttyd = "latest" }
+run = "vhs demo/demo.tape"

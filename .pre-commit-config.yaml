@@ -15,6 +15,8 @@ repos:
       - id: detect-private-key
       - id: check-added-large-files
         args: [--maxkb=512]
+        # The README's GIF, made by `mise run demo`.
+        exclude: ^docs/demo\.gif$
       - id: check-merge-conflict
       - id: check-case-conflict
       - id: check-symlinks
