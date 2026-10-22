@@ -43,6 +43,8 @@ Then, once, in a shell:
 
 `agent-sidebar-setup` does what has to happen outside tmux, and is safe to run again:
 
+- It links the tools into `~/.local/bin` (or `$XDG_BIN_HOME`), so the agents in your panes can run `agent-scan` and `agent-msg`, and you can run `git-wt`.
+  tmux hands a new pane the `PATH` of the terminal it was opened from, so the plugin alone reaches only its own keys and hooks.
 - It links the agent-sidebar skill into `~/.agents/skills` and into each Claude Code config folder (`~/.claude`, `~/.claude-*`), so agents know how to use `agent-scan` and `agent-msg`.
 - It links the `agents` and `projects` channels into television's cable folder, when television is installed.
 - It puts `agent-usage-tap` in front of each Claude Code statusline, in its `settings.json`, so the sidebar can show how much of each account's 5 hour and weekly limits is used.
@@ -87,7 +89,7 @@ The ones used most:
 
 ## The tools
 
-All of them are in `bin/`, which the plugin puts first on tmux's `PATH`.
+All of them are in `bin/`: the plugin puts it on the `PATH` of tmux's keys and hooks, and `agent-sidebar-setup` links each tool into `~/.local/bin`.
 
 | Tool | What it is |
 |------|------------|

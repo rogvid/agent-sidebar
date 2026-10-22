@@ -5,7 +5,12 @@
 #   agent-sidebar-setup            make the changes
 #   agent-sidebar-setup --check    say what it would change, touch nothing
 #
-# It does three things:
+# It does four things:
+#
+#   - Links the tools into ${XDG_BIN_HOME:-~/.local/bin}. tmux hands a new
+#     pane the PATH of the terminal it was opened from, not its own, so the
+#     PATH the plugin gives tmux reaches its keys and hooks but not the
+#     agents in your panes, which run agent-scan and agent-msg by name.
 #
 #   - Links the agent-sidebar skill, which tells agents how to use
 #     agent-scan and agent-msg, into ~/.agents/skills (Codex, OpenCode and
@@ -33,6 +38,7 @@ readonly skill
 channels="$(dirname "${bin}")/extras/television"
 readonly channels
 readonly cable="${XDG_CONFIG_HOME:-${HOME}/.config}/television/cable"
+readonly user_bin="${XDG_BIN_HOME:-${HOME}/.local/bin}"
 # The shell Claude Code runs the statusline in expands a leading ~.
 readonly tap="${bin/#"${HOME}"/\~}/agent-usage-tap"
 CHECK=0
@@ -78,6 +84,20 @@ link_to() {
     mkdir -p "$(dirname "${link}")"
     ln -sfn "${source}" "${link}"
     say "linked   ${link}"
+}
+
+link_tools() {
+    head_ "tools -> ${user_bin}"
+    local tool changed=0
+    for tool in "${bin}"/*; do
+        [[ -f "${tool}" && -x "${tool}" ]] || continue
+        link_to "${tool}" "${user_bin}/$(basename "${tool}")"
+    done
+    ((changed)) || say "every tool is linked"
+    case ":${PATH}:" in
+        *":${user_bin}:"*) ;;
+        *) say "note: ${user_bin} is not on PATH; add it in your shell's rc file" ;;
+    esac
 }
 
 link_channels() {
@@ -138,6 +158,7 @@ wire_usage_tap() {
 }
 
 ((CHECK)) && echo "check mode - nothing will be modified"
+link_tools
 link_skill
 link_channels
 wire_usage_tap

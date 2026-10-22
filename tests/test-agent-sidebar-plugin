@@ -73,8 +73,10 @@ check "the agent counts go in front of status-right" \
     same "$(t "${plain}" show-options -gv status-right)" "#('${repo}/bin/agent-scan' --tmux)theirs"
 check "bin goes on the server's PATH" \
     contains ":$(t "${plain}" show-environment -g PATH | sed 's/^PATH=//'):" ":${repo}/bin:"
-check "a job finds the tools by name" \
-    same "$(t "${plain}" run-shell 'command -v agent-scan')" "${repo}/bin/agent-scan"
+# Into a file: tmux 3.4 does not print a job's output to a client that is
+# not attached.
+t "${plain}" run-shell "command -v agent-scan >'${scratch}/found'"
+check "a job finds the tools by name" same "$(cat "${scratch}/found")" "${repo}/bin/agent-scan"
 check "tmux-resurrect leaves the sidebar out of its saves" \
     contains "$(t "${plain}" show-options -gqv @resurrect-hook-post-save-layout)" "prune-resurrect"
 

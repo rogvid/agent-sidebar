@@ -30,6 +30,12 @@ printf '#!/bin/sh\n' >"${scratch}/stubs/tv"
 chmod +x "${scratch}/stubs/tv"
 export PATH="${scratch}/stubs:${PATH}"
 printf 'own\n' >"${cable}/projects.toml"
+# ~/.local/bin holds a git-wt of the user's own, and a link from an old
+# install of agent-scan.
+readonly user_bin="${HOME}/.local/bin"
+mkdir -p "${user_bin}"
+printf '#!/bin/sh\n' >"${user_bin}/git-wt"
+ln -s /old/place/agent-scan "${user_bin}/agent-scan"
 
 mkdir -p "${HOME}/.claude" "${HOME}/.claude-personal/skills/agent-sidebar" \
     "${HOME}/.claude-work" "${HOME}/.claude-odd"
@@ -78,6 +84,10 @@ check "and in each Claude Code config folder" links_to_skill "${HOME}/.claude/sk
 check "a skill of the folder's own is not replaced" \
     same "$(cat "${HOME}/.claude-personal/skills/agent-sidebar/SKILL.md")" own
 check "and the run says why" contains "${out}" "skipped  ${HOME}/.claude-personal/skills/agent-sidebar - not a link"
+check "the tools go in ~/.local/bin" links_to "${user_bin}/agent-msg" "${repo}/bin/agent-msg"
+check "a link from an old install is pointed here" links_to "${user_bin}/agent-scan" "${repo}/bin/agent-scan"
+check "a tool of the user's own is not replaced" not test -L "${user_bin}/git-wt"
+check "and the run says ~/.local/bin is not on PATH" contains "${out}" "${user_bin} is not on PATH"
 check "the agents channel goes in television's cable folder" \
     links_to "${cable}/agents.toml" "${repo}/extras/television/agents.toml"
 check "a channel of the user's own is not replaced" same "$(cat "${cable}/projects.toml")" own
@@ -97,6 +107,7 @@ check "and the run says to wire it by hand" contains "${out}" "skipped  ${HOME}/
 out="$("${setup}" 2>&1)"
 check "a second run links nothing" contains "${out}" "every skills folder links the plugin's skill"
 check "no channel either" contains "${out}" "every channel is linked"
+check "nor a tool" contains "${out}" "every tool is linked"
 check "and wires nothing" contains "${out}" "every Claude Code statusline runs through agent-usage-tap"
 
 # The plugin moved, or the tap was wired by hand by its bare name.
