@@ -1311,6 +1311,9 @@ def switch_command():
     opens("switch to the main checkout by path", str(c.main), one, c.main)
     opens("switch to the main checkout by its branch", "main", one, c.main)
     opens("switch with no target opens the fzf pick", None, c.main, one, FZF_PICK=one.name)
+    named_src = c.add_wt("src")
+    opens("a branch named like a folder of the current worktree is the branch",
+          "src", one, named_src)
 
     r = wt("switch", "feat/none", cwd=c.main, env=recording_shell())
     check("switch to an unknown target exits 1 and opens nothing",
@@ -1392,6 +1395,11 @@ def remove_command():
     p = c.add_wt("feat/by-subdir")
     r = remove("-f", str(p / "src"))
     check("remove -f by a subdirectory of the worktree", r.code == 0 and removed(p), r.desc())
+
+    p = c.add_wt("src")
+    r = remove("-f", "src", cwd=c.main)
+    check("remove of a branch named like a folder of the current worktree removes "
+          "the branch's", r.code == 0 and removed(p) and (c.main / "src").is_dir(), r.desc())
 
     p = c.add_wt("feat/inside")
     c.commit(p, "inside.txt", "inside\n")
