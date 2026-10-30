@@ -436,8 +436,9 @@ project_of() {
 
 # git-wt's tmux session name and folder for a directory, tab separated:
 # what it opens a worktree as, so opening it any way lands in one session.
+# Nothing, and git-wt's reason on stderr, when it has none.
 session_of() {
-    git-wt session "$1" 2>/dev/null
+    git-wt session "$1" || true
 }
 
 # The worktree that has a branch checked out, or nothing.
@@ -734,7 +735,10 @@ remove_worktree() {
     local pane="$1" dir project main top
     dir="$(pane_path "${pane}")"
     project="$(project_of "${dir}")"
-    main="$(session_of "${project:-/nonexistent}" | cut -f2)"
+    main=""
+    if [[ -n "${project}" ]]; then
+        main="$(session_of "${project}" | cut -f2)"
+    fi
     top="$(git -C "${dir}" rev-parse --show-toplevel 2>/dev/null || true)"
     if [[ -z "${project}" || -z "${top}" || "${top}" == "${main}" ]]; then
         notify "${pane} is not working in a project's worktree"
@@ -765,7 +769,8 @@ open_project() {
 # folder; tmux reads `.` and `:` in a target as window and pane separators.
 open_session() {
     local dir="$1" name session
-    if session="$(session_of "${dir}")" && [[ -n "${session}" ]]; then
+    session="$(session_of "${dir}" 2>/dev/null)"
+    if [[ -n "${session}" ]]; then
         name="${session%%$'\t'*}"
         dir="${session#*$'\t'}"
     else

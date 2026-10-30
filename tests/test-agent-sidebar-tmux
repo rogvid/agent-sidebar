@@ -410,6 +410,19 @@ check "spawn refuses a session that already exists" not act spawn "${agent}" fea
 check "and types nothing into it" equals "t list-panes -t =app-feat-y: -F #{pane_id}" "${spawned}"
 outsider="$(t new-window -d -t main: -c "${scratch}" -P -F '#{pane_id}' 'sleep 3600')"
 check "spawn from a pane outside a project fails" not act spawn "${outsider}" feat/z
+# A git-wt that cannot name the worktree's session.
+cat >"${scratch}/bin/git-wt" <<'EOF'
+#!/bin/sh
+echo "git-wt: no session for you" >&2
+exit 1
+EOF
+chmod +x "${scratch}/bin/git-wt"
+act spawn "${agent}" feat/nameless 2>"${scratch}/spawn-err" || true
+rm "${scratch}/bin/git-wt"
+check "spawn passes on why git-wt names no session" \
+    grep -qF "no session for you" "${scratch}/spawn-err"
+check "and says what it could not do" \
+    grep -qF "no tmux session name for ${project}/feat-nameless" "${scratch}/spawn-err"
 
 # Accounts: a harness's config folder next to its default one, named by its
 # suffix, when it holds a login; and any listed in the accounts file.
@@ -461,6 +474,9 @@ check "and takes you to it" equals client_session main
 main_agent="$(t new-window -t main: -c "${main}" -P -F '#{pane_id}' 'sleep 3600')"
 act remove-worktree "${main_agent}"
 check "remove-worktree leaves the main worktree alone" pane_alive "${main_agent}"
+act remove-worktree "${outsider}" || true
+check "and says so of a pane outside any project" \
+    in_messages "${outsider} is not working in a project's worktree"
 wt_agent="$(t new-window -t main: -c "${worktree}" -P -F '#{pane_id}' 'sleep 3600')"
 act remove-worktree "${wt_agent}"
 check "remove-worktree removes the agent's worktree" not exists "${worktree}"
