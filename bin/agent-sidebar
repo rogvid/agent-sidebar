@@ -988,32 +988,50 @@ class MessageLog:
         # When each message agent-msg has yet to paste was sent, by id.
         self.undelivered: dict[int, float | None] = {}
 
-    def refresh(self) -> bool:
-        """Take in what was added; whether anything was."""
+    def added(self) -> tuple[bool, list[Row], list[Row], list[Row]] | None:
+        """What was added since the last call, read and parsed: whether the
+        log starts over (a file was replaced or cut short), the messages,
+        the read marks and the delivered marks; None when nothing was. It
+        only reads the files, so it can run in a thread while the sidebar
+        draws from the rest."""
         tails = (self._sent, self._read, self._delivered)
-        added = [tail.lines() for tail in tails]
-        if any(lines is None for lines in added):
+        lines = [tail.lines() for tail in tails]
+        anew = any(new is None for new in lines)
+        if anew:
             for tail in tails:
                 tail.rewind()
+            lines = [tail.lines() or [] for tail in tails]
+        elif not any(lines):
+            return None
+        sent, read, delivered = (list(json_objects(new or []))
+                                 for new in lines)
+        return anew, sent, read, delivered
+
+    def take(self, added: tuple[bool, list[Row], list[Row], list[Row]]
+             | None) -> bool:
+        """Take in what added() found; whether anything was."""
+        if added is None:
+            return False
+        anew, sent, read, delivered = added
+        if anew:
             self.clear()
-            added = [tail.lines() or [] for tail in tails]
-            changed = True
-        else:
-            changed = any(added)
-        sent, read, delivered = added
-        for message in json_objects(sent or []):
+        for message in sent:
             self.latest.append(message)
             if message["id"] not in self.read:
                 self.unread[message["id"]] = address(message.get("to"))
             if message.get("push") is True and message["id"] not in self.delivered:
                 self.undelivered[message["id"]] = sent_at(message)
-        for mark in json_objects(read or []):
+        for mark in read:
             self.read.add(mark["id"])
             self.unread.pop(mark["id"], None)
-        for mark in json_objects(delivered or []):
+        for mark in delivered:
             self.delivered.add(mark["id"])
             self.undelivered.pop(mark["id"], None)
-        return changed
+        return True
+
+    def refresh(self) -> bool:
+        """Take in what was added; whether anything was."""
+        return self.take(self.added())
 
     def queued(self, now: float) -> set[int]:
         """The messages agent-msg still means to paste: pushed, not yet
@@ -1765,10 +1783,13 @@ class AgentSidebar(App[None]):
                 pass
 
     async def rescan(self) -> None:
-        rows, here, _ = await asyncio.gather(
+        rows, here, added = await asyncio.gather(
             self._scan(), self._panes_here(),
-            asyncio.to_thread(self._log.refresh),
+            asyncio.to_thread(self._log.added),
         )
+        # Taken in here, not in that thread: m draws the messages from the
+        # log meanwhile, and a log changing under it would end the sidebar.
+        self._log.take(added)
         # Whose inbox a message is in takes every pane's session, which is
         # worth asking tmux for only while something is unread.
         self._inbox = (self._log.inbox(await self._panes())
