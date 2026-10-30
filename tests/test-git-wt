@@ -1627,6 +1627,15 @@ def prune_command():
     r = wt("prune", "-f", "--no-fetch", cwd=c.main)
     check("nothing to prune exits 0", r.code == 0 and fresh.exists(), r.desc())
 
+    # A worktree on a removable disk, which is what git worktree lock is for.
+    unplugged = c.add_wt("feat/unplugged")
+    git(c.main, "worktree", "lock", str(unplugged))
+    shutil.rmtree(unplugged)
+    r = wt("prune", "-f", "--no-fetch", cwd=c.main)
+    check("a locked worktree whose folder is gone is kept and not offered",
+          r.code == 0 and c.is_registered(unplugged) and unplugged.name not in r.all,
+          r.desc())
+
     late = merged_wt("feat/late")
     tips: list[str] = []
     r = answer_later(command("prune", "-d", "--no-fetch"), c.main,
