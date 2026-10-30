@@ -21,7 +21,7 @@ trap 'rm -rf "${scratch}"' EXIT
 
 export HOME="${scratch}/home"
 # CI runners set these to the runner's own folders.
-export XDG_CONFIG_HOME="${HOME}/.config"
+export XDG_CONFIG_HOME="${HOME}/.config" XDG_STATE_HOME="${HOME}/.local/state"
 unset XDG_BIN_HOME
 readonly skill="${repo}/skills/agent-sidebar"
 # The path the setup writes: the plugin's bin, as Claude Code's shell reads it.
@@ -46,7 +46,8 @@ printf '{"hooks": {"Stop": []}, "statusLine": {"type": "command", "command": "~/
     >"${HOME}/.claude/settings.json"
 ln -s ../.claude/settings.json "${HOME}/.claude-personal/settings.json"
 printf 'own\n' >"${HOME}/.claude-personal/skills/agent-sidebar/SKILL.md"
-printf '#!/bin/sh\n' >"${HOME}/.claude-work/statusline.sh"
+printf '#!/bin/sh\necho work\n' >"${HOME}/.claude-work/statusline.sh"
+chmod +x "${HOME}/.claude-work/statusline.sh"
 printf '{"statusLine": {"type": "command", "command": "ccstatusline | head -1"}}\n' \
     >"${HOME}/.claude-odd/settings.json"
 
@@ -121,6 +122,31 @@ printf '{"statusLine": {"command": "agent-usage-tap"}}\n' >"${HOME}/.claude-odd/
 check "a tap from elsewhere is pointed at this one" \
     same "$(statusline .claude-work command)" "${tap} ~/.claude-work/statusline.sh"
 check "a bare tap too" same "$(statusline .claude-odd command)" "${tap}"
+
+# moved_to DIR: a copy of the plugin in DIR, set up from there.
+moved_to() {
+    mkdir -p "$1"
+    cp -r "${repo}/bin" "${repo}/skills" "${repo}/extras" "$1"
+    "$1/bin/agent-sidebar-setup" >/dev/null 2>&1
+}
+# runs FOLDER: the statusline of FOLDER, as Claude Code's shell runs it.
+runs() { sh -c "$(statusline "$1" command)" </dev/null 2>&1; }
+# A path with a space is quoted, past the ~ so the shell still expands it,
+# and a second run finds the tap rather than stacking another.
+moved_to "${HOME}/my plugins/agent-sidebar"
+"${HOME}/my plugins/agent-sidebar/bin/agent-sidebar-setup" >/dev/null 2>&1
+# shellcheck disable=SC2088 # the literal tilde settings.json holds
+check "a plugin path with a space is quoted" same "$(statusline .claude-work command)" \
+    "~/'my plugins/agent-sidebar/bin/agent-usage-tap' ~/.claude-work/statusline.sh"
+check "and the statusline runs" same "$(runs .claude-work)" work
+# Only a whole folder of HOME becomes ~.
+moved_to "${HOME}x/agent-sidebar"
+check "a folder next to HOME is not taken for one in it" \
+    same "$(statusline .claude-work command)" "${HOME}x/agent-sidebar/bin/agent-usage-tap ~/.claude-work/statusline.sh"
+moved_to "${HOME}/my plugins/agent-sidebar"
+"${setup}" >/dev/null 2>&1
+check "a quoted tap from elsewhere is pointed at this one" \
+    same "$(statusline .claude-work command)" "${tap} ~/.claude-work/statusline.sh"
 
 check "an unknown option is refused" not "${setup}" --force
 

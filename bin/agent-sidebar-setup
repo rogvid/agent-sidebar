@@ -39,8 +39,27 @@ channels="$(dirname "${bin}")/extras/television"
 readonly channels
 readonly cable="${XDG_CONFIG_HOME:-${HOME}/.config}/television/cable"
 readonly user_bin="${XDG_BIN_HOME:-${HOME}/.local/bin}"
-# The shell Claude Code runs the statusline in expands a leading ~.
-readonly tap="${bin/#"${HOME}"/\~}/agent-usage-tap"
+
+# shell_word PATH: PATH as one word for the shell Claude Code runs the
+# statusline in. A path in HOME starts ~/, which that shell expands, and the
+# rest is quoted when it is not a plain path.
+shell_word() {
+    local path="$1" home=""
+    if [[ "${path}" == "${HOME%/}/"* ]]; then
+        # shellcheck disable=SC2088 # the literal tilde, for that shell
+        home="~/"
+        path="${path#"${HOME%/}/"}"
+    fi
+    [[ "${path}" =~ ^[A-Za-z0-9_./=:@%+,-]+$ ]] || path="'${path//\'/\'\\\'\'}'"
+    printf '%s%s\n' "${home}" "${path}"
+}
+
+tap="$(shell_word "${bin}/agent-usage-tap")"
+readonly tap
+# The first word of a command line, and a command line the tap can exec:
+# plain words, single quotes and backslash escapes, nothing the shell acts on.
+readonly first_word_re="^([^ '\\]|\\\\.|'[^']*')*"
+readonly plain_re="^([][A-Za-z0-9_./~=:@%+, -]|\\\\.|'[^']*')+\$"
 CHECK=0
 case "${1:-}" in
     --check) CHECK=1 ;;
@@ -116,7 +135,7 @@ link_channels() {
 wire_usage_tap() {
     head_ "agent-usage-tap -> Claude Code statusline"
     command -v jq >/dev/null || { say "skipped - needs jq"; return 0; }
-    local cfg settings real current command first updated changed=0
+    local cfg settings real current command first bare updated changed=0
     local -A seen=()
     while IFS= read -r cfg; do
         settings="${cfg}/settings.json"
@@ -128,21 +147,23 @@ wire_usage_tap() {
             say "skipped  ${settings} - not valid JSON"
             continue
         }
-        first="${command%% *}"
+        [[ "${command}" =~ ${first_word_re} ]]
+        first="${BASH_REMATCH[0]}"
         [[ "${first}" == "${tap}" ]] && continue
         # A tap from elsewhere, or from where this plugin was before.
-        if [[ "${first}" == agent-usage-tap || "${first}" == */agent-usage-tap ]]; then
+        bare="${first//[\'\\]/}"
+        if [[ "${bare}" == agent-usage-tap || "${bare}" == */agent-usage-tap ]]; then
             command="${command#"${first}"}"
             command="${command# }"
         fi
         # The tap execs its arguments, so only a plain command line survives
         # the prefix.
-        if [[ -n "${command}" && ! "${command}" =~ ^[][A-Za-z0-9_./~=:@%+,\ -]+$ ]]; then
+        if [[ -n "${command}" && ! "${command}" =~ ${plain_re} ]]; then
             say "skipped  ${settings} - put agent-usage-tap in front of its statusLine.command by hand"
             continue
         fi
         if [[ -z "${command}" && -e "${cfg}/statusline.sh" ]]; then
-            command="${cfg/#"${HOME}"/\~}/statusline.sh"
+            command="$(shell_word "${cfg}/statusline.sh")"
         fi
         changed=1
         command="${tap}${command:+ }${command}"
