@@ -1351,13 +1351,16 @@ def plan_prune(repo: Repo) -> PrunePlan:
         if worktree.is_main:
             continue
         reason = merges.reason(worktree.branch)
+        # git worktree prune keeps a locked one whose folder is gone too:
+        # it may be on a disk that is not plugged in.
+        if worktree.locked is not None:
+            if reason:
+                plan.skipped.append((worktree, "locked"))
+            continue
         if worktree.missing:
             plan.candidates.append((worktree, reason))
             continue
         if not reason:
-            continue
-        if worktree.locked is not None:
-            plan.skipped.append((worktree, "locked"))
             continue
         work = repo.work(worktree)
         if work.at_risk:
