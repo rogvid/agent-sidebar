@@ -27,6 +27,9 @@ cleanup() {
 trap cleanup EXIT
 
 unset TMUX TMUX_PANE
+# The servers' agent-msg deliver --watch keeps to a log of its own, so it
+# never pastes your queued messages into a throwaway session.
+export XDG_STATE_HOME="${scratch}/state"
 # Copies of the tools installed elsewhere (~/.local/bin) would answer for
 # the plugin's own.
 PATH="$(tr ':' '\n' <<<"${PATH}" | grep -vxF -e "${HOME}/.local/bin" -e "${repo}/bin" | paste -sd:)"
@@ -80,7 +83,20 @@ check "a job finds the tools by name" same "$(cat "${scratch}/found")" "${repo}/
 check "tmux-resurrect leaves the sidebar out of its saves" \
     contains "$(t "${plain}" show-options -gqv @resurrect-hook-post-save-layout)" "prune-resurrect"
 
+# The pids of the deliver --watch running from this repository, once a
+# second one has had time to see the first and leave.
+watchers() {
+    sleep 1
+    pgrep -f "bash ${repo}/bin/agent-msg deliver --watch" || true
+}
+watcher="$(watchers)"
+check "agent-msg deliver --watch runs, to paste queued messages" \
+    same "$(wc -w <<<"${watcher}" | tr -d ' ')" 1
+check "talking to the server that started it" \
+    contains "$(tr '\0' '\n' <"/proc/${watcher}/environ" | grep '^TMUX=')" "${plain}"
+
 t "${plain}" run-shell "${plugin}"
+check "a re-source starts no second watcher" same "$(watchers)" "${watcher}"
 check "a re-source adds no second count" \
     same "$(count "$(t "${plain}" show-options -gv status-right)" agent-scan)" 1
 check "nor a second PATH entry" \

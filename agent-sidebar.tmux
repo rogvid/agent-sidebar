@@ -54,6 +54,11 @@ if [[ "$(option @agent-sidebar-status on)" != off ]]; then
     fi
 fi
 
+# agent-msg queues a message its recipient cannot take yet, such as one
+# blocked on a dialog; this pastes it once it can, for as long as the
+# server runs. Only one runs, so a re-source starts no second.
+tmux run-shell -b "'${bin}/agent-msg' deliver --watch"
+
 # tmux-resurrect would bring a saved sidebar back as a bare shell in its
 # slot. Only when nothing else has claimed the hook.
 if [[ -z "$(tmux show-options -gqv @resurrect-hook-post-save-layout)" ]]; then
