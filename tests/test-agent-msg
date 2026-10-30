@@ -316,6 +316,21 @@ check "and every read mark is whole" \
 check "and none marked twice" \
     same "$(jq -cR 'fromjson? | .id' "${XDG_STATE_HOME}/agent-sidebar/messages-read.jsonl" | sort -n | uniq -d)" ""
 
+# --- a pane scrolled up ---
+
+# Scrolled up, the pane is in copy mode. That takes Enter for itself, and
+# a paste into it loses its brackets, so the message would be cut at its
+# first newline and the rest left in the input box, never submitted.
+t copy-mode -t "${worker}"
+skip="$(size "${worker}")"
+printf 'line one\nline two;\n' | msg send "${worker}" >/dev/null
+id="$(agent-msg log --json --last 1 | jq '.[0].id')"
+check "a pane scrolled up in copy mode gets the message as one paste, submitted" \
+    same "$(got "${worker}" "${skip}")" \
+    $'\e[200~[msg '"${id}"' from orchestrator '"${orch}"$' · verify: agent-msg verify '"${id}"$' · reply: agent-msg reply '"${id}"$' "..."]\rline one\rline two;\e[201~\r'
+check "and is back at the bottom, showing it" \
+    same "$(t display-message -p -t "${worker}" '#{pane_in_mode}')" 0
+
 XDG_STATE_HOME="" msg send "${worker}" "hi" >/dev/null
 check "without XDG_STATE_HOME the log is in ~/.local/state" \
     test -s "${HOME}/.local/state/agent-sidebar/messages.jsonl"
