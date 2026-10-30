@@ -32,9 +32,19 @@ case ":${path}:" in
     *) tmux set-environment -g PATH "${bin}:${path}" ;;
 esac
 
+# The key the last run bound goes first, unless something else has been
+# bound to it since: the option may name another key now, or off.
+toggle="'${bin}/agent-sidebar-tmux' toggle"
+bound="$(option @agent-sidebar-bound-key "")"
+if [[ -n "${bound}" ]] &&
+    [[ "$(tmux list-keys -T root "${bound}" 2>/dev/null)" == *"${toggle}"* ]]; then
+    tmux unbind-key -n "${bound}"
+fi
+tmux set-option -gu @agent-sidebar-bound-key
 key="$(option @agent-sidebar-key M-2)"
 if [[ "${key}" != off ]]; then
-    tmux bind-key -n "${key}" run-shell "'${bin}/agent-sidebar-tmux' toggle"
+    tmux bind-key -n "${key}" run-shell "${toggle}" \; \
+        set-option -g @agent-sidebar-bound-key "${key}"
 fi
 
 # The sidebar is one pane that these move into whichever window you are
@@ -47,11 +57,14 @@ for hook in session-window-changed client-session-changed client-attached \
         "run-shell -b \"'${bin}/agent-sidebar-tmux' follow\""
 done
 
-if [[ "$(option @agent-sidebar-status on)" != off ]]; then
-    status="$(tmux show-options -gv status-right)"
-    if [[ "${status}" != *agent-scan*--tmux* ]]; then
-        tmux set-option -g status-right "#('${bin}/agent-scan' --tmux)${status}"
+counts="#('${bin}/agent-scan' --tmux)"
+status="$(tmux show-options -gv status-right)"
+if [[ "$(option @agent-sidebar-status on)" == off ]]; then
+    if [[ "${status}" == *"${counts}"* ]]; then
+        tmux set-option -g status-right "${status/"${counts}"/}"
     fi
+elif [[ "${status}" != *agent-scan*--tmux* ]]; then
+    tmux set-option -g status-right "${counts}${status}"
 fi
 
 # agent-msg queues a message its recipient cannot take yet, such as one
