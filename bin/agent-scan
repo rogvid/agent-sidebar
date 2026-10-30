@@ -362,8 +362,10 @@ def list_panes() -> list[Pane]:
     return panes
 
 
-def capture_pane(pane_id: str) -> str:
-    return tmux("capture-pane", "-t", pane_id, "-p") or ""
+def capture_pane(pane_id: str, styled: bool = False) -> str:
+    """The pane's screen as text, with STYLED its colours and attributes
+    as escape sequences too."""
+    return tmux("capture-pane", "-t", pane_id, "-p", *(["-e"] if styled else [])) or ""
 
 
 # --- git ---
@@ -854,11 +856,57 @@ def input_draft(lines: list[str]) -> str:
     return clean(" ".join(line.strip() for line in box)).strip()
 
 
-def pane_draft(lines: list[str]) -> str:
+# A Select Graphic Rendition sequence, and any other escape a styled
+# capture can hold.
+SGR_RE = re.compile(r"\x1b\[([0-9;:]*)m")
+ESCAPE_RE = re.compile(r"\x1b(?:\[[0-9;:?]*[A-Za-z]|\][^\x07\x1b]*(?:\x07|\x1b\\))")
+
+
+def undimmed(line: str) -> str:
+    """A styled capture's LINE as plain text, without what is drawn dim:
+    a harness's placeholder and suggested next prompt, which sit greyed in
+    an empty input box and are nobody's typing."""
+    out: list[str] = []
+    dim = False
+    start = 0
+    for m in SGR_RE.finditer(line):
+        if not dim:
+            out.append(line[start:m.start()])
+        codes = (m.group(1) or "0").split(";")
+        i = 0
+        while i < len(codes):
+            code = codes[i]
+            if code in ("38", "48", "58"):
+                # A colour's own numbers follow, and a 2 among them is not dim.
+                i += {"5": 3, "2": 5}.get(codes[i + 1] if i + 1 < len(codes) else "", 1)
+                continue
+            if code == "2":
+                dim = True
+            elif code in ("", "0", "22"):
+                dim = False
+            i += 1
+        start = m.end()
+    if not dim:
+        out.append(line[start:])
+    return ESCAPE_RE.sub("", "".join(out))
+
+
+def pane_draft(lines: list[str], styled: bool = False) -> str:
     """What sits unsent in the pane's input box: someone is writing there,
-    so agent-msg holds a message back rather than paste into it."""
+    so agent-msg holds a message back rather than paste into it. STYLED
+    lines are a styled capture's, whose dim text is left out."""
+    if styled:
+        lines = visible_lines("\n".join(undimmed(line) for line in lines))
     body, _ = split_tray(lines)
     return input_draft(body)
+
+
+def styled_draft(pane_id: str, lines: list[str]) -> str:
+    """The pane's draft. Only text in the box pays for a second, styled
+    capture, to tell typing from a dim suggestion."""
+    if not pane_draft(lines):
+        return ""
+    return pane_draft(capture_pane(pane_id, styled=True).splitlines(), styled=True)
 
 
 def pick_message(state: str, lines: list[str], whole: bool = False) -> str:
@@ -1284,7 +1332,7 @@ def collect_rows(hide: Sequence[str] = ()) -> list[Row]:
             hidden=config.hidden(pane.session, hide),
             argv=tuple(info[harness_agent.pid][1]),
             session_id=harness_session(harness_agent, account),
-            draft=pane_draft(lines),
+            draft=styled_draft(pane.pane_id, lines),
         ))
 
     rows.sort(key=sort_key)
