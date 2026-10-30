@@ -53,7 +53,8 @@ directory, how far into context rot it is (`context_level`: ok, warn, rot,
 or unknown), and `message_full`: the whole of what the pane last said, where
 `message` is the first line of it, cut short, such as all of a recap, and
 `draft`: unsent text in its input box ("" when the box is empty or not one
-agent-scan can read).
+agent-scan can read), and `started`: when its harness process started, in
+Unix seconds.
 
 --tmux prints one coloured count per state in tmux's own style syntax, for
 the status bar, and nothing at all when no agent is running.
@@ -1260,6 +1261,9 @@ class Row:
     # Unsent text in the input box, "" when it is empty or the harness's
     # box is not one agent-scan can read.
     draft: str = ""
+    # When the harness process started, in Unix seconds: one just started
+    # is not listening yet, and loses what is pasted into it.
+    started: float = 0.0
 
 
 def sort_key(row: Row) -> tuple[int, int, float, str]:
@@ -1333,6 +1337,7 @@ def collect_rows(hide: Sequence[str] = ()) -> list[Row]:
             argv=tuple(info[harness_agent.pid][1]),
             session_id=harness_session(harness_agent, account),
             draft=styled_draft(pane.pane_id, lines),
+            started=harness_agent.started_at,
         ))
 
     rows.sort(key=sort_key)
