@@ -450,6 +450,19 @@ CODEX_PICKER = """• 1
 
   Press enter to confirm or esc to go back"""
 
+# An idle codex with a draft in its composer and its status line in place
+# of the default footer.
+CODEX_IDLE_DRAFT = """› count to 1
+
+
+• 1
+
+
+› run the tests next
+  and then commit
+
+  gpt-5 default · /tmp/project"""
+
 # claude in its default permission mode, with no statusline: the input box
 # and its `? for shortcuts` hint are all there is under the transcript.
 CLAUDE_DEFAULT_QUOTED_YESNO = """● The installer will ask: Overwrite existing config? (y/n)
@@ -811,6 +824,11 @@ MESSAGE_CASES = (
      "Would you like to make the following edits?"),
     ("blocked shows codex's own question", "blocked", CODEX_QUESTION,
      "Choose an option."),
+    # The composer's placeholder and footer are chrome.
+    ("codex done, not its composer", "done", CODEX_IDLE, "1"),
+    ("nor a draft in it", "done", CODEX_IDLE_DRAFT, "1"),
+    ("codex's (y/n) is its last words", "done", CODEX_QUOTED_YESNO,
+     "Overwrite existing config? (y/n)"),
 )
 
 

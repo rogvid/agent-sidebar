@@ -229,6 +229,10 @@ CODEX_HINT_RE = re.compile(
 # following command?`, or the line under a question's `Question 1/2` header.
 CODEX_TITLE_RE = re.compile(r"^\s{0,2}Would you like\b")
 CODEX_QUESTION_RE = re.compile(r"^\s{0,2}Question \d+/\d+\b")
+# codex's composer: `› Ask Codex to do anything`, or a draft, with only
+# indented rows - the draft's own, the footer - under it. Its transcript
+# marks your messages the same way, but has its answers at column 0 below.
+CODEX_COMPOSER_RE = re.compile(r"^› ")
 # Plain shell-style confirmations, for agents that do not draw a menu.
 YESNO_RE = re.compile(r"\[y/n\]|\(y/n\)\s*[?:]?\s*$", re.IGNORECASE | re.MULTILINE)
 # The input bar under the prompt box: claude's permission-mode hint and
@@ -679,9 +683,10 @@ def transcript_region(lines: list[str]) -> list[str]:
     first of them. opencode's ends at the `┃` rows above its `╹▀▀▀` rule,
     and it is cut to the rule's width to leave the sidebar out. The rule is
     only taken from the last rows, where nothing but the hint bar sits below
-    it, so a claude transcript quoting one cannot pass for it. Agents that
-    draw neither fall through to the whole pane, and the chrome filter below
-    sorts out their footer.
+    it, so a claude transcript quoting one cannot pass for it. codex's ends
+    at its composer's `›` row, the last one with nothing but indented rows
+    below it. Agents that draw none of these fall through to the whole
+    pane, and the chrome filter below sorts out their footer.
     """
     tail = range(max(len(lines) - 3, 0), len(lines))
     end = next((i for i in reversed(tail)
@@ -692,6 +697,11 @@ def transcript_region(lines: list[str]) -> list[str]:
             top -= 1
         width = cells(lines[end])
         return [cut_cells(line, width) for line in lines[:top]]
+    composer = next((i for i in range(len(lines) - 1, -1, -1)
+                     if CODEX_COMPOSER_RE.match(lines[i])), None)
+    if composer is not None and all(
+            not line[:1].strip() for line in lines[composer + 1:]):
+        return lines[:composer]
     borders = [i for i, line in enumerate(lines) if BORDER_RE.match(line)]
     if len(borders) >= 2:
         return lines[:borders[-2]]
@@ -719,7 +729,7 @@ def is_chrome(line: str) -> bool:
 
 def clean(line: str) -> str:
     """Strip an agent's line markers and squeeze the whitespace out."""
-    text = re.sub(r"^\s*(?:[●○◉]|⎿|❯|>|│|┃|┃?\s*→)\s*", "", line)
+    text = re.sub(r"^\s*(?:[●○◉•]|⎿|❯|>|│|┃|┃?\s*→)\s*", "", line)
     return " ".join(text.split())
 
 
