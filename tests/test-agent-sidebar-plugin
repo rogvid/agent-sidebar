@@ -105,6 +105,22 @@ check "nor a second PATH entry" \
 check "nor a second hook" \
     same "$(t "${plain}" show-hooks -g client-attached | grep -c agent-sidebar-tmux)" 1
 
+# A re-source replaces what the last run set up, options changed since
+# included.
+t "${plain}" set -g @agent-sidebar-key M-s \; set -g @agent-sidebar-status off
+t "${plain}" run-shell "${plugin}"
+check "a re-source with another key binds that" \
+    contains "$(key "${plain}" M-s)" "agent-sidebar-tmux' toggle"
+check "and frees the old one" not contains "$(key "${plain}" M-2)" agent-sidebar
+check "a re-source with @agent-sidebar-status off takes the counts out" \
+    same "$(t "${plain}" show-options -gv status-right)" theirs
+t "${plain}" bind-key -n M-s display-message mine-too \; set -g @agent-sidebar-key off
+t "${plain}" run-shell "${plugin}"
+check "a re-source with the key off unbinds it" \
+    not contains "$(t "${plain}" list-keys -T root)" agent-sidebar-tmux
+check "but not a key bound to something else since" \
+    contains "$(key "${plain}" M-s)" mine-too
+
 own="$(server own \
     'set -g @agent-sidebar-key M-s' \
     'set -g @agent-sidebar-status off' \
