@@ -216,6 +216,19 @@ PERMISSION_RE = re.compile(r"^\s*[│┃|]?\s*[^\w\s]\s*Permission required")
 # its editor, so a live one has a single rule between it and pi's footer,
 # where the idle editor sits between two.
 PI_HINT_RE = re.compile(r"^\s{0,2}↑↓ navigate\s{2,}enter select\b")
+# codex's dialogs take the place of its composer and footer and close with
+# their key hints: an approval's `Press enter to confirm or esc to cancel`,
+# which wraps on a narrow pane, and the `… | enter to submit answer | …` of
+# a question codex asks. A picker you opened, such as /model, says `esc to
+# go back` instead: nothing is waiting on that.
+CODEX_HINT_RE = re.compile(
+    r"^\s{0,2}Press \S+ to confirm or \S+ to(?!\s+go\b)"
+    r"|^\s{0,2}(?:[^|]*\|\s+)*\S+ to submit\b"
+)
+# What codex's dialogs ask: an approval's title, `Would you like to run the
+# following command?`, or the line under a question's `Question 1/2` header.
+CODEX_TITLE_RE = re.compile(r"^\s{0,2}Would you like\b")
+CODEX_QUESTION_RE = re.compile(r"^\s{0,2}Question \d+/\d+\b")
 # Plain shell-style confirmations, for agents that do not draw a menu.
 YESNO_RE = re.compile(r"\[y/n\]|\(y/n\)\s*[?:]?\s*$", re.IGNORECASE | re.MULTILINE)
 # The input bar under the prompt box: claude's permission-mode hint and
@@ -627,6 +640,7 @@ def waiting_dialog(dialog: list[str]) -> bool:
         if ((CHOICE_RE.match(line) and corroborated)
                 or HINT_RE.match(line)
                 or PI_HINT_RE.match(line)
+                or CODEX_HINT_RE.match(line)
                 or BUTTONS_RE.search(line)
                 or PERMISSION_RE.match(line)
                 or YESNO_RE.search(line)):
@@ -820,9 +834,26 @@ def pi_question(lines: list[str]) -> str | None:
     return None
 
 
+def codex_question(lines: list[str]) -> str | None:
+    """What a live codex dialog asks: the approval's title, or the question
+    under the header of one codex asks itself."""
+    start = max(len(lines) - DIALOG_LINES, 0)
+    if not any(CODEX_HINT_RE.match(line) for line in lines[start:]):
+        return None
+    for i in range(len(lines) - 1, -1, -1):
+        if CODEX_TITLE_RE.match(lines[i]):
+            return clean(lines[i])
+        if CODEX_QUESTION_RE.match(lines[i]):
+            question = next((line for line in lines[i + 1:] if line.strip()),
+                            None)
+            return clean(question) if question else None
+    return None
+
+
 def dialog_message(lines: list[str]) -> str:
     """What the dialog is asking for."""
-    question = claude_question(lines) or pi_question(lines)
+    question = (claude_question(lines) or pi_question(lines)
+                or codex_question(lines))
     if question:
         return question
     dialog = lines[-DIALOG_LINES:]

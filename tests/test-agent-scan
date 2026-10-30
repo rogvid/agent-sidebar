@@ -377,6 +377,79 @@ CODEX_IDLE = """› count to 1
 CODEX_QUOTED_YESNO = CODEX_IDLE.replace(
     "• 1", "• Overwrite existing config? (y/n)")
 
+# codex's approval overlay takes the composer's and the footer's place, and
+# closes with its key hints. These are its own vt100 snapshots.
+CODEX_APPROVAL_EXEC = """• I'll check the greeting first.
+
+
+  Would you like to run the following command?
+
+  Reason: this is a test reason such as one that would be produced by the model
+
+  $ echo hello world
+
+› 1. Yes, proceed (y)
+  2. Yes, and don't ask again for commands that start with `echo hello world` (p)
+  3. No, and tell Codex what to do differently (esc)
+
+  Press enter to confirm or esc to cancel"""
+
+CODEX_APPROVAL_PATCH = """
+  Would you like to make the following edits?
+
+  Description: The model wants to apply changes
+  Destination: /tmp/project/README.md
+
+› 1. Yes, proceed (y)
+  2. Yes, and don't ask again for these files (a)
+  3. No, and tell Codex what to do differently (esc)
+
+  Press enter to confirm or esc to cancel"""
+
+# On a narrow pane the hint wraps, and a long command is clipped.
+CODEX_APPROVAL_NARROW = """
+  Would you like to run the following
+  [… 43 lines] ⌃g view all
+› 1. Yes, proceed (y)
+  2. No, and tell Codex what to do
+     differently (esc)
+  Press enter to confirm or esc to
+  cancel"""
+
+# codex asking a question of its own, the way claude's AskUserQuestion does.
+CODEX_QUESTION = """
+  Question 1/1 (1 unanswered)
+  Choose an option.
+
+  › 1. Option 1           First choice.
+    2. Option 2           Second choice.
+    3. Option 3           Third choice.
+    4. None of the above  Optionally, add details in notes (tab)
+
+  tab to add notes | enter to submit answer | esc to interrupt"""
+
+CODEX_QUESTION_WRAPPED = """
+  Question 1/2 (2 unanswered)
+  Choose an option.
+
+    1. Option 1  First choice.
+  › 2. Option 2  Second choice.
+    3. Option 3  Third choice.
+
+  tab to add notes | enter to submit answer
+  ←/→ to navigate questions | esc to interrupt"""
+
+# A picker you opened yourself, such as /model, goes back rather than
+# cancelling anything: no task is waiting on it.
+CODEX_PICKER = """• 1
+
+  Select Model and Effort
+
+› 1. gpt-5-codex (current)  Optimized for coding.
+  2. gpt-5                  Broad world knowledge.
+
+  Press enter to confirm or esc to go back"""
+
 # claude in its default permission mode, with no statusline: the input box
 # and its `? for shortcuts` hint are all there is under the transcript.
 CLAUDE_DEFAULT_QUOTED_YESNO = """● The installer will ask: Overwrite existing config? (y/n)
@@ -445,6 +518,16 @@ STATE_CASES = (
     ("codex asking (y/n) in its answer", CODEX_QUOTED_YESNO, "done"),
     ("claude default mode quoting (y/n)", CLAUDE_DEFAULT_QUOTED_YESNO,
      "done"),
+    ("codex blocked (command approval)", CODEX_APPROVAL_EXEC, "blocked"),
+    ("codex blocked (edit approval)", CODEX_APPROVAL_PATCH, "blocked"),
+    ("codex blocked (narrow, hint wraps)", CODEX_APPROVAL_NARROW,
+     "blocked"),
+    ("codex blocked (question)", CODEX_QUESTION, "blocked"),
+    ("codex blocked (question, hint wraps)", CODEX_QUESTION_WRAPPED,
+     "blocked"),
+    ("codex picker is not a dialog", CODEX_PICKER, "done"),
+    ("done pane quoting codex approval",
+     CODEX_APPROVAL_EXEC + "\n" + CODEX_IDLE, "done"),
     ("done pane quoting claude dialog", QUOTED_CLAUDE_DIALOG, "done"),
     ("done pane quoting opencode dialog", QUOTED_OPENCODE_DIALOG, "done"),
     ("done pane quoting a question", QUOTED_ASK_DIALOG, "done"),
@@ -722,6 +805,12 @@ MESSAGE_CASES = (
     ("pi running shows its loader", "running", PI_RUNNING, "Working..."),
     ("codex running shows its header", "running", CODEX_RUNNING_HEADER,
      "Investigating rendering code"),
+    ("blocked shows codex's question", "blocked", CODEX_APPROVAL_EXEC,
+     "Would you like to run the following command?"),
+    ("blocked shows codex's edit question", "blocked", CODEX_APPROVAL_PATCH,
+     "Would you like to make the following edits?"),
+    ("blocked shows codex's own question", "blocked", CODEX_QUESTION,
+     "Choose an option."),
 )
 
 
