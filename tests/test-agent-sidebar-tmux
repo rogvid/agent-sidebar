@@ -162,7 +162,9 @@ check() {
     printf 'FAIL  %s%s\n' "${name}" "${got:+  got=${got}}"
     failures=$((failures + 1))
     if ((failures == 1)); then
-        dump_state
+        # Not fatal: its `| head` cuts pipes short, which pipefail counts as
+        # a failure, and the run would end here without its summary.
+        dump_state || true
     fi
 }
 
