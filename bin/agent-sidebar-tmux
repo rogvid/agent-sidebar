@@ -794,10 +794,14 @@ open_session() {
 # where you are when it runs, not when it fired, so it covers every follow
 # fired after it, and those leave. Queued one behind another they would
 # hold up the M-2 pressed after them for seconds.
+#
+# The locks sit beside the server's socket, in the folder tmux keeps for you
+# alone. A name in /tmp anyone can guess could be taken first, or be a link
+# to a file of yours, which opening the lock would empty.
 locked() {
     local socket lock
     socket="${TMUX%%,*}"
-    lock="${TMPDIR:-/tmp}/agent-sidebar-$(id -u)-$(basename "${socket:-default}").lock"
+    lock="${socket:-$(tmux display-message -p '#{socket_path}')}.agent-sidebar.lock"
     if [[ "$1" == follow ]]; then
         exec 8>"${lock}.waiting"
         if ! flock -n 8; then
