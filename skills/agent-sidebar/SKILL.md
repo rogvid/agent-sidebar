@@ -23,6 +23,7 @@ The sidebar is for humans - you use `agent-scan`, `agent-msg`, `git-wt` and `tmu
 
 `git-wt` layout: a project folder holds `.bare` (shared by every worktree) and one folder per branch, folded to lowercase letters, digits and dashes.
 Branch `feat/x` lives at `<project-dir>/feat-x` with tmux session `<project>-feat-x`.
+When another project's worktree already holds that session name, git-wt adds `-2`, `-3` and so on; `git-wt session` tells which.
 The main branch's worktree is `<project-dir>/main` (or whatever the main branch is called) with session `<project>`.
 Projects are not all under one root, so never hardcode a path like `~/projects/<project>` - take it from `cwd` or `git-wt session`.
 

@@ -2164,6 +2164,65 @@ def session():
               r.desc())
 
 
+@section
+def session_collisions():
+    # Project api's worktree gateway and project api-gateway's main worktree
+    # are both named api-gateway; each keeps its own session.
+    api = Case("collide-api", repo="api")
+    other = Case("collide-api-gateway", repo="api-gateway")
+    gateway = api.add_wt("gateway")
+    kill_tmux()
+    new_session("api-gateway", other.main)
+    new_session("home", api.main)
+    attach_client("home")
+    inside = inside_tmux_env("home")
+
+    r = wt("session", str(gateway), cwd=api.main)
+    name = r.out.split("\t")[0]
+    check("session names another session for a worktree whose name is taken",
+          r.code == 0 and name not in ("", "api-gateway") and name.startswith("api-gateway"),
+          r.desc())
+    r = wt("switch", "gateway", cwd=api.main, env=inside | recording_shell())
+    check("switch opens that session in the worktree, not the other project's",
+          r.code == 0 and wait_until(lambda: client_sessions() == [name])
+          and session_path(name) == str(gateway)
+          and session_path("api-gateway") == str(other.main),
+          r.desc() + f" clients={client_sessions()} sessions={sorted(sessions())}")
+    r = wt("switch", "main", cwd=gateway, env=inside)
+    r = wt("switch", "gateway", cwd=api.main, env=inside)
+    check("and reuses it next time",
+          r.code == 0 and wait_until(lambda: client_sessions() == [name])
+          and sessions() == {"api", "api-gateway", "home", name},
+          r.desc() + f" sessions={sorted(sessions())}")
+    r = wt("session", str(gateway), cwd=api.main)
+    check("which session then names", r.out.split("\t")[0] == name, r.desc())
+
+    r = wt("remove", "-f", "--no-fetch", "gateway", cwd=api.main)
+    check("remove closes the worktree's own session",
+          r.code == 0 and wait_until(lambda: name not in sessions()),
+          r.desc() + f" sessions={sorted(sessions())}")
+    check("and leaves the other project's session alone",
+          "api-gateway" in sessions() and session_path("api-gateway") == str(other.main),
+          f"sessions={sorted(sessions())}")
+
+    # The worktree's session first this time, the other project's after it.
+    kill_tmux()
+    gateway = api.add_wt("gateway2", path=api.wts / "gateway")
+    new_session("home", api.main)
+    attach_client("home")
+    inside = inside_tmux_env("home")
+    r = wt("switch", "gateway2", cwd=api.main, env=inside)
+    first = r.code == 0 and wait_until(lambda: client_sessions() == ["api-gateway"]) \
+        and session_path("api-gateway") == str(gateway)
+    r = wt("switch", "main", cwd=other.main, env=inside)
+    check("a project whose main session name is taken gets another one",
+          first and r.code == 0 and wait_until(lambda: len(sessions()) == 3)
+          and session_path("api-gateway") == str(gateway)
+          and any(session_path(n) == str(other.main) for n in sessions()),
+          r.desc() + f" sessions={sorted(sessions())}")
+    kill_tmux()
+
+
 # --- main ------------------------------------------------------------------------------------
 
 
