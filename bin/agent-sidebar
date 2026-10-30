@@ -770,7 +770,8 @@ def load_saves(path: Path) -> list[Row]:
     ][:SAVE_KEEP]
 
 
-def with_save(saves: list[Row], agents: list[Row], now: float) -> list[Row] | None:
+def with_save(saves: list[Row], agents: list[Row], now: float,
+              ours: bool = True) -> list[Row] | None:
     """The saves once these agents are saved, None when there is nothing
     new to save.
 
@@ -779,11 +780,16 @@ def with_save(saves: list[Row], agents: list[Row], now: float) -> list[Row] | No
     out. So the saves behind the newest are of states that lasted, however
     fast the changes come. No agents is never saved: that is what a
     sidebar sees after a crash, with the saves it is there to keep.
+
+    Only a save this sidebar started (ours) takes changes. A sidebar just
+    started cannot tell what came between the newest save and now - a
+    crash, say - so the few agents it finds start a save of their own,
+    rather than replacing all the agents saved before.
     """
     if not agents or (saves and saves[0]["agents"] == agents):
         return None
     save = {"since": now, "saved_at": now, "agents": agents}
-    if saves and now - saves[0]["since"] < SAVE_SPACING:
+    if saves and ours and now - saves[0]["since"] < SAVE_SPACING:
         return [save | {"since": saves[0]["since"]}, *saves[1:]]
     return [save, *saves][:SAVE_KEEP]
 
@@ -1686,6 +1692,8 @@ class AgentSidebar(App[None]):
         self._help = help
         self._saves_path = saves_path(self._state)
         self._saves = load_saves(self._saves_path)
+        # Whether the newest save is one this sidebar made.
+        self._saved = False
         # Every agent of the last scan, the hidden ones too.
         self._scanned: list[Row] = []
         self._panes = panes
@@ -1786,9 +1794,10 @@ class AgentSidebar(App[None]):
         self.show_usage()
 
     def save(self, rows: list[Row]) -> None:
-        saves = with_save(self._saves, saved_agents(rows), time.time())
+        saves = with_save(self._saves, saved_agents(rows), time.time(),
+                          ours=self._saved)
         if saves is not None:
-            self._saves = saves
+            self._saves, self._saved = saves, True
             write_saves(self._saves_path, saves)
 
     def announce(self, rows: list[Row], here: set[str]) -> None:
