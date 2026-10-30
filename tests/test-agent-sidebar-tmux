@@ -320,6 +320,20 @@ press M-2
 check "and closes it" equals sidebar_count 0
 rm "${config}"
 
+# A sidebar command that exits at once - uv missing, a crash at import - is
+# not opened again and again: each exit fires the hook that would reopen it.
+t set-environment -g AGENT_SIDEBAR_COMMAND 'echo broken; false'
+pane_shows() { t capture-pane -p -t "$(sidebar)" | grep -qF "$1"; }
+press M-2
+check "a sidebar command that exits at once says so in its pane" \
+    pane_shows "exited at once"
+check "below what it printed" pane_shows broken
+check "and the sidebar closes rather than reopening it" equals open_flag ""
+check "leaving that one pane" equals sidebar_count 1
+press x
+check "which a key closes" equals sidebar_count 0
+t set-environment -g AGENT_SIDEBAR_COMMAND "${AGENT_SIDEBAR_COMMAND}"
+
 # Anything a key's run-shell prints, its failure included, tmux shows in
 # view mode over your pane, where it takes the next keys: M-2 among them.
 # A toggle that cannot get the lock in time fails.
