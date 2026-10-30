@@ -308,5 +308,37 @@ check "input without a name fails the hook" \
     not bash -c "echo '{\"cwd\":\"${main}\"}' | claude-worktree-create >/dev/null 2>&1"
 check "a cwd outside any git repo fails the hook" not hook "${scratch}" nope
 
+# --- a bootstrap that fails part way ------------------------------------------
+
+# A path that cannot be copied: on these branches conf is a tracked file,
+# where main keeps an ignored conf/ folder.
+main="$(make_repo blocked app ".gitignore=$(printf 'conf/\n.env\n')" \
+    ".worktreeinclude=$(printf '.env\nconf/local.env\n')")"
+put "${main}" .env "SECRET=1"
+put "${main}" conf/local.env "LOCAL=1"
+wts="${scratch}/blocked/projects/app"
+git -C "${main}" worktree add -q -b old "${wts}/old"
+put "${wts}/old" conf "a file"
+git -C "${wts}/old" add conf
+git -C "${wts}/old" commit -qm conf
+git -C "${main}" worktree remove "${wts}/old"
+git -C "${main}" branch old-too old
+no_traceback() { not grep -q Traceback "$1"; }
+(cd "${main}" && git-wt-add old) >"${scratch}/blocked-out" 2>&1 &&
+    added=0 || added=$?
+check "git-wt-add still succeeds when a file cannot be copied" same "${added}" 0
+check "without a traceback" no_traceback "${scratch}/blocked-out"
+check "says the bootstrap failed" grep -q "Bootstrap failed" "${scratch}/blocked-out"
+check "and copies what it can" content_is "${wts}/old/.env" "SECRET=1"
+git-wt-bootstrap "${wts}/old" >"${scratch}/blocked-out" 2>&1 && booted=0 || booted=$?
+check "git-wt-bootstrap fails when a file cannot be copied" same "${booted}" 1
+check "naming it, without a traceback" \
+    bash -c "grep -q conf/local.env '${scratch}/blocked-out' && ! grep -q Traceback '${scratch}/blocked-out'"
+hook_input "${main}" old-too | claude-worktree-create >"${scratch}/blocked-out" 2>"${scratch}/blocked-err" &&
+    hooked=0 || hooked=$?
+check "the hook still succeeds when a file cannot be copied" same "${hooked}" 0
+check "printing only the path" same "$(cat "${scratch}/blocked-out")" "${wts}/old-too"
+check "without a traceback" no_traceback "${scratch}/blocked-err"
+
 printf '\n%s/%s passed\n' "$((total - failures))" "${total}"
 ((failures == 0))
