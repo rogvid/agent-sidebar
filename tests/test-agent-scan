@@ -1057,6 +1057,9 @@ def scan_real_panes(root: Path) -> tuple[dict[str, dict | None], str]:
     finally:
         subprocess.run(["tmux", "-L", socket, "kill-server"], env=env,
                        capture_output=True)
+        # kill-server leaves the socket file behind.
+        (Path(env.get("TMUX_TMPDIR") or "/tmp") / f"tmux-{os.getuid()}"
+         / socket).unlink(missing_ok=True)
     rows = {r["pane_id"]: r for r in json.loads(out)}
     return {name: rows.get(pane) for name, pane in panes.items()}, status_bar
 
