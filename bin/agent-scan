@@ -219,9 +219,12 @@ PI_HINT_RE = re.compile(r"^\s{0,2}↑↓ navigate\s{2,}enter select\b")
 # Plain shell-style confirmations, for agents that do not draw a menu.
 YESNO_RE = re.compile(r"\[y/n\]|\(y/n\)\s*[?:]?\s*$", re.IGNORECASE | re.MULTILINE)
 # The input bar under the prompt box: claude's permission-mode hint and
-# statusline, opencode's hint bar. Present while idle or running, hidden
-# while a dialog owns the bottom of the screen.
-INPUT_BAR_RE = re.compile(r"⏵|⏸|Ctx:|ctrl\+p commands|tab agents")
+# statusline, opencode's hint bar, codex's footer (`? for shortcuts`, which
+# claude's default mode shows too, and `100% context left`). Present while
+# idle or running, hidden while a dialog owns the bottom of the screen.
+INPUT_BAR_RE = re.compile(
+    r"⏵|⏸|Ctx:|ctrl\+p commands|tab agents|\? for shortcuts|% context left"
+)
 # From the statusline: claude's `Ctx: 488.7k` or `58% ctx`, opencode's
 # `12.0K (9%)`.
 CTX_RE = re.compile(
@@ -631,8 +634,10 @@ def waiting_dialog(dialog: list[str]) -> bool:
     if last_marker < 0:
         return False
     below = dialog[last_marker + 1:]
-    if (PI_HINT_RE.match(dialog[last_marker])
-            and sum(bool(BORDER_RE.match(line)) for line in below) > 1):
+    # The input box's two rules are as good as an input bar, and the only
+    # sign of one for agents that draw no bar: pi, and claude in its default
+    # mode with no statusline. A pi selector has a single rule under it.
+    if sum(bool(BORDER_RE.match(line)) for line in below) > 1:
         return False
     return not any(INPUT_BAR_RE.search(line) for line in below)
 

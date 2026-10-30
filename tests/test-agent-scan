@@ -329,6 +329,19 @@ PI_RUNNING = """ please be slow
 ~/projects/app
 0.0%/128k (auto)                                                        fake"""
 
+# pi's answer ending in a shell-style question. The editor below says the
+# turn is over: nothing is waiting on a keypress.
+PI_QUOTED_YESNO = """ reply yn
+
+
+ Overwrite existing config? (y/n)
+
+────────────────────────────────────────────────────────────
+
+────────────────────────────────────────────────────────────
+~/projects/app
+0.0%/128k (auto)                                                        fake"""
+
 # codex 0.166.0's status row, from its own vt100 snapshots: a bullet that
 # is also its transcript's, a header, then the elapsed time and the
 # interrupt hint in one parenthetical.
@@ -360,6 +373,18 @@ CODEX_IDLE = """› count to 1
 › Ask Codex to do anything
 
   ? for shortcuts                                 100% context left"""
+
+CODEX_QUOTED_YESNO = CODEX_IDLE.replace(
+    "• 1", "• Overwrite existing config? (y/n)")
+
+# claude in its default permission mode, with no statusline: the input box
+# and its `? for shortcuts` hint are all there is under the transcript.
+CLAUDE_DEFAULT_QUOTED_YESNO = """● The installer will ask: Overwrite existing config? (y/n)
+✻ Worked for 15s · done 7:58 PM
+────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────
+  ? for shortcuts"""
 
 # A pane displaying someone else's dialog, with its own input bar below it.
 QUOTED_CLAUDE_DIALOG = CLAUDE_WAITING_EDIT + "\n" + CLAUDE_IDLE
@@ -413,9 +438,13 @@ STATE_CASES = (
     ("pi blocked (selector)", PI_SELECTOR, "blocked"),
     ("pi pane quoting its key hints", PI_QUOTED_HINT, "done"),
     ("pi running", PI_RUNNING, "running"),
+    ("pi asking (y/n) in its answer", PI_QUOTED_YESNO, "done"),
     ("codex running", CODEX_RUNNING, "running"),
     ("codex running (own header)", CODEX_RUNNING_HEADER, "running"),
     ("codex done", CODEX_IDLE, "done"),
+    ("codex asking (y/n) in its answer", CODEX_QUOTED_YESNO, "done"),
+    ("claude default mode quoting (y/n)", CLAUDE_DEFAULT_QUOTED_YESNO,
+     "done"),
     ("done pane quoting claude dialog", QUOTED_CLAUDE_DIALOG, "done"),
     ("done pane quoting opencode dialog", QUOTED_OPENCODE_DIALOG, "done"),
     ("done pane quoting a question", QUOTED_ASK_DIALOG, "done"),
