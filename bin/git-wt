@@ -691,6 +691,14 @@ def fzf(lines: list[str], *options: str) -> subprocess.CompletedProcess[str]:
 
 
 def find_worktree(worktrees: list[Worktree], target: str) -> Worktree | None:
+    # Names first: a branch called docs is meant, not the docs folder of
+    # the worktree the command runs in.
+    for worktree in worktrees:
+        if worktree.branch == target:
+            return worktree
+    for worktree in worktrees:
+        if worktree.name == target:
+            return worktree
     candidate = Path(target).expanduser()
     if candidate.exists():
         real = candidate.resolve()
@@ -699,12 +707,6 @@ def find_worktree(worktrees: list[Worktree], target: str) -> Worktree | None:
         for worktree in sorted(worktrees, key=lambda w: len(str(w.path)), reverse=True):
             if inside(real, worktree.path):
                 return worktree
-    for worktree in worktrees:
-        if worktree.branch == target:
-            return worktree
-    for worktree in worktrees:
-        if worktree.name == target:
-            return worktree
     return None
 
 
