@@ -283,10 +283,122 @@ close() {
 # Restoring a saved sidebar would bring back a plain shell squeezed into
 # its slot, because resurrect restores commands, not what they were for.
 # resurrect hands this hook the file it has just written.
+#
+# Dropping its pane line is not all: resurrect puts each pane back by its
+# index, and lays the window out from the saved layout, cell by cell. So
+# the panes after it move down an index, and its cell leaves the layout the
+# way tmux takes out a killed pane's: the cell beside it, the one before if
+# there is one, takes its room. A window it was alone in goes too.
 prune_resurrect() {
     local file="$1"
-    awk -F '\t' -v title="${title}" '!($1 == "pane" && $7 == title)' \
-        "${file}" >"${file}.agent-sidebar"
+    awk -F '\t' -v OFS='\t' -v title="${title}" '
+        BEGIN { for (i = 32; i < 127; i++) ord[sprintf("%c", i)] = i }
+
+        # A layout cell, "WxH,X,Y,ID" or "WxH,X,Y" and its cells in {} (side
+        # by side) or [] (one above another), read from L at pos.
+        function number(   n) {
+            match(substr(L, pos), /^[0-9]+/)
+            n = substr(L, pos, RLENGTH) + 0
+            pos += RLENGTH
+            return n
+        }
+        function parse(   n, c) {
+            n = ++cells
+            sx[n] = number(); pos++
+            sy[n] = number(); pos++
+            number(); pos++
+            number()
+            c = substr(L, pos++, 1)
+            if (c == ",") {
+                kind[n] = "pane"
+                id[n] = number()
+                leaf[++leaves] = n
+                return n
+            }
+            kind[n] = c
+            count[n] = 0
+            do {
+                child[n, ++count[n]] = parse()
+                up[child[n, count[n]]] = n
+            } while (substr(L, pos++, 1) == ",")
+            return n
+        }
+        # Give a cell d more columns (x) or rows (y), spread over its cells
+        # as tmux spreads them: one at a time, first to last.
+        function grow(n, d, axis,   i) {
+            if (axis == "x") sx[n] += d; else sy[n] += d
+            if (kind[n] == "pane") return
+            if ((kind[n] == "{") == (axis == "x")) {
+                for (i = 0; i < d; i++) grow(child[n, i % count[n] + 1], 1, axis)
+            } else {
+                for (i = 1; i <= count[n]; i++) grow(child[n, i], d, axis)
+            }
+        }
+        function remove(n,   p, i, j, other) {
+            p = up[n]
+            for (i = 1; child[p, i] != n; i++) {}
+            other = child[p, i > 1 ? i - 1 : i + 1]
+            if (kind[p] == "{") grow(other, sx[n] + 1, "x")
+            else grow(other, sy[n] + 1, "y")
+            for (j = i; j < count[p]; j++) child[p, j] = child[p, j + 1]
+            if (--count[p] > 1) return
+            # One cell left, which takes the place of its parent.
+            up[other] = up[p]
+            if (p == root) { root = other; return }
+            for (i = 1; child[up[p], i] != p; i++) {}
+            child[up[p], i] = other
+        }
+        function dump(n, x, y,   s, i) {
+            s = sx[n] "x" sy[n] "," x "," y
+            if (kind[n] == "pane") return s "," id[n]
+            s = s kind[n]
+            for (i = 1; i <= count[n]; i++) {
+                s = s (i > 1 ? "," : "") dump(child[n, i], x, y)
+                if (kind[n] == "{") x += sx[child[n, i]] + 1
+                else y += sy[child[n, i]] + 1
+            }
+            return s (kind[n] == "{" ? "}" : "]")
+        }
+        # tmux refuses a layout whose checksum does not match.
+        function checksum(s,   c, i) {
+            c = 0
+            for (i = 1; i <= length(s); i++) {
+                c = int(c / 2) + (c % 2) * 32768
+                c = (c + ord[substr(s, i, 1)]) % 65536
+            }
+            return sprintf("%04x", c)
+        }
+        function without(layout, nth) {
+            if (layout !~ /^[0-9a-f]+,[0-9]+x[0-9]+,[0-9]+,[0-9]+[,{[]/) return layout
+            L = substr(layout, index(layout, ",") + 1)
+            pos = 1; cells = 0; leaves = 0
+            root = parse()
+            if (leaf[nth] == root) return ""
+            remove(leaf[nth])
+            L = dump(root, 0, 0)
+            return checksum(L) "," L
+        }
+
+        NR == FNR {
+            if ($1 == "pane") panes[$2, $3] = panes[$2, $3] " " $6
+            if ($1 == "pane" && $7 == title) sidebar[$2, $3] = $6
+            next
+        }
+
+        $1 == "pane" && ($2, $3) in sidebar {
+            if ($6 == sidebar[$2, $3]) next
+            if ($6 > sidebar[$2, $3]) $6--
+        }
+        $1 == "window" && ($2, $3) in sidebar {
+            # Its cell is the one at its place among the panes of the window.
+            nth = 1
+            split(panes[$2, $3], indexes, " ")
+            for (i in indexes) if (indexes[i] < sidebar[$2, $3]) nth++
+            $7 = without($7, nth)
+            if ($7 == "") next
+        }
+        { print }
+    ' "${file}" "${file}" >"${file}.agent-sidebar"
     mv "${file}.agent-sidebar" "${file}"
 }
 
