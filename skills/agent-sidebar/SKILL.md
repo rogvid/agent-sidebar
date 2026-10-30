@@ -203,11 +203,19 @@ A message that cannot be pasted yet is queued rather than lost, and pasted as so
 
 ```text
 queued msg 19 for shop-feat-login %42: %42 is blocked on a dialog (Do you want to run this command?).
-agent-msg deliver pastes it once that clears.
+agent-msg deliver pastes it once that clears, and tells you if it still waits in 10m.
 ```
 
 It waits while the pane is `blocked` (its dialog would take the paste as its answer), while the pane has unsent text in its input box (someone is writing there), and while the pane is gone, until an agent runs in its session again.
 A message queued for more than a day is not pasted any more and stays in the recipient's inbox.
+
+If it still waits after 10 minutes, a note saying so and why is pasted into your pane, once:
+
+```text
+[note from agent-msg · msg 19 to shop-feat-login %42 is still queued after 10m: %42 is blocked on a dialog (Do you want to run this command?) · it is pasted once that clears]
+```
+
+A note is not a message: it is not in the log, has nothing to verify and nothing to reply to.
 
 Every message, pasted or not, is in the recipient's inbox:
 
@@ -225,7 +233,8 @@ Rules:
 - **Address with `pane_id` (`%12`).** `send` takes nothing else.
 - `send` refuses, with a non-zero exit and the reason, a pane `agent-scan` does not list (in a shell, Enter runs the text) and your own pane. Nothing is pasted or logged then.
 - A reply to a message sent from a pane that runs no agent, such as a shell, is only logged; they read it with `agent-msg inbox`.
-- **Queued is handled.** Do not send it again, and do not get round the queue with raw tmux: a blocked pane's dialog is not yours to answer. Tell the user if it matters that the pane is stuck.
+- **Queued is handled.** Do not send it again, and do not get round the queue with raw tmux: a blocked pane's dialog is not yours to answer.
+- **Tell the user what a queue is waiting on them for.** When a message is queued because its pane is blocked on a dialog, or is gone with no agent in its session to take it, tell the user now, naming the session, the pane and the reason: only they can clear it. Unsent text in a pane's input means someone is writing there, most likely the user, so only mention it. Tell them again when a note says it still waits, and say what the wait holds up for you.
 - If `send` or `reply` says no `agent-msg deliver --watch` is running, the plugin is not loaded; tell the user, since queued messages then wait in the inbox.
 - **Do not reply just to acknowledge.** A reply wakes its receiver, so `ok`, `thanks` and `noted` cost a turn and invite one back. Reply when you are asked something, or when the answer is the result the sender is waiting on.
 - After sending something that wants an answer, end your turn: the reply is pasted into your pane when it comes.
@@ -233,7 +242,7 @@ Rules:
 - Read before you write: `agent-scan --json | jq '.[] | select(.pane_id=="%42")'`, and its `message_full` for what it last said. A `running` agent gets your message in the middle of its turn.
 - After sending, poll `agent-scan` once after 1-2s to confirm the state changed.
 - **A harness you just started is not listening yet.** For its first seconds, keys sent to it are lost - text can land in its input with the Enter dropped. Give a new agent its task on its launch command line (section 4), not as a message after it.
-- The log is `${XDG_STATE_HOME:-~/.local/state}/agent-sidebar/messages.jsonl`, one JSON message a line: `id`, `time`, `kind` (`send` or `reply`), `from` and `to` (`pane`, `session`, `project`, `branch`), `reply_to`, `text` and `push` (to be pasted). Deliveries are in `messages-delivered.jsonl` beside it.
+- The log is `${XDG_STATE_HOME:-~/.local/state}/agent-sidebar/messages.jsonl`, one JSON message a line: `id`, `time`, `kind` (`send` or `reply`), `from` and `to` (`pane`, `session`, `project`, `branch`), `reply_to`, `text` and `push` (to be pasted). Deliveries are in `messages-delivered.jsonl` beside it, and the senders told that theirs wait in `messages-nudged.jsonl`.
 
 ### Raw tmux, only for what agent-msg does not do
 
