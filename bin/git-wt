@@ -1068,12 +1068,25 @@ def bootstrap(target: Path, print_index: bool = False) -> int:
 
 # --- commands ---
 
+def refuse_locked(worktree: Worktree) -> None:
+    """git worktree prune keeps a locked registration whose folder is gone:
+    it may be on a disk that is not plugged in."""
+    if worktree.missing and worktree.locked is not None:
+        why = f" ({worktree.locked})" if worktree.locked else ""
+        raise Fail(
+            f"{worktree.path} is locked{why} and its folder is gone; if it is not "
+            f"coming back, unlock it first with: git worktree unlock {worktree.path}"
+        )
+
+
 def add_worktree(repo: Repo, branch: str, base: str | None) -> Path:
     if not git_ok("check-ref-format", "--branch", branch, cwd=repo.root):
         raise Fail(f"Not a valid branch name: {branch}")
 
     worktrees = repo.worktrees()
     existing = next((w for w in worktrees if w.branch == branch), None)
+    if existing is not None:
+        refuse_locked(existing)
     if existing is not None and existing.missing:
         repo.git("worktree", "prune")
         say(dim(f"Pruned the stale registration of {existing.path}"))
@@ -1093,6 +1106,7 @@ def add_worktree(repo: Repo, branch: str, base: str | None) -> Path:
         raise Fail(f"{branch} would take the main worktree's folder {path}; pick another name")
     occupant = next((w for w in worktrees if same_path(w.path, path)), None)
     if occupant is not None:
+        refuse_locked(occupant)
         if occupant.missing:
             repo.git("worktree", "prune")
         else:
