@@ -36,7 +36,8 @@ state, agent, context, how long the pane has been in its current state,
 the 5h usage block, session age, and the last thing the pane said.
 
 The project is the repository the pane is working in, so every worktree of
-a project reads as that project. The branch is what it has checked out:
+a project reads as that project; --json also gives its folder, which tells
+two projects of one name apart. The branch is what it has checked out:
 `@<sha>` for a detached HEAD, `no git` outside a repository. Long project
 and branch names are cut short. The target never is, because the
 television channel finds the pane by pulling the first
@@ -423,8 +424,8 @@ def git(cwd: str, *args: str) -> str | None:
     return r.stdout.strip() if r.returncode == 0 else None
 
 
-def project_name(common_dir: str) -> str:
-    """The repository a git common dir belongs to.
+def project_dir(common_dir: str) -> Path:
+    """The folder of the repository a git common dir belongs to.
 
     Every worktree shares its main checkout's common dir, which is what
     makes them all read as one project. `.git`, and the `.bare` of a
@@ -432,26 +433,29 @@ def project_name(common_dir: str) -> str:
     `koyr.git` is the project itself.
     """
     path = Path(common_dir)
-    if path.name.startswith("."):
-        return path.parent.name
-    return path.name.removesuffix(".git")
+    return path.parent if path.name.startswith(".") else path
 
 
-def git_identity(cwd: str) -> tuple[str, str]:
-    """(project, branch) for a working directory."""
+def project_name(common_dir: str) -> str:
+    """The repository a git common dir belongs to, by name."""
+    return project_dir(common_dir).name.removesuffix(".git")
+
+
+def git_identity(cwd: str) -> tuple[str, str, str]:
+    """(project, branch, the project's folder) for a working directory."""
     common = git(
         cwd, "rev-parse", "--path-format=absolute", "--git-common-dir",
     )
     if common is None:
-        return Path(cwd).name or cwd, NO_GIT
-    project = project_name(common)
+        return Path(cwd).name or cwd, NO_GIT, cwd
+    project, folder = project_name(common), str(project_dir(common))
     # symbolic-ref rather than rev-parse: it still names the branch of a
     # repository with no commits yet, where HEAD resolves to nothing.
     branch = git(cwd, "symbolic-ref", "--short", "-q", "HEAD")
     if branch:
-        return project, branch
+        return project, branch, folder
     sha = git(cwd, "rev-parse", "--short", "HEAD")
-    return project, f"@{sha}" if sha else "@?"
+    return project, f"@{sha}" if sha else "@?", folder
 
 
 def fit(text: str, limit: int) -> str:
@@ -1338,6 +1342,9 @@ class Row:
     # When the harness process started, in Unix seconds: one just started
     # is not listening yet, and loses what is pasted into it.
     started: float = 0.0
+    # The project's folder, where its name may be another project's too;
+    # the working directory outside a repository.
+    project_dir: str = ""
 
 
 def sort_key(row: Row) -> tuple[int, int, float, str]:
@@ -1398,7 +1405,7 @@ def collect_rows(hide: Sequence[str] = (), brief: bool = False) -> list[Row]:
             ))
             continue
         since = state_seconds(state, lines, now)
-        project, branch = identities[pane.cwd]
+        project, branch, folder = identities[pane.cwd]
         changes = parse_changes(lines)
         if changes is None:
             if pane.cwd not in tree_changes:
@@ -1409,6 +1416,7 @@ def collect_rows(hide: Sequence[str] = (), brief: bool = False) -> list[Row]:
         rows.append(Row(
             state=state,
             project=project,
+            project_dir=folder,
             branch=branch,
             target=pane.target,
             pane_id=pane.pane_id,

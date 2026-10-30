@@ -411,11 +411,18 @@ HELP_PAIRS = {
 }
 
 
+def project_key(row: Row) -> str:
+    """What a row's project goes by: its folder, which no other project
+    has, where its name may be another's too."""
+    return row.get("project_dir") or row["project"]
+
+
 def group_by_project(rows: list[Row]) -> list[tuple[str, list[Row]]]:
-    """Rows grouped by project, groups in order of their first row."""
+    """Rows grouped by project, groups in order of their first row, each by
+    its project_key."""
     groups: dict[str, list[Row]] = {}
     for row in rows:
-        groups.setdefault(row["project"], []).append(row)
+        groups.setdefault(project_key(row), []).append(row)
     return list(groups.items())
 
 
@@ -1917,7 +1924,7 @@ class AgentSidebar(App[None]):
         )
 
     def pull_request(self, row: Row) -> dict[str, Any] | None:
-        return self._prs.get(row["project"], {}).get(row["branch"])
+        return self._prs.get(project_key(row), {}).get(row["branch"])
 
     def show_rows(self) -> None:
         rows, here = self._rows, self._here
@@ -1945,6 +1952,7 @@ class AgentSidebar(App[None]):
         line: dict[str, str] = {}
         folded_before = False
         for index, (project, group) in enumerate(group_by_project(rows)):
+            name = group[0]["project"]
             folded = project in self._collapsed
             # Folded projects in a row read as one list, so no rule between.
             if index and not (folded and folded_before):
@@ -1954,7 +1962,7 @@ class AgentSidebar(App[None]):
             if folded:
                 options.append(Option(
                     collapsed_prompt(
-                        project, group,
+                        name, group,
                         any(row["pane_id"] in here for row in group),
                         # A message to a gone pane is in the inbox of every
                         # agent in its session, and counts once here.
@@ -1969,7 +1977,7 @@ class AgentSidebar(App[None]):
                 )
                 continue
             options.append(Option(
-                project_prompt(project, len(group)),
+                project_prompt(name, len(group)),
                 id=project_id,
                 disabled=True,
             ))
@@ -2086,7 +2094,7 @@ class AgentSidebar(App[None]):
         if option.id.startswith(PROJECT_PREFIX):
             return option.id.removeprefix(PROJECT_PREFIX)
         row = self._by_pane.get(option.id)
-        return row["project"] if row else None
+        return project_key(row) if row else None
 
     def on_agent(
         self, act: Callable[[Row], None], or_project: bool = False,
@@ -2096,7 +2104,7 @@ class AgentSidebar(App[None]):
         # the project itself.
         if row is None and or_project:
             project = self.project()
-            row = next((r for r in self._rows if r["project"] == project),
+            row = next((r for r in self._rows if project_key(r) == project),
                        None)
         if row is None:
             self.bell()
