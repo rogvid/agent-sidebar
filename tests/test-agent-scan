@@ -381,6 +381,18 @@ CONTEXT_CASES = (
     ("no statusline visible", OPENCODE_WAITING, "-"),
 )
 
+# Unsent text in the input box: agent-msg holds a message back rather than
+# paste it into the middle of what someone is writing.
+DRAFT_CASES = (
+    ("claude, empty prompt", CLAUDE_IDLE, ""),
+    ("claude, prompt put back after a stop", CLAUDE_INTERRUPTED,
+     "Run this bash command in the foreground: ping -c 40 127.0.0.1"),
+    ("claude, typed and not sent", TYPED_NUMBERED_LINE, "1. do this thing"),
+    ("claude, working", CLAUDE_RUNNING_TIMED, ""),
+    ("pi, empty editor", PI_IDLE, ""),
+    ("opencode, no box it can read", OPENCODE_IDLE, ""),
+)
+
 AGE_CASES = (
     ("claude hours", CLAUDE_IDLE, "36h3m"),
     ("under an agent tray", CLAUDE_DELEGATED_PAIR, "17h7m"),
@@ -1000,6 +1012,13 @@ def main() -> int:
         print(f"{'ok  ' if ok else 'FAIL'}  context  {name:36} "
               f"want={want:8} got={got}")
 
+    for name, sample, want in DRAFT_CASES:
+        got = mod.pane_draft(mod.visible_lines(sample))
+        ok = got == want
+        failures += not ok
+        print(f"{'ok  ' if ok else 'FAIL'}  draft    {name:36} "
+              f"want={want!r} got={got!r}")
+
     for name, sample, want in AGE_CASES:
         got = mod.parse_age(mod.visible_lines(sample))
         ok = got == want
@@ -1137,9 +1156,10 @@ def main() -> int:
 
     ok = (decoded[0]["cwd"] == "/tmp/koyr"
           and decoded[0]["context_level"] == "ok"
-          and "message_full" in decoded[0])
+          and "message_full" in decoded[0]
+          and decoded[0]["draft"] == "")
     failures += not ok
-    print(f"{'ok  ' if ok else 'FAIL'}  json     {'cwd, context level and full message':36} "
+    print(f"{'ok  ' if ok else 'FAIL'}  json     {'cwd, context level, message, draft':36} "
           f"{'ok' if ok else f'got={decoded[0]!r}'}")
 
     for name, context, want in CONTEXT_LEVEL_CASES:
@@ -1266,7 +1286,8 @@ def main() -> int:
     print(f"{'ok  ' if ok else 'FAIL'}  pane     {'the status bar leaves it out':36} "
           f"{'ok' if ok else f'want={shown} got={status_bar!r}'}")
 
-    total = (len(STATE_CASES) + len(CONTEXT_CASES) + len(AGE_CASES)
+    total = (len(STATE_CASES) + len(CONTEXT_CASES) + len(DRAFT_CASES)
+             + len(AGE_CASES)
              + len(BLOCK_CASES) + len(COLOR_CASES) + len(DURATION_CASES)
              + len(MESSAGE_CASES) + len(FULL_MESSAGE_CASES)
              + len(WEEKLY_CASES)
