@@ -850,6 +850,13 @@ def merged():
     ok, d = merged_in_list(c, squashed)
     check("a squash-merged branch is [MERGED]", ok, d)
 
+    # Merging it would change nothing, but nothing of it was ever merged.
+    undone = c.add_wt("feat/undone")
+    c.commit(undone, "try.txt", "try A\n", "try A")
+    git(undone, "revert", "--no-edit", "HEAD")
+    ok, d = not_merged_in_list(c, undone)
+    check("a branch whose commits undo each other is not [MERGED]", ok, d)
+
     # Two commits, so no single commit on main has the same patch, and later
     # edits right around the squashed lines, so merging it again would conflict.
     reworked = c.add_wt("feat/reworked")
