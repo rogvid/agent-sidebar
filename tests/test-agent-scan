@@ -393,6 +393,24 @@ DRAFT_CASES = (
     ("opencode, no box it can read", OPENCODE_IDLE, ""),
 )
 
+# The same, from a capture with its escapes (capture-pane -e): claude puts
+# its suggested next prompt, greyed, in an empty box, and that is nobody's
+# typing.
+STYLED_BOX = ("\x1b[2m\x1b[37m✻\x1b[0m \x1b[2m\x1b[37mWorked for 42s\x1b[0m\n"
+              "\x1b[37m" + "─" * 60 + "\n{}\n\x1b[37m" + "─" * 60 + "\n"
+              "\x1b[39m  \x1b[38;5;96m⎇ main\x1b[2m\x1b[37m | \x1b[0m"
+              "\x1b[38;5;178m(+0,-0)\n")
+STYLED_DRAFT_CASES = (
+    ("a suggested prompt, dim",
+     "\x1b[39m❯\xa0\x1b[2mreassign #535 and #536 to Simone\x1b[0m", ""),
+    ("an empty box with a dim prompt", "\x1b[2m❯\xa0\x1b[0m", ""),
+    ("typed", "\x1b[39m❯\xa0reassign #535", "reassign #535"),
+    ("typed, ahead of a dim completion",
+     "\x1b[39m❯\xa0fix the \x1b[2mbug in login\x1b[0m", "fix the"),
+    ("typed in a colour with a 2 in its number",
+     "\x1b[39m❯\xa0\x1b[38;5;2mgreen words\x1b[0m", "green words"),
+)
+
 AGE_CASES = (
     ("claude hours", CLAUDE_IDLE, "36h3m"),
     ("under an agent tray", CLAUDE_DELEGATED_PAIR, "17h7m"),
@@ -1019,6 +1037,13 @@ def main() -> int:
         print(f"{'ok  ' if ok else 'FAIL'}  draft    {name:36} "
               f"want={want!r} got={got!r}")
 
+    for name, box, want in STYLED_DRAFT_CASES:
+        got = mod.pane_draft(STYLED_BOX.format(box).splitlines(), styled=True)
+        ok = got == want
+        failures += not ok
+        print(f"{'ok  ' if ok else 'FAIL'}  draft    {name:36} "
+              f"want={want!r} got={got!r}")
+
     for name, sample, want in AGE_CASES:
         got = mod.parse_age(mod.visible_lines(sample))
         ok = got == want
@@ -1286,7 +1311,7 @@ def main() -> int:
     print(f"{'ok  ' if ok else 'FAIL'}  pane     {'the status bar leaves it out':36} "
           f"{'ok' if ok else f'want={shown} got={status_bar!r}'}")
 
-    total = (len(STATE_CASES) + len(CONTEXT_CASES) + len(DRAFT_CASES)
+    total = (len(STATE_CASES) + len(CONTEXT_CASES) + len(DRAFT_CASES) + len(STYLED_DRAFT_CASES)
              + len(AGE_CASES)
              + len(BLOCK_CASES) + len(COLOR_CASES) + len(DURATION_CASES)
              + len(MESSAGE_CASES) + len(FULL_MESSAGE_CASES)

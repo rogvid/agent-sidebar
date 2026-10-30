@@ -6,7 +6,8 @@
 # The agents are stand-ins named after harnesses, so agent-scan lists them
 # and reads their state off the screen: one waits at a prompt with
 # bracketed paste on and records every byte it is sent (`claude draft` has
-# unsent text in its input box), one sits on a permission dialog.
+# unsent text in its input box, and `claude suggest` a dim suggested
+# prompt), one sits on a permission dialog.
 #
 # Run: tests/test-agent-msg     (or `mise run test`)
 
@@ -35,6 +36,8 @@ printf '\e[H\e[2J'
 rule="\$(printf '─%.0s' {1..60})"
 if [[ "\${1:-}" == draft ]]; then
     printf '%s\n' "\${rule}" "❯ half a thought" "\${rule}"
+elif [[ "\${1:-}" == suggest ]]; then
+    printf '%s\n' "\${rule}" $'❯ \e[2mrun the tests again\e[0m' "\${rule}"
 fi
 printf '\e[?2004h❯ '
 stty raw -echo
@@ -384,6 +387,10 @@ out="$(msg send "${drafting}" "when you have a moment")"
 check "a message to a pane with unsent text in its input is queued" \
     has "${out}" "queued msg ${first} for app-draft ${drafting}: ${drafting} has unsent text in its input."
 check "rather than pasted into the middle of it" same "$(got "${drafting}")" ""
+suggesting="$(start app-suggest 'claude suggest')"
+wait_for "${suggesting}" 'run the tests again'
+check "a dim suggested prompt in the box is nobody's typing, so it is pasted" \
+    has "$(msg send "${suggesting}" "hello")" "sent msg "
 
 # Waiting long, its sender is told: AGENT_MSG_NUDGE=0 makes any wait long.
 from_shell="$(next)"
