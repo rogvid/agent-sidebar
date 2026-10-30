@@ -38,6 +38,8 @@ Without TPM, clone the repository and run its entry point from `~/.tmux.conf`:
 run-shell ~/path/to/agent-sidebar/agent-sidebar.tmux
 ```
 
+Either way, the plugin also starts `agent-msg deliver --watch`, which pastes messages queued for an agent that could not take them yet, for as long as tmux runs.
+
 Then, once, in a shell:
 
 ```bash
@@ -100,7 +102,7 @@ All of them are in `bin/`: the plugin puts it on the `PATH` of tmux's keys and h
 | `agent-sidebar` | The sidebar itself, a [Textual](https://github.com/Textualize/textual) app |
 | `agent-sidebar-tmux` | Keeps the sidebar pane in the window you look at, and runs its actions |
 | `agent-scan` | Finds the agents in tmux panes and works out their state; `--json` for scripts |
-| `agent-msg` | Messages between agents, every one logged and verifiable |
+| `agent-msg` | Messages between agents, replies included, every one logged and verifiable, and queued until the recipient can take it |
 | `agent-usage-tap` | Keeps each Claude account's rate limits for the sidebar |
 | `agent-sidebar-config` | Reads and checks the settings file |
 | `agent-sidebar-setup` | The setup above |

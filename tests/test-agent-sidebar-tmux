@@ -105,6 +105,9 @@ export UV_CACHE_DIR UV_PYTHON_INSTALL_DIR
 # The panes' login shells read ~/.profile, and a real one puts the real
 # harnesses ahead of the stand-ins.
 export HOME="${scratch}/home" XDG_CONFIG_HOME="${scratch}/home/.config"
+# The plugin's agent-msg deliver --watch would paste your queued messages
+# into the throwaway sessions.
+export XDG_STATE_HOME="${scratch}/home/.local/state"
 mkdir -p "${HOME}"
 # An agent running this test would hand its own account on to every spawn.
 unset CLAUDE_CONFIG_DIR CODEX_HOME PI_CODING_AGENT_DIR
