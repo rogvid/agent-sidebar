@@ -1237,6 +1237,18 @@ def message_log_cases(mod) -> list[tuple[str, bool, str]]:
     log.refresh()
     check("and so are its read marks", log.unread == {1: orch}, log.unread)
 
+    # The sidebar reads the files in a thread while it draws the messages.
+    append(sent, message(2, orch, work))
+    found = log.added()
+    check("reading what was added leaves the messages as they were",
+          [m["id"] for m in log.latest] == [1] and log.unread == {1: orch},
+          (list(log.latest), log.unread))
+    check("until it is taken in",
+          log.take(found) and [m["id"] for m in log.latest] == [1, 2]
+          and log.unread == {1: orch, 2: work}, (list(log.latest), log.unread))
+    check("and nothing added is nothing to take in",
+          not log.take(log.added()), list(log.latest))
+
     # agent-msg's inbox rule, on a log of its own.
     folder = Path(tempfile.mkdtemp())
     append(folder / "messages.jsonl",
@@ -1282,6 +1294,14 @@ def message_log_cases(mod) -> list[tuple[str, bool, str]]:
     delivered.unlink()
     log.refresh()
     check("deliveries started over are read again", log.queued(now) == {2, 3, 6},
+          log.queued(now))
+
+    # The sidebar reads the delivery marks in a thread too.
+    append(delivered, {"id": 3, "time": "2026-09-30T12:00:00Z", "pane": "%1"})
+    found = log.added()
+    check("reading a delivery leaves the queue as it was",
+          log.queued(now) == {2, 3, 6}, log.queued(now))
+    check("until it is taken in", log.take(found) and log.queued(now) == {2, 6},
           log.queued(now))
     return results
 
