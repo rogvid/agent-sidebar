@@ -38,7 +38,8 @@ Layout: a project is a folder holding .bare, git's own data, a .git file
 pointing at it, and a folder per worktree named after its branch, folded
 to lowercase letters, digits and dashes: <project>/main, <project>/feat-x.
 The main branch's worktree is the main worktree. Its tmux session is named
-after the project, every other worktree's <project>-<folder>.
+after the project, every other worktree's <project>-<folder>. When another
+project's worktree already has that name, a -2, -3 and so on is added.
 
 Merged: a branch counts as merged into origin's main branch when its own
 commits are there, whether they got there by a merge, a fast-forward, a
@@ -429,7 +430,17 @@ class Repo:
 
     def session(self, path: Path) -> str:
         folder = None if same_path(path, self.main_path) else path.name
-        return session_name(self.name, folder)
+        base = session_name(self.name, folder)
+        # Names collide: project api's worktree gateway and project
+        # api-gateway's main worktree are both api-gateway. A session is the
+        # worktree's only if it was started in it; otherwise the worktree
+        # gets the first free one of base-2, base-3 and so on.
+        existing = tmux_sessions()
+        names = [base, *(f"{base}-{n}" for n in range(2, len(existing) + 3))]
+        for name in names:
+            if name in existing and same_path(Path(existing[name]), path):
+                return name
+        return next(name for name in names if name not in existing)
 
     def worktrees(self) -> list[Worktree]:
         out = self.git("worktree", "list", "--porcelain", "-z")
@@ -641,6 +652,15 @@ def tmux(*args: str) -> subprocess.CompletedProcess[str] | None:
     return subprocess.run(["tmux", *args], capture_output=True, text=True)
 
 
+def tmux_sessions() -> dict[str, str]:
+    """Every tmux session by name, with the folder it was started in."""
+    result = tmux("list-sessions", "-F", "#{session_name}\t#{session_path}")
+    if result is None or result.returncode != 0:
+        return {}
+    pairs = (line.split("\t", 1) for line in result.stdout.splitlines() if "\t" in line)
+    return dict(pairs)
+
+
 def has_session(name: str) -> bool:
     result = tmux("has-session", "-t", f"={name}")
     return result is not None and result.returncode == 0
@@ -672,7 +692,7 @@ def close_session(repo: Repo, worktree: Worktree) -> None:
     if clients:
         # Somewhere to stand before the floor goes, so nobody is detached.
         home = repo.main_path if repo.main_path.is_dir() else repo.root
-        refuge = ensure_session(session_name(repo.name, None), home)
+        refuge = ensure_session(repo.session(repo.main_path), home)
         for client in clients:
             tmux("switch-client", "-c", client, "-t", f"={refuge}")
     tmux("kill-session", "-t", f"={name}")
