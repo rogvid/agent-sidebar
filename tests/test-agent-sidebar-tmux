@@ -19,11 +19,19 @@ readonly width=36
 scratch="$(mktemp -d)"
 readonly scratch
 
+# Where tmux keeps the sockets, and agent-sidebar-tmux its locks.
+socket_dir="${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)"
+readonly socket_dir lock="${socket_dir}/${socket}.agent-sidebar.lock"
+# Where it kept them before, for anyone to plant a link at.
+old_lock="${TMPDIR:-/tmp}/agent-sidebar-$(id -u)-${socket}.lock"
+readonly old_lock
+
 cleanup() {
     tmux -L "${socket}" kill-server 2>/dev/null || true
     tmux -L "${host}" kill-server 2>/dev/null || true
     # tmux leaves the sockets of a killed server behind.
-    rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/"{"${socket}","${host}"}
+    rm -f "${socket_dir}/"{"${socket}","${host}"} "${lock}" "${lock}.waiting" \
+        "${old_lock}" "${old_lock}.waiting"
     rm -rf "${scratch}"
 }
 trap cleanup EXIT
@@ -214,6 +222,10 @@ active_pane() { t display-message -p -t "$(viewed)" '#{pane_id}'; }
 
 check "client attached" equals viewed "$(t display-message -p -t main:one '#{window_id}')"
 
+# A link planted where anyone can write, at the name its lock would have.
+echo mine >"${scratch}/mine"
+ln -s "${scratch}/mine" "${old_lock}"
+
 press M-2
 check "M-2 opens it down the left of this window" in_place
 check "M-2 focuses it" equals active_pane "$(sidebar)"
@@ -338,7 +350,7 @@ t set-environment -g AGENT_SIDEBAR_COMMAND "${AGENT_SIDEBAR_COMMAND}"
 # view mode over your pane, where it takes the next keys: M-2 among them.
 # A toggle that cannot get the lock in time fails.
 pane_mode() { t display-message -p -t "$(viewed)" '#{pane_mode}'; }
-flock "${TMPDIR:-/tmp}/agent-sidebar-$(id -u)-${socket}.lock" sleep 7 &
+flock "${lock}" sleep 7 &
 holder=$!
 sleep 0.3
 press M-2
@@ -351,6 +363,8 @@ press M-2
 check "and the next M-2 works" equals sidebar_count 1
 press M-2
 check "and closes it again" equals sidebar_count 0
+check "none of that emptied the file a planted link points at" \
+    equals "cat ${scratch}/mine" mine
 
 # A window as tmux-resurrect saves it: a line for each pane, by index, and
 # one with its layout. resurrect restores the panes by index and the layout
