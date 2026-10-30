@@ -142,6 +142,7 @@ Use `agent-scan` for *agent* state, `git-wt`/`tmux list-*` for *worktree/session
 
 Use `agent-msg`.
 It pastes into the other agent's input and submits it, whatever harness that agent runs, logs every message, and tells the receiver how to answer.
+Replies are delivered the same way, so a conversation between agents goes both ways without anyone polling.
 
 ```bash
 agent-msg send "%42" "also add a logout button"
@@ -188,10 +189,27 @@ agent-msg reply 17 "done: logout button added and committed on feat/login"
 agent-msg reply 17 <<'EOF'      # like send, the text can come on stdin
 done, with one question: ...
 EOF
+# sent reply 18 to orchestrator %137
 ```
 
-A reply goes to the log only, never into a pane: the sender may be a pane the user dictates into.
-The sender reads it from its inbox:
+The reply is pasted into the sender's pane under its own header, and verified the same way:
+
+```text
+[reply 18 to msg 17 from shop-feat-login %42 · verify: agent-msg verify 18 · reply: agent-msg reply 18 "..."]
+done: logout button added and committed on feat/login
+```
+
+A message that cannot be pasted yet is queued rather than lost, and pasted as soon as it can be by `agent-msg deliver --watch`, which the tmux plugin keeps running:
+
+```text
+queued msg 19 for shop-feat-login %42: %42 is blocked on a dialog (Do you want to run this command?).
+agent-msg deliver pastes it once that clears.
+```
+
+It waits while the pane is `blocked` (its dialog would take the paste as its answer), while the pane has unsent text in its input box (someone is writing there), and while the pane is gone, until an agent runs in its session again.
+A message queued for more than a day is not pasted any more and stays in the recipient's inbox.
+
+Every message, pasted or not, is in the recipient's inbox:
 
 ```bash
 agent-msg inbox --unread --mark-read   # new messages to you, then mark them read
@@ -205,14 +223,17 @@ agent-msg log --json                   # a JSON list; inbox --json adds "unread"
 
 Rules:
 - **Address with `pane_id` (`%12`).** `send` takes nothing else.
-- `send` refuses, with a non-zero exit and the reason, a pane that is `blocked` (its dialog would take the paste as its answer), a pane `agent-scan` does not list (in a shell, Enter runs the text), and your own pane. Nothing is pasted or logged then.
-- **Blocked is not yours to answer.** Do not get round the refusal with raw tmux. Tell the user, or send once `agent-scan` shows the pane is no longer `blocked`.
-- Replies are not pushed to anyone. After sending something that wants an answer, check `agent-msg inbox --unread` once the other agent turns `done` in `agent-scan`.
+- `send` refuses, with a non-zero exit and the reason, a pane `agent-scan` does not list (in a shell, Enter runs the text) and your own pane. Nothing is pasted or logged then.
+- A reply to a message sent from a pane that runs no agent, such as a shell, is only logged; they read it with `agent-msg inbox`.
+- **Queued is handled.** Do not send it again, and do not get round the queue with raw tmux: a blocked pane's dialog is not yours to answer. Tell the user if it matters that the pane is stuck.
+- If `send` or `reply` says no `agent-msg deliver --watch` is running, the plugin is not loaded; tell the user, since queued messages then wait in the inbox.
+- **Do not reply just to acknowledge.** A reply wakes its receiver, so `ok`, `thanks` and `noted` cost a turn and invite one back. Reply when you are asked something, or when the answer is the result the sender is waiting on.
+- After sending something that wants an answer, end your turn: the reply is pasted into your pane when it comes.
 - Your inbox follows your tmux session: after your session is started again, with a new pane id, messages to the pane you had before are still yours.
 - Read before you write: `agent-scan --json | jq '.[] | select(.pane_id=="%42")'`, and its `message_full` for what it last said. A `running` agent gets your message in the middle of its turn.
 - After sending, poll `agent-scan` once after 1-2s to confirm the state changed.
 - **A harness you just started is not listening yet.** For its first seconds, keys sent to it are lost - text can land in its input with the Enter dropped. Give a new agent its task on its launch command line (section 4), not as a message after it.
-- The log is `${XDG_STATE_HOME:-~/.local/state}/agent-sidebar/messages.jsonl`, one JSON message a line: `id`, `time`, `kind` (`send` or `reply`), `from` and `to` (`pane`, `session`, `project`, `branch`), `reply_to` and `text`.
+- The log is `${XDG_STATE_HOME:-~/.local/state}/agent-sidebar/messages.jsonl`, one JSON message a line: `id`, `time`, `kind` (`send` or `reply`), `from` and `to` (`pane`, `session`, `project`, `branch`), `reply_to`, `text` and `push` (to be pasted). Deliveries are in `messages-delivered.jsonl` beside it.
 
 ### Raw tmux, only for what agent-msg does not do
 
@@ -280,7 +301,7 @@ To bring the user to the worker only when they ask: `tmux switch-client -t "$wor
 # Who needs me?
 agent-scan --json | jq -r '.[] | "\(.state) \(.project)/\(.branch) \(.pane_id): \(.message)"'
 
-# What did they answer?
+# What did they answer? (Replies are pasted into your pane; this catches up.)
 agent-msg inbox --unread --mark-read
 
 # Queue top (most urgent first)
@@ -345,6 +366,7 @@ Check them before spawning a batch of workers on an account.
 Sidebar keys (for the human): `⏎` jump, `m` messages, `n` new worktree, `o` open project, `d` review, `g` git, `p` pr, `x` kill, `X` remove worktree, `h`/`l` collapse/expand project, `H`/`L` all, `c`/`C` one line for agent/all, `s` settings (config.toml in nvim), `r` rescan, `esc` back, `q` close, `?` help.
 `m` switches to the agent-msg log, newest first, where the highlighted message shows up to ten lines in place, `t` pages through all of it and its thread in a popup, `⏎` jumps to the pane it went to, and `m` or `esc` goes back.
 `✉2` on an agent means two messages in its inbox are unread; the sidebar only reads the log, so only its receiver clears it, with `agent-msg verify` or `agent-msg inbox --mark-read`.
+A message agent-msg has yet to paste says `queued` in the messages view.
 
 New-worktree dialog (`n`):
 - Branch name input, a harness list and a `yolo` checkbox. Tab moves between them, j/k move in the list, ⏎ creates from any field, esc cancels.
@@ -395,7 +417,7 @@ agent-sidebar-config path           # where the file is
 - Never kill a session, window or pane you did not create for this task, and never the one holding `$TMUX_PANE` - that is the user's. When a `tmux` or `git-wt` command fails, stop and report; do not clean up by killing.
 - Do not parse the `agent-scan` table - use `--json`.
 - Do not address panes by `target` - it renumbers.
-- Do not message an agent with `tmux send-keys` or `paste-buffer` - use `agent-msg send`, which checks the pane and logs it. Do not answer a message by sending into its sender's pane - use `agent-msg reply`.
+- Do not message an agent with `tmux send-keys` or `paste-buffer` - use `agent-msg send`, which checks the pane, logs it and queues it when it cannot be pasted yet. Do not answer a message by sending into its sender's pane - use `agent-msg reply`, which delivers it there.
 - Do not `send-keys` text without `-l`, or multiline or `;`-ending text at all.
 - Do not poll `agent-scan` faster than 1s - it walks the process tree and captures every pane.
 - Do not judge a pane by its `message` - check `state`. Do not interrupt `running` unless you must.
