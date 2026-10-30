@@ -31,8 +31,10 @@ another window stops and needs you, tmux says so on the status line.
 first, and back. The highlighted message shows in place, up to ten lines;
 `t` pages through all of it and the rest of its thread in a popup, and `⏎`
 jumps to the pane it went to. `✉2` on an agent says two messages to it are
-unread. The sidebar only reads agent-msg's log: a message is marked read
-when its receiver verifies it or reads its inbox with --mark-read.
+unread, and `queued` on a message that agent-msg has yet to paste into its
+recipient's pane. The sidebar only reads agent-msg's log: a message is
+marked read when its receiver verifies it or reads its inbox with
+--mark-read.
 
 With many agents open, `h` folds a project into one line that counts its
 agents by state, and `c` puts an agent on one line. Both are remembered in
@@ -136,6 +138,9 @@ USAGE_WARN, USAGE_HIGH = 60, 85
 UNREAD = "✉"
 # How many of the newest messages the messages view lists.
 LATEST = 100
+# agent-msg's patience: how long a queued message waits to be pasted before
+# it is left to its recipient's inbox.
+PATIENCE = 24 * 60 * 60
 # How many lines of the highlighted message show in place; t shows the rest.
 EXPANDED = 10
 
@@ -956,14 +961,16 @@ def address(end: Any) -> tuple[str, str]:
 
 
 class MessageLog:
-    """agent-msg's log, as the sidebar needs it: the newest messages, and
-    where the unread ones went. Read, never written: messages-read.jsonl is
-    agent-msg inbox's to keep. Each refresh reads only the lines added
-    since the last, so a long log costs once, when the sidebar starts."""
+    """agent-msg's log, as the sidebar needs it: the newest messages, where
+    the unread ones went, and which are still queued. Read, never written:
+    messages-read.jsonl and messages-delivered.jsonl are agent-msg's to
+    keep. Each refresh reads only the lines added since the last, so a long
+    log costs once, when the sidebar starts."""
 
     def __init__(self, folder: Path) -> None:
         self._sent = Tail(folder / "messages.jsonl")
         self._read = Tail(folder / "messages-read.jsonl")
+        self._delivered = Tail(folder / "messages-delivered.jsonl")
         self.clear()
 
     def clear(self) -> None:
@@ -971,26 +978,42 @@ class MessageLog:
         self.read: set[int] = set()
         # Each unread message's recipient, by id.
         self.unread: dict[int, tuple[str, str]] = {}
+        self.delivered: set[int] = set()
+        # When each message agent-msg has yet to paste was sent, by id.
+        self.undelivered: dict[int, float | None] = {}
 
     def refresh(self) -> bool:
         """Take in what was added; whether anything was."""
-        sent, read = self._sent.lines(), self._read.lines()
-        if sent is None or read is None:
-            self._sent.rewind()
-            self._read.rewind()
+        tails = (self._sent, self._read, self._delivered)
+        added = [tail.lines() for tail in tails]
+        if any(lines is None for lines in added):
+            for tail in tails:
+                tail.rewind()
             self.clear()
-            sent, read = self._sent.lines() or [], self._read.lines() or []
+            added = [tail.lines() or [] for tail in tails]
             changed = True
         else:
-            changed = bool(sent or read)
-        for message in json_objects(sent):
+            changed = any(added)
+        sent, read, delivered = added
+        for message in json_objects(sent or []):
             self.latest.append(message)
             if message["id"] not in self.read:
                 self.unread[message["id"]] = address(message.get("to"))
-        for mark in json_objects(read):
+            if message.get("push") is True and message["id"] not in self.delivered:
+                self.undelivered[message["id"]] = sent_at(message)
+        for mark in json_objects(read or []):
             self.read.add(mark["id"])
             self.unread.pop(mark["id"], None)
+        for mark in json_objects(delivered or []):
+            self.delivered.add(mark["id"])
+            self.undelivered.pop(mark["id"], None)
         return changed
+
+    def queued(self, now: float) -> set[int]:
+        """The messages agent-msg still means to paste: pushed, not yet
+        delivered, and sent within its patience."""
+        return {id for id, sent in self.undelivered.items()
+                if sent is not None and now - sent < PATIENCE}
 
     def inbox(self, panes: dict[str, str]) -> dict[str, set[int]]:
         """The unread messages in each live pane's inbox, given every
@@ -1060,9 +1083,11 @@ class Clipped:
 
 def message_prompt(
     message: Row, unread: bool, now: float, full: bool = False,
+    queued: bool = False,
 ) -> Group:
     """Who sent it, to whom, and its first line, or when full as much of
-    it as fits in place."""
+    it as fits in place. Queued, it says it is still waiting to be pasted
+    into its recipient's pane."""
     sent = sent_at(message)
     top = grid()
     top.add_row(
@@ -1078,7 +1103,10 @@ def message_prompt(
         Text(""),
         Text("→", style=MUTED),
         Address(message.get("to")),
-        Text(f" re #{reply_to}" if reply_to else "", style=MUTED),
+        Text.assemble(
+            (f" re #{reply_to}" if reply_to else "", MUTED),
+            (" queued" if queued else "", STATE_COLOR["blocked"]),
+        ),
     )
     text = str(message.get("text") or "").strip()
     body = Table.grid(expand=True)
@@ -1669,6 +1697,7 @@ class AgentSidebar(App[None]):
         # The messages listed, by option id, and which of them are unread.
         self._by_message: dict[str, Row] = {}
         self._unread_listed: set[str] = set()
+        self._queued_listed: set[str] = set()
         self._expanded: str | None = None
 
     def get_css_variables(self) -> dict[str, str]:
@@ -1959,14 +1988,17 @@ class AgentSidebar(App[None]):
         for message in reversed(self._log.latest):
             messages.setdefault(str(message["id"]), message)
         unread = {key for key in messages if int(key) not in self._log.read}
-        # Redraw when a message comes, is read, or ages a minute.
-        key = json.dumps([[key, key in unread, sent_at(message) and
-                           age(now - sent_at(message))]
+        waiting = self._log.queued(now)
+        queued = {key for key in messages if int(key) in waiting}
+        # Redraw when a message comes, is read or delivered, or ages a minute.
+        key = json.dumps([[key, key in unread, key in queued, sent_at(message)
+                           and age(now - sent_at(message))]
                           for key, message in messages.items()])
         if key == self._messages_shown:
             return
         self._messages_shown = key
         self._by_message, self._unread_listed = messages, unread
+        self._queued_listed = queued
 
         listing = self.query_one("#messages", OptionList)
         listing.display = bool(messages)
@@ -1982,8 +2014,9 @@ class AgentSidebar(App[None]):
             # the next.
             if options:
                 options.append(None)
-            options.append(Option(message_prompt(message, key in unread, now,
-                                                 full=key == target), id=key))
+            options.append(Option(message_prompt(
+                message, key in unread, now, full=key == target,
+                queued=key in queued), id=key))
         listing.set_options(options)
         if target is not None:
             listing.highlighted = listing.get_option_index(target)
@@ -1993,7 +2026,8 @@ class AgentSidebar(App[None]):
         if message is not None:
             self.query_one("#messages", OptionList).replace_option_prompt(
                 key, message_prompt(message, key in self._unread_listed,
-                                    time.time(), full=full))
+                                    time.time(), full=full,
+                                    queued=key in self._queued_listed))
 
     def on_option_list_option_highlighted(
         self, event: OptionList.OptionHighlighted,

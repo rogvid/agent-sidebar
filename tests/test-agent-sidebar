@@ -1150,8 +1150,9 @@ async def restore_cases(mod) -> list[tuple[str, bool, str]]:
 
 def message(id: int, sender: tuple[str, str], to: tuple[str, str],
             text: str = "hello", reply_to: int | None = None,
-            ago: float = 120) -> dict:
-    """A line of agent-msg's log, sent ago seconds before now."""
+            ago: float = 120, push: bool | None = None) -> dict:
+    """A line of agent-msg's log, sent ago seconds before now; with push,
+    one logged since agent-msg pastes every message it can."""
     def end(address):
         session, pane = address
         return {"pane": pane, "session": session, "project": session,
@@ -1159,7 +1160,7 @@ def message(id: int, sender: tuple[str, str], to: tuple[str, str],
     stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - ago))
     return {"id": id, "time": stamp, "kind": "reply" if reply_to else "send",
             "from": end(sender), "to": end(to), "reply_to": reply_to,
-            "text": text}
+            "text": text} | ({} if push is None else {"push": push})
 
 
 def append(path: Path, *lines: dict | str) -> None:
@@ -1247,6 +1248,38 @@ def message_log_cases(mod) -> list[tuple[str, bool, str]]:
     want = {"%2": {1, 2}, "%4": {2}, "%3": {3, 5}}
     check("a pane's inbox is agent-msg's: its own, its session's gone panes'",
           got == want, got)
+
+    # What agent-msg still has to paste.
+    folder = Path(tempfile.mkdtemp())
+    sent = folder / "messages.jsonl"
+    delivered = folder / "messages-delivered.jsonl"
+    append(sent,
+           message(1, orch, work),                       # from before push
+           message(2, orch, work, push=True),
+           message(3, work, orch, reply_to=2, push=True),
+           message(4, work, ("koyr", "%9"), push=False),  # to a shell
+           message(5, orch, work, push=True, ago=2 * 86400))
+    log = mod.MessageLog(folder)
+    log.refresh()
+    now = time.time()
+    check("a pushed message not yet pasted is queued",
+          log.queued(now) == {2, 3}, log.queued(now))
+    append(delivered, {"id": 2, "time": "2026-09-30T12:00:00Z", "pane": "%2"})
+    log.refresh()
+    check("until agent-msg records it delivered", log.queued(now) == {3},
+          log.queued(now))
+    append(delivered, {"id": 6, "time": "2026-09-30T12:00:00Z", "pane": "%2"})
+    append(sent, message(6, orch, work, push=True))
+    log.refresh()
+    check("even when it is recorded before it is read", 6 not in log.queued(now),
+          log.queued(now))
+    check("a day queued, agent-msg leaves it to the inbox",
+          5 not in log.queued(now) and 5 in log.queued(now - 2 * 86400),
+          log.queued(now))
+    delivered.unlink()
+    log.refresh()
+    check("deliveries started over are read again", log.queued(now) == {2, 3, 6},
+          log.queued(now))
     return results
 
 
@@ -1334,6 +1367,7 @@ async def message_cases(mod) -> list[tuple[str, bool, str]]:
            message(3, orch, work, "Rebase onto main\nthen report back"),
            message(4, orch, ("koyr", "%7"), "For a pane now gone"))
     append(read, {"id": 2, "time": "2026-09-30T12:00:00Z", "by": "%9"})
+    (folder / "messages-delivered.jsonl").touch()
     fake = Fake([row("koyr", "%1"), row("dotfiles", "%2"),
                  row("koyr", "%3", "running"), row("hoyr", "%4")], {"%2"})
     panes = {"%1": "koyr", "%3": "koyr", "%9": "orchestrator",
@@ -1446,7 +1480,7 @@ async def message_cases(mod) -> list[tuple[str, bool, str]]:
               titles)
 
         append(sent, message(5, ("koyr", "%1"), orch, "Done.", reply_to=1,
-                             ago=0))
+                             ago=0, push=True))
         append(read, {"id": 1, "time": "2026-09-30T12:00:00Z", "by": "%1"})
         await rescan()
         check("a new message comes in on top", ids()[:2] == ["5", "4"], ids())
@@ -1454,6 +1488,14 @@ async def message_cases(mod) -> list[tuple[str, bool, str]]:
               listing.highlighted_option.id == "4", listing.highlighted_option)
         check("a message read loses its mark",
               "✉" not in lines(listing, "1")[0], lines(listing, "1"))
+        check("one agent-msg has yet to paste says it is queued",
+              lines(listing, "5")[1] == " → orchestrator %9    re #1 queued",
+              lines(listing, "5"))
+        append(folder / "messages-delivered.jsonl",
+               {"id": 5, "time": "2026-09-30T12:00:00Z", "pane": "%9"})
+        await rescan()
+        check("and stops saying so once it is delivered",
+              "queued" not in lines(listing, "5")[1], lines(listing, "5"))
 
         await press("m")
         check("m goes back to the agents",
