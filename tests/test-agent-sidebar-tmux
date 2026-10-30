@@ -338,12 +338,29 @@ check "and the next M-2 works" equals sidebar_count 1
 press M-2
 check "and closes it again" equals sidebar_count 0
 
-printf 'pane\tmain\t1\t1\t:*\t0\tagent-sidebar\t:/home\t0\tsleep\t:\n' >"${scratch}/save"
-printf 'pane\tmain\t1\t1\t:*\t1\tzsh\t:/home\t1\tzsh\t:\n' >>"${scratch}/save"
-printf 'window\tmain\t1\t:one\t1\t:*\tlayout\t:\n' >>"${scratch}/save"
+# A window as tmux-resurrect saves it: a line for each pane, by index, and
+# one with its layout. resurrect restores the panes by index and the layout
+# cell by cell, so a save without the sidebar must be the window as it
+# would be with the sidebar's pane killed.
+saved_as() {
+    t list-panes -t "$1" -F "$(printf 'pane\tmain\t#{window_index}\t0\t:\t#{pane_index}\t#{pane_title}\t:/\t0\tsleep\t:sleep 3600')"
+    t display-message -p -t "$1" "$(printf 'window\tmain\t#{window_index}\t:w\t0\t:\t#{window_layout}\t:')"
+}
+saved="$(t new-window -d -t main: -P -F '#{window_id}' 'sleep 3600')"
+t split-window -d -h -t "${saved}" 'sleep 3600'
+t split-window -d -v -t "${saved}" 'sleep 3600'
+slot="$(t split-window -d -hbf -l "${width}" -t "${saved}" -P -F '#{pane_id}' 'sleep 3600')"
+t select-pane -t "${slot}" -T agent-sidebar
+alone="$(t new-window -d -t main: -P -F '#{window_id}' 'sleep 3600')"
+t select-pane -t "${alone}" -T agent-sidebar
+{ saved_as "${saved}"; saved_as "${alone}"; } >"${scratch}/save"
 "${repo}/bin/agent-sidebar-tmux" prune-resurrect "${scratch}/save"
-pruned() { [[ "$(cut -f1,7 "${scratch}/save" | tr '\t\n' ' ;')" == "pane zsh;window layout;" ]]; }
-check "resurrect saves leave the sidebar out" pruned
+t kill-pane -t "${slot}"
+t kill-window -t "${alone}"
+saved_as "${saved}" >"${scratch}/save-without"
+check "resurrect saves leave the sidebar out, as if its pane were killed" \
+    cmp -s "${scratch}/save" "${scratch}/save-without"
+t kill-window -t "${saved}"
 
 # The actions, run the way the sidebar runs them: from inside the server.
 act() {
