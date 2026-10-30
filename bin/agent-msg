@@ -197,10 +197,13 @@ append() {
 }
 
 # Paste TEXT into PANE as one bracketed paste, then submit it. The buffer is
-# this process's own, so two senders at once cannot swap texts.
+# this process's own, so two senders at once cannot swap texts. A pane
+# scrolled up is in copy mode, which would drop the paste's brackets and
+# take the Enter for itself, so it is brought back to the bottom first.
 paste_into() {
     local pane="$1" text="$2" buffer="agent-msg-$$"
-    printf '%s' "${text}" | tmux load-buffer -b "${buffer}" - &&
+    tmux copy-mode -q -t "${pane}" &&
+        printf '%s' "${text}" | tmux load-buffer -b "${buffer}" - &&
         tmux paste-buffer -p -d -b "${buffer}" -t "${pane}" &&
         sleep "${settle}" &&
         tmux send-keys -t "${pane}" Enter
