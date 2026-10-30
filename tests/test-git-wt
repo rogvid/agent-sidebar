@@ -1160,6 +1160,21 @@ def add_command():
           r.code == 0 and (stale / "README.md").exists()
           and c.registered().count(stale) == 1, r.desc())
 
+    # git worktree prune keeps a locked registration, so add cannot reuse it.
+    unplugged = c.add_wt("feat/unplugged")
+    git(c.main, "worktree", "lock", "--reason", "on a usb disk", str(unplugged))
+    shutil.rmtree(unplugged)
+    r = wt("add", "feat/unplugged", cwd=c.main)
+    check("add for a locked worktree whose folder is gone says to unlock it first",
+          r.code == 1 and "Pruned" not in r.all and "unlock" in r.err
+          and c.is_registered(unplugged), r.desc())
+    occupied = c.add_wt("feat/x-y")
+    git(c.main, "worktree", "lock", str(occupied))
+    shutil.rmtree(occupied)
+    r = wt("add", "feat/x_y", cwd=c.main)
+    check("so does add for a branch whose folder such a worktree holds",
+          r.code == 1 and "unlock" in r.err and not c.has_branch("feat/x_y"), r.desc())
+
     r = wt("add", "bad..name", cwd=c.main)
     check("an invalid branch name exits 1 and creates nothing",
           r.code == 1 and not c.has_branch("bad..name") and not (c.wts / "bad-name").exists(),
