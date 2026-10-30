@@ -137,6 +137,7 @@ wire_usage_tap() {
     command -v jq >/dev/null || { say "skipped - needs jq"; return 0; }
     local cfg settings real current command first bare updated changed=0
     local -A seen=()
+    local -a skipped=()
     while IFS= read -r cfg; do
         settings="${cfg}/settings.json"
         real="$(realpath -m "${settings}")"
@@ -146,11 +147,13 @@ wire_usage_tap() {
         if [[ -e "${real}" ]]; then
             current="$(cat "${real}" 2>/dev/null)" || {
                 say "skipped  ${settings} - cannot read it"
+                skipped+=("${settings}")
                 continue
             }
         fi
         command="$(jq -r '.statusLine.command // ""' <<<"${current}" 2>/dev/null)" || {
             say "skipped  ${settings} - not valid JSON"
+            skipped+=("${settings}")
             continue
         }
         [[ "${command}" =~ ${first_word_re} ]]
@@ -166,6 +169,7 @@ wire_usage_tap() {
         # the prefix.
         if [[ -n "${command}" && ! "${command}" =~ ${plain_re} ]]; then
             say "skipped  ${settings} - put agent-usage-tap in front of its statusLine.command by hand"
+            skipped+=("${settings}")
             continue
         fi
         if [[ -z "${command}" && -e "${cfg}/statusline.sh" ]]; then
@@ -181,7 +185,15 @@ wire_usage_tap() {
         printf '%s\n' "${updated}" >"${real}.partial" && mv -f "${real}.partial" "${real}"
         say "wired    ${settings}"
     done < <(claude_dirs)
-    ((changed)) || say "every Claude Code statusline runs through agent-usage-tap"
+    if ((${#skipped[@]} == 1)); then
+        say "1 statusline does not run through agent-usage-tap: ${skipped[0]}"
+    elif ((${#skipped[@]})); then
+        local list
+        list="$(printf ', %s' "${skipped[@]}")"
+        say "${#skipped[@]} statuslines do not run through agent-usage-tap: ${list#, }"
+    elif ! ((changed)); then
+        say "every Claude Code statusline runs through agent-usage-tap"
+    fi
 }
 
 ((CHECK)) && echo "check mode - nothing will be modified"

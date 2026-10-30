@@ -112,7 +112,11 @@ out="$("${setup}" 2>&1)"
 check "a second run links nothing" contains "${out}" "every skills folder links the plugin's skill"
 check "no channel either" contains "${out}" "every channel is linked"
 check "nor a tool" contains "${out}" "every tool is linked"
-check "and wires nothing" contains "${out}" "every Claude Code statusline runs through agent-usage-tap"
+check "and wires nothing" not contains "${out}" "wired"
+check "nor claims every statusline runs through the tap" \
+    not contains "${out}" "every Claude Code statusline runs through agent-usage-tap"
+check "but names the one that does not" \
+    contains "${out}" "1 statusline does not run through agent-usage-tap: ${HOME}/.claude-odd/settings.json"
 
 # The plugin moved, or the tap was wired by hand by its bare name.
 printf '{"statusLine": {"command": "/old/plugin/bin/agent-usage-tap ~/.claude-work/statusline.sh"}}\n' \
@@ -147,6 +151,9 @@ moved_to "${HOME}/my plugins/agent-sidebar"
 "${setup}" >/dev/null 2>&1
 check "a quoted tap from elsewhere is pointed at this one" \
     same "$(statusline .claude-work command)" "${tap} ~/.claude-work/statusline.sh"
+out="$("${setup}" 2>&1)"
+check "with none skipped every statusline runs through the tap" \
+    contains "${out}" "every Claude Code statusline runs through agent-usage-tap"
 
 # A settings.json the setup cannot read is not taken for an empty one.
 printf '{"hooks": {"Stop": []}}\n' >"${HOME}/.claude-work/settings.json"
@@ -156,6 +163,13 @@ chmod 644 "${HOME}/.claude-work/settings.json"
 check "an unreadable settings.json is kept" \
     same "$(cat "${HOME}/.claude-work/settings.json")" '{"hooks": {"Stop": []}}'
 check "and the run says so" contains "${out}" "skipped  ${HOME}/.claude-work/settings.json - cannot read it"
+
+# Several skipped are each named in the summary.
+printf '{"statusLine": {"command": "a | b"}}\n' >"${HOME}/.claude-odd/settings.json"
+printf 'not json\n' >"${HOME}/.claude-work/settings.json"
+out="$("${setup}" 2>&1)"
+check "the run names every statusline it skipped" contains "${out}" \
+    "2 statuslines do not run through agent-usage-tap: ${HOME}/.claude-odd/settings.json, ${HOME}/.claude-work/settings.json"
 
 check "an unknown option is refused" not "${setup}" --force
 
