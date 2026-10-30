@@ -148,6 +148,15 @@ moved_to "${HOME}/my plugins/agent-sidebar"
 check "a quoted tap from elsewhere is pointed at this one" \
     same "$(statusline .claude-work command)" "${tap} ~/.claude-work/statusline.sh"
 
+# A settings.json the setup cannot read is not taken for an empty one.
+printf '{"hooks": {"Stop": []}}\n' >"${HOME}/.claude-work/settings.json"
+chmod 000 "${HOME}/.claude-work/settings.json"
+out="$("${setup}" 2>&1)"
+chmod 644 "${HOME}/.claude-work/settings.json"
+check "an unreadable settings.json is kept" \
+    same "$(cat "${HOME}/.claude-work/settings.json")" '{"hooks": {"Stop": []}}'
+check "and the run says so" contains "${out}" "skipped  ${HOME}/.claude-work/settings.json - cannot read it"
+
 check "an unknown option is refused" not "${setup}" --force
 
 rm "${scratch}/stubs/tv"

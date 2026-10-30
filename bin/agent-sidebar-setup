@@ -142,7 +142,13 @@ wire_usage_tap() {
         real="$(realpath -m "${settings}")"
         [[ -n "${seen[${real}]:-}" ]] && continue
         seen[${real}]=1
-        current="$(cat "${real}" 2>/dev/null || echo '{}')"
+        current='{}'
+        if [[ -e "${real}" ]]; then
+            current="$(cat "${real}" 2>/dev/null)" || {
+                say "skipped  ${settings} - cannot read it"
+                continue
+            }
+        fi
         command="$(jq -r '.statusLine.command // ""' <<<"${current}" 2>/dev/null)" || {
             say "skipped  ${settings} - not valid JSON"
             continue
