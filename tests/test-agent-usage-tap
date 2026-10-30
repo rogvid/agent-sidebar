@@ -99,6 +99,21 @@ check "input with no rate limits still reaches the statusline" same "${out}" '{"
 check "and changes nothing" \
     same "$(saved "${HOME}/.claude")" "$(record 1 1790721000 71 1790942400)"
 
+# A window that is no use to the sidebar is not kept, and neither it nor a
+# file that is not JSON may stop the next good reading from landing.
+"${tap}" <<<'{"rate_limits":{"five_hour":{"used_percentage":2,"resets_at":null},"seven_day":{"used_percentage":72,"resets_at":1790942400}}}'
+check "a window with no reset time is not kept" \
+    same "$(saved "${HOME}/.claude")" "$(record 1 1790721000 72 1790942400)"
+file="$(grep -l "\"${HOME}/.claude\"" "${usage}"/*.json)"
+jq -c '.five_hour.resets_at = null' "${file}" >"${file}.new" && mv "${file}.new" "${file}"
+"${tap}" <<<"$(input 3 1790721000 73 1790942400)"
+check "nor does a saved one stop the next reading" \
+    same "$(saved "${HOME}/.claude")" "$(record 3 1790721000 73 1790942400)"
+echo 'not json' >"${file}"
+"${tap}" <<<"$(input 4 1790721000 74 1790942400)"
+check "nor does a saved file that is not JSON" \
+    same "$(saved "${HOME}/.claude")" "$(record 4 1790721000 74 1790942400)"
+
 out="$("${tap}" cat <<<'not json')"
 check "input that is not JSON still reaches the statusline" same "${out}" "not json"
 

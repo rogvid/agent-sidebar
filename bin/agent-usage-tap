@@ -40,8 +40,14 @@ keep() {
     # Every pane on the account runs this every few seconds.
     exec 9<"${dir}" && flock -w 2 9 || return
     current="$(cat "${file}" 2>/dev/null)"
-    merged="$(jq -c --arg folder "${folder}" --argjson new "${limits}" '
+    # A window is only kept with both numbers, and a saved file that is not
+    # JSON counts as none: either would otherwise fail every merge after it,
+    # and the account's limits would never move again.
+    merged="$(jq -nc --arg folder "${folder}" --argjson new "${limits}" \
+        --arg current "${current}" '
         def window: if type == "object"
+                and (.used_percentage | type) == "number"
+                and (.resets_at | type) == "number"
             then {used_percentage, resets_at} else null end;
         def newer($old; $new):
             if $new == null then $old
@@ -51,11 +57,12 @@ keep() {
                 then $new else $old end
             elif $new.resets_at > $old.resets_at then $new
             else $old end;
-        (if type == "object" then . else {} end) as $old
+        ((try ($current | fromjson) catch null)
+            | if type == "object" then . else {} end) as $old
         | {harness: "claude", folder: $folder,
            five_hour: newer($old.five_hour | window; $new.five_hour | window),
            seven_day: newer($old.seven_day | window; $new.seven_day | window)}
-    ' <<<"${current:-null}" 2>/dev/null)" || return
+    ' 2>/dev/null)" || return
     [[ "${merged}" == "${current}" ]] && return
     # Replaced whole, so the sidebar never reads half a file.
     printf '%s\n' "${merged}" >"${file}.partial" 2>/dev/null \
