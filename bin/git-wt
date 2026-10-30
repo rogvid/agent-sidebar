@@ -1242,7 +1242,13 @@ def cmd_switch(args: argparse.Namespace) -> int:
     return 0
 
 
-def delete_branch(repo: Repo, branch: str) -> None:
+def delete_branch(repo: Repo, branch: str, checked: str) -> None:
+    """Deletes branch if it is still at checked, the commit found merged."""
+    # A commit made while the prompt waited was never checked.
+    tip = repo.git("rev-parse", "--verify", "--quiet", f"refs/heads/{branch}", check=False).strip()
+    if tip != checked:
+        warn(f"Kept branch {branch}: it got new commits after it was found merged.")
+        return
     # -D: the merge check above is the safety, and git's own -d refuses
     # branches that were squash-merged.
     result = run(["git", "branch", "-D", branch], cwd=repo.root, check=False)
@@ -1318,7 +1324,7 @@ def cmd_remove(args: argparse.Namespace) -> int:
     close_session(repo, worktree)
     if worktree.branch:
         if args.delete and reason:
-            delete_branch(repo, worktree.branch)
+            delete_branch(repo, worktree.branch, worktree.head)
         elif args.delete:
             say(f"Kept branch {worktree.branch}: it is not merged into {repo.target}.")
         elif reason:
@@ -1378,7 +1384,7 @@ def carry_out(plan: PrunePlan, delete: bool) -> int:
             say(green(f"✓ Removed {worktree.name}"))
         close_session(repo, worktree)
         if delete and worktree.branch and reason:
-            delete_branch(repo, worktree.branch)
+            delete_branch(repo, worktree.branch, worktree.head)
     return failures
 
 
