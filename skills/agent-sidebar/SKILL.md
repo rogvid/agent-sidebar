@@ -206,7 +206,7 @@ queued msg 19 for shop-feat-login %42: %42 is blocked on a dialog (Do you want t
 agent-msg deliver pastes it once that clears, and tells you if it still waits in 10m.
 ```
 
-It waits while the pane is `blocked` (its dialog would take the paste as its answer), while the pane has unsent text in its input box (someone is writing there), and while the pane is gone, until an agent runs in its session again.
+It waits while the pane is `blocked` (its dialog would take the paste as its answer), while the pane has unsent text in its input box (someone is writing there), for the first 10 seconds of a harness just started (it is not listening yet), and while the pane is gone, until an agent other than you runs in its session again.
 A message queued for more than a day is not pasted any more and stays in the recipient's inbox.
 
 If it still waits after 10 minutes, a note saying so and why is pasted into your pane, once:

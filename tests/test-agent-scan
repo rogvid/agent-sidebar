@@ -1182,9 +1182,10 @@ def main() -> int:
     ok = (decoded[0]["cwd"] == "/tmp/koyr"
           and decoded[0]["context_level"] == "ok"
           and "message_full" in decoded[0]
-          and decoded[0]["draft"] == "")
+          and decoded[0]["draft"] == ""
+          and decoded[0]["started"] == 0.0)
     failures += not ok
-    print(f"{'ok  ' if ok else 'FAIL'}  json     {'cwd, context level, message, draft':36} "
+    print(f"{'ok  ' if ok else 'FAIL'}  json     {'cwd, context level, message, draft, started':36} "
           f"{'ok' if ok else f'got={decoded[0]!r}'}")
 
     for name, context, want in CONTEXT_LEVEL_CASES:

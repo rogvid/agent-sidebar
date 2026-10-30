@@ -57,8 +57,9 @@ fi
 # agent-msg queues a message its recipient cannot take yet, such as one
 # blocked on a dialog; this pastes it once it can, and tells its sender if
 # it waits long, for as long as the server runs. Only one runs, so a
-# re-source starts no second.
-tmux run-shell -b "'${bin}/agent-msg' deliver --watch"
+# re-source starts no second. Its output goes nowhere: tmux would keep a
+# job's output for as long as it runs, which is as long as the server.
+tmux run-shell -b "'${bin}/agent-msg' deliver --watch >/dev/null 2>&1"
 
 # tmux-resurrect would bring a saved sidebar back as a bare shell in its
 # slot. Only when nothing else has claimed the hook.

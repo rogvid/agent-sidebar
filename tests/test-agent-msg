@@ -63,6 +63,9 @@ export PATH="${scratch}/bin:${repo}/bin:${PATH}"
 UV_CACHE_DIR="$(uv cache dir)" UV_PYTHON_INSTALL_DIR="$(uv python dir)"
 export UV_CACHE_DIR UV_PYTHON_INSTALL_DIR
 export HOME="${scratch}/home" XDG_STATE_HOME="${scratch}/state"
+# The stand-ins listen at once, where a real harness takes seconds; the
+# wait for one just started has a check of its own.
+export AGENT_MSG_WARMUP=0
 mkdir -p "${HOME}"
 readonly messages="${XDG_STATE_HOME}/agent-sidebar/messages.jsonl"
 readonly delivered="${XDG_STATE_HOME}/agent-sidebar/messages-delivered.jsonl"
@@ -88,6 +91,17 @@ wait_for() {
         sleep 0.1
     done
     echo "      ${1} never showed ${2}" >&2
+    return 1
+}
+# Wait until PANE no longer shows TEXT: a pane started again shows its old
+# screen until the new stand-in clears it.
+wait_gone() {
+    local _
+    for _ in $(seq 50); do
+        t capture-pane -p -t "$1" | grep -qF "$2" || return 0
+        sleep 0.1
+    done
+    echo "      ${1} still shows ${2}" >&2
     return 1
 }
 # What PANE's agent has been sent, once the paste has had time to land;
@@ -196,6 +210,9 @@ check "and its delivery recorded, with the pane it went to" \
     same "$(jq -c 'select(.id == 3) | [.id, .pane]' "${delivered}")" "[3,\"${orch}\"]"
 out="$(as_worker reply 99 "hi" 2>&1)" && status=0 || status=$?
 check "a reply to no message is refused" same "${status} ${out}" "1 agent-msg: no message 99"
+out="$(as_worker reply 3 "talking to myself" 2>&1)" && status=0 || status=$?
+check "and so is a reply to your own message" \
+    same "${status} ${out}" "1 agent-msg: message 3 is your own"
 
 # --- verify ---
 
@@ -370,6 +387,7 @@ check "deliver leaves it queued while the dialog is up" \
     same "$(got "${dialog}") $(delivered_to "${id}")" " "
 # The dialog answered: the same pane, now at its prompt.
 t respawn-pane -k -t "${dialog}" claude
+wait_gone "${dialog}" 'Esc to cancel'
 wait_for "${dialog}" '❯'
 agent-msg deliver
 check "once it clears, deliver pastes it under its header" \
@@ -387,10 +405,29 @@ out="$(msg send "${drafting}" "when you have a moment")"
 check "a message to a pane with unsent text in its input is queued" \
     has "${out}" "queued msg ${first} for app-draft ${drafting}: ${drafting} has unsent text in its input."
 check "rather than pasted into the middle of it" same "$(got "${drafting}")" ""
+id="$(next)"
+out="$(AGENT_MSG_WARMUP=3600 msg send "${worker}" "too soon")"
+check "a harness just started is not pasted into, as it is not listening yet" \
+    has "${out}" "queued msg ${id} for app-feat-x ${worker}: ${worker} has only just started, and is not listening yet."
+agent-msg deliver
+check "and gets it once it has had time" same "$(delivered_to "${id}")" "\"${worker}\""
 suggesting="$(start app-suggest 'claude suggest')"
 wait_for "${suggesting}" 'run the tests again'
 check "a dim suggested prompt in the box is nobody's typing, so it is pasted" \
     has "$(msg send "${suggesting}" "hello")" "sent msg "
+
+# A message to a pane that is gone goes to the one agent left in its
+# session, but not back to its own sender.
+alone="$(start app-pair claude)"
+wait_for "${alone}" '❯'
+gone="$(t split-window -d -t "${alone}" -P -F '#{pane_id}' codex)"
+wait_for "${gone}" 'Esc to cancel'
+id="$(next)"
+TMUX_PANE="${alone}" agent-msg send "${gone}" "to my neighbour" >/dev/null
+t kill-pane -t "${gone}"
+agent-msg deliver
+check "a message whose pane is gone is not pasted back into its sender" \
+    same "$(got "${alone}") $(delivered_to "${id}")" " "
 
 # Waiting long, its sender is told: AGENT_MSG_NUDGE=0 makes any wait long.
 from_shell="$(next)"
@@ -412,6 +449,7 @@ check "a sender that runs no agent is recorded as told nobody" \
 check "one blocked on a dialog itself is left to a later pass" \
     same "$(got "${blocker}") $(nudged_to "${from_blocked}")" " "
 t respawn-pane -k -t "${blocker}" claude
+wait_gone "${blocker}" 'Esc to cancel'
 wait_for "${blocker}" '❯'
 skip="$(size "${orch}")"
 AGENT_MSG_NUDGE=0 agent-msg deliver
@@ -444,13 +482,14 @@ check "a message queued for more than a day is not pasted" \
 AGENT_MSG_INTERVAL=0.2 agent-msg deliver --watch &
 watcher=$!
 sleep 0.5
-timeout 2 agent-msg deliver --watch && status=0 || status=$?
+timeout 5 agent-msg deliver --watch && status=0 || status=$?
 check "a second deliver --watch leaves it to the one running" same "${status}" 0
 id="$(next)"
 out="$(msg send "${drafting}" "still there?")"
 check "while one runs, a queued message is said to be pasted once it clears" \
     has "${out}" "agent-msg deliver pastes it once that clears, and tells you if it still waits in 10m."
 t respawn-pane -k -t "${drafting}" claude
+wait_gone "${drafting}" 'half a thought'
 wait_for "${drafting}" '❯'
 for _ in $(seq 50); do
     [[ -n "$(delivered_to "${id}")" ]] && break
@@ -459,6 +498,24 @@ done
 check "deliver --watch pastes the queue, oldest first, once it clears" \
     same "$(got "${drafting}" | tr '\r' '\n' | grep -oE '\[msg [0-9]+' | paste -sd ' ')" \
     "[msg ${first} [msg ${from_shell} [msg ${from_blocked} [msg ${id}"
+
+# A watcher whose script is updated under it, as TPM does, goes on as the
+# new code: a copy of its own, with a log of its own.
+mkdir -p "${scratch}/updated"
+cp "${repo}/bin/agent-msg" "${scratch}/updated/agent-msg"
+XDG_STATE_HOME="${scratch}/updated" AGENT_MSG_INTERVAL=0.2 \
+    "${scratch}/updated/agent-msg" deliver --watch &
+updated=$!
+sleep 0.5
+sed -i "2i touch '${scratch}/updated/ran'" "${scratch}/updated/agent-msg"
+for _ in $(seq 50); do
+    [[ -e "${scratch}/updated/ran" ]] && break
+    sleep 0.1
+done
+check "an updated deliver --watch runs its new code" test -e "${scratch}/updated/ran"
+XDG_STATE_HOME="${scratch}/updated" timeout 5 agent-msg deliver --watch && status=0 || status=$?
+check "still the one watcher, holding the lock" \
+    same "${status} $(kill -0 "${updated}" && echo running)" "0 running"
 
 XDG_STATE_HOME="" msg send "${worker}" "hi" >/dev/null
 check "without XDG_STATE_HOME the log is in ~/.local/state" \
@@ -471,6 +528,7 @@ for _ in $(seq 50); do
 done
 kill -0 "${watcher}" 2>/dev/null && status=0 || status=$?
 check "deliver --watch stops with the tmux server" test "${status}" -ne 0
+wait "${updated}" 2>/dev/null || true
 
 printf '\n%s/%s passed\n' "$((total - failures))" "${total}"
 ((failures == 0))

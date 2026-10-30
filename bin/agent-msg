@@ -72,9 +72,11 @@
 # also held back from a pane that is blocked, because its dialog would take
 # the paste as its answer, and from one with unsent text in its input box,
 # because someone is writing there and the paste would land in the middle
-# of their words. Held back, it is queued: logged, and pasted by deliver
-# once that clears. So it is when its pane is gone, until an agent runs in
-# its session again (the session's mail is its own, as for inbox below).
+# of their words, and from a harness started moments ago, which is not
+# listening yet and would lose it. Held back, it is queued: logged, and
+# pasted by deliver once that clears. So it is when its pane is gone, until an agent runs in
+# its session again (the session's mail is its own, as for inbox below),
+# other than its sender.
 # Every message is delivered the same way, a reply as much as a send: an
 # agent only notices what is pasted into it, so a reply that only went to
 # the log was one its sender never saw. A message queued for longer than a
@@ -123,6 +125,8 @@ readonly interval="${AGENT_MSG_INTERVAL:-3}"
 readonly patience=$((24 * 60 * 60))
 # How long a queued message waits before its sender is told so.
 readonly nudge_after="${AGENT_MSG_NUDGE:-600}"
+# How long a harness just started takes to listen, in seconds.
+readonly warmup="${AGENT_MSG_WARMUP:-10}"
 
 usage() {
     sed -n '2,/^$/s/^# \{0,1\}//p' "$0"
@@ -271,13 +275,14 @@ header() {
 # agent-scan's ROWS: printed as {message, pane}, or {message, wait} saying
 # why it has to wait, with busy set when an agent is there but cannot take
 # a paste yet. That is the pane it was sent to, or once that is gone, the
-# one agent running in its session.
+# one agent running in its session, unless that is its sender.
 route() {
     local rows="$1" live
     live="$(tmux list-panes -a -F '#{session_name}	#{pane_id}' 2>/dev/null |
         jq -nR 'reduce (inputs | split("\t")) as [$s, $p] ({}; .[$s] += [$p])')" ||
         live='{}'
-    jq -c --argjson rows "${rows}" --argjson live "${live}" '
+    jq -c --argjson rows "${rows}" --argjson live "${live}" \
+        --argjson since "$(($(date +%s) - warmup))" '
         def row($pane): first($rows[] | select(.pane_id == $pane)) // null;
         def checked($pane): row($pane) as $row
             | if $row == null then {wait: "\($pane) runs no agent"}
@@ -285,13 +290,16 @@ route() {
               then {wait: "\($pane) is blocked on a dialog (\($row.message))", busy: true}
               elif ($row.draft // "") != ""
               then {wait: "\($pane) has unsent text in its input", busy: true}
+              elif ($row.started // 0 | floor) > $since
+              then {wait: "\($pane) has only just started, and is not listening yet", busy: true}
               else {pane: $pane} end;
         . as $message | .to.pane as $pane | .to.session as $session
         | $live[$session] as $panes
         | {message: $message} + if $panes == null
             then {wait: "session \($session) is not running"}
             elif $panes | index($pane) then checked($pane)
-            else [$rows[] | select(.pane_id | IN($panes[])) | .pane_id] as $agents
+            else [$rows[] | select(.pane_id | IN($panes[])) | .pane_id
+                  | select(. != $message.from.pane)] as $agents
                 | if ($agents | length) == 1 then checked($agents[0])
                   elif $agents == [] then {wait: "\($pane) is gone and no agent runs in \($session)"}
                   else {wait: "\($pane) is gone and \($session) runs more than one agent"} end
@@ -367,6 +375,8 @@ reply() {
     to="$(slurp "${log_file}" |
         jq -c --argjson id "${original}" 'first(.[] | select(.id == $id)) | .from')"
     [[ -n "${to}" ]] || die "no message ${original}"
+    [[ "$(jq -c '{pane, session}' <<<"${to}")" != "$(jq -c '{pane, session}' <<<"${from}")" ]] ||
+        die "message ${original} is your own"
     rows="$(agent-scan --json)"
     pane="$(jq -r .pane <<<"${to}")"
     session="$(jq -r .session <<<"${to}")"
@@ -392,9 +402,9 @@ reply() {
 queued() {
     slurp "${log_file}" | jq -c --argjson delivered "$(slurp "${delivered_file}")" \
         --argjson since "$(($(date +%s) - patience))" '
-        ([$delivered[].id]) as $done
-        | map(select(.push == true and (.id | IN($done[]) | not)
-            and (.time | fromdateiso8601? // 0) >= $since))'
+        (reduce $delivered[] as $mark ({}; .[$mark.id | tostring] = true)) as $done
+        | map(select(.push == true and (.time | fromdateiso8601? // 0) >= $since
+            and ($done[.id | tostring] | not)))'
 }
 
 # Tell the sender of MESSAGE, which still waits for the reason WAIT, that
@@ -422,25 +432,37 @@ nudge() {
 
 # jq: whether the sender of queued message . is due to be told it still
 # waits, by $due (the latest time it can have been sent) and $told (the
-# ids whose senders were).
+# ids whose senders were, as keys).
 # shellcheck disable=SC2016
-readonly owed='(.time | fromdateiso8601) <= $due and (.id | IN($told[]) | not)'
+readonly owed='(.time | fromdateiso8601) <= $due and ($told[.id | tostring] | not)'
 
-# Paste every queued message that can be now, and tell the sender of each
-# that has waited too long. agent-scan only runs when one is queued for a
-# session that is running, or a sender is owed a note.
-deliver_queued() {
-    local sessions told due messages rows routed message
-    lock
+# Set told and due, for owed.
+deadlines() {
+    told="$(slurp "${nudged_file}" | jq -c 'reduce .[] as $mark ({}; .[$mark.id | tostring] = true)')"
+    due="$(($(date +%s) - nudge_after))"
+}
+
+# The queued messages there is something to do about, one a line: those
+# for a session that is running, and those whose sender is owed a note.
+pending() {
+    local sessions
     sessions="$(tmux list-sessions -F '#{session_name}' 2>/dev/null |
         jq -cR '[., inputs]')" || return 0
-    told="$(slurp "${nudged_file}" | jq -c 'map(.id)')"
-    due="$(($(date +%s) - nudge_after))"
-    messages="$(queued | jq -c --argjson sessions "${sessions}" \
+    queued | jq -c --argjson sessions "${sessions}" \
         --argjson told "${told}" --argjson due "${due}" \
-        ".[] | select((.to.session | IN(\$sessions[])) or ${owed})")"
-    [[ -n "${messages}" ]] || return 0
+        ".[] | select((.to.session | IN(\$sessions[])) or ${owed})"
+}
+
+# Paste every queued message that can be now, and tell the sender of each
+# that has waited too long. agent-scan only runs when there is something to
+# do, and before the lock, which others wait on.
+deliver_queued() {
+    local told due rows routed message
+    deadlines
+    [[ -n "$(pending)" ]] || return 0
     rows="$(agent-scan --json)"
+    lock
+    deadlines
     while IFS= read -r -u 3 routed; do
         message="$(jq -c .message <<<"${routed}")"
         if [[ "$(jq -r '.pane // ""' <<<"${routed}")" != "" ]]; then
@@ -448,7 +470,7 @@ deliver_queued() {
         else
             nudge "${message}" "$(jq -r .wait <<<"${routed}")" "${rows}"
         fi
-    done 3< <(route "${rows}" <<<"${messages}" |
+    done 3< <(pending | route "${rows}" |
         jq -c --argjson told "${told}" --argjson due "${due}" \
             "select(.pane or (.message | ${owed}))")
 }
@@ -457,14 +479,21 @@ deliver() {
     case "${1:-}" in
     "") deliver_queued ;;
     --watch)
-        # One watcher: another one already running keeps the job.
+        # One watcher: another one already running keeps the job. Waiting
+        # a moment lets a send that is checking for one (watched) let go.
         mkdir -p "${dir}"
         exec 8>>"${watch_lock}"
-        flock -n 8 || exit 0
+        flock -w 1 8 || exit 0
+        local version
+        version="$(cksum <"$0")"
         # Each pass in a subshell, so the log's lock goes with it.
         while tmux list-sessions >/dev/null 2>&1; do
             (deliver_queued) || true
             sleep "${interval}"
+            # Updated, as by TPM, it carries on as the new code, which takes
+            # the lock over.
+            [[ "$(cksum <"$0" 2>/dev/null)" == "${version}" ]] ||
+                exec "$0" deliver --watch
         done
         ;;
     *) usage >&2; exit 2 ;;
