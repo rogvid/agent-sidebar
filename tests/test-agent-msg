@@ -21,6 +21,8 @@ readonly scratch
 
 cleanup() {
     tmux -L "${socket}" kill-server 2>/dev/null || true
+    # tmux leaves the socket of a killed server behind.
+    rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/${socket}"
     rm -rf "${scratch}"
 }
 trap cleanup EXIT

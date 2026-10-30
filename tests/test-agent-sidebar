@@ -1344,6 +1344,9 @@ def inbox_agreement_cases(mod) -> list[tuple[str, bool, str]]:
             os.environ["TMUX"] = saved
         subprocess.run(["tmux", "-L", socket, "kill-server"],
                        capture_output=True)
+        # tmux leaves the socket of a killed server behind.
+        (Path(os.environ.get("TMUX_TMPDIR", "/tmp")) / f"tmux-{os.getuid()}"
+         / socket).unlink(missing_ok=True)
         for name in ("messages.jsonl", "messages-read.jsonl", "messages.lock"):
             (folder / name).unlink(missing_ok=True)
     return results
