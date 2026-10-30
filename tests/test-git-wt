@@ -2220,6 +2220,36 @@ def session_collisions():
           "api-gateway" in sessions() and session_path("api-gateway") == str(other.main),
           f"sessions={sorted(sessions())}")
 
+    # tmux-resurrect starts a restored session in its first pane's saved
+    # folder, wherever in the worktree that pane had gone.
+    kill_tmux()
+    restored = api.add_wt("restored")
+    (restored / "src").mkdir()
+    new_session("api-restored", restored / "src")
+    new_session("home", api.main)
+    attach_client("home")
+    inside = inside_tmux_env("home")
+    r = wt("switch", "restored", cwd=api.main, env=inside)
+    check("switch reuses a restored session started in a folder of the worktree",
+          r.code == 0 and wait_until(lambda: client_sessions() == ["api-restored"])
+          and sessions() == {"api-restored", "home"},
+          r.desc() + f" sessions={sorted(sessions())}")
+    # Started elsewhere, but every pane in the worktree.
+    tmux("kill-session", "-t", "=api-restored")
+    new_session("api-restored", api.project)
+    tmux("respawn-pane", "-k", "-c", str(restored), "-t", "=api-restored:")
+    tmux("split-window", "-d", "-c", str(restored / "src"), "-t", "=api-restored:")
+    r = wt("session", str(restored), cwd=api.main)
+    check("a session whose panes are all in the worktree is the worktree's",
+          r.out.split("\t")[0] == "api-restored", r.desc())
+    tmux("split-window", "-d", "-c", str(other.main), "-t", "=api-restored:")
+    r = wt("session", str(restored), cwd=api.main)
+    check("but not once one of them is somewhere else",
+          r.out.split("\t")[0] == "api-restored-2", r.desc())
+    r = wt("remove", "-f", "--no-fetch", "restored", cwd=api.main)
+    check("and remove leaves that one alone",
+          r.code == 0 and "api-restored" in sessions(), r.desc() + f" sessions={sorted(sessions())}")
+
     # The worktree's session first this time, the other project's after it.
     kill_tmux()
     gateway = api.add_wt("gateway2", path=api.wts / "gateway")

@@ -433,12 +433,13 @@ class Repo:
         base = session_name(self.name, folder)
         # Names collide: project api's worktree gateway and project
         # api-gateway's main worktree are both api-gateway. A session is the
-        # worktree's only if it was started in it; otherwise the worktree
-        # gets the first free one of base-2, base-3 and so on.
+        # worktree's only if it was started in it or a folder of it, or every
+        # pane of it is there; otherwise the worktree gets the first free one
+        # of base-2, base-3 and so on.
         existing = tmux_sessions()
         names = [base, *(f"{base}-{n}" for n in range(2, len(existing) + 3))]
         for name in names:
-            if name in existing and same_path(Path(existing[name]), path):
+            if name in existing and owns(path, *existing[name]):
                 return name
         return next(name for name in names if name not in existing)
 
@@ -652,13 +653,32 @@ def tmux(*args: str) -> subprocess.CompletedProcess[str] | None:
     return subprocess.run(["tmux", *args], capture_output=True, text=True)
 
 
-def tmux_sessions() -> dict[str, str]:
-    """Every tmux session by name, with the folder it was started in."""
-    result = tmux("list-sessions", "-F", "#{session_name}\t#{session_path}")
-    if result is None or result.returncode != 0:
-        return {}
-    pairs = (line.split("\t", 1) for line in result.stdout.splitlines() if "\t" in line)
-    return dict(pairs)
+def tmux_sessions() -> dict[str, tuple[str, list[str]]]:
+    """Every tmux session by name: the folder it was started in, and the
+    folders its panes are in."""
+    def pairs(*args: str) -> list[list[str]]:
+        result = tmux(*args)
+        if result is None or result.returncode != 0:
+            return []
+        return [line.split("\t", 1) for line in result.stdout.splitlines() if "\t" in line]
+
+    sessions = {
+        name: (start, [])
+        for name, start in pairs("list-sessions", "-F", "#{session_name}\t#{session_path}")
+    }
+    for name, folder in pairs("list-panes", "-a", "-F", "#{session_name}\t#{pane_current_path}"):
+        if name in sessions and folder:
+            sessions[name][1].append(folder)
+    return sessions
+
+
+def owns(path: Path, start: str, panes: list[str]) -> bool:
+    """Whether a session is the worktree at path's. tmux-resurrect starts a
+    restored session in its first pane's saved folder, which can be one
+    inside the worktree."""
+    if inside(Path(start), path):
+        return True
+    return bool(panes) and all(inside(Path(pane), path) for pane in panes)
 
 
 def has_session(name: str) -> bool:
