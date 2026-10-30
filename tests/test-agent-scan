@@ -1085,6 +1085,48 @@ def make_repos(root: Path) -> str:
     return git(app, "rev-parse", "--short", "HEAD")
 
 
+# git_changes runs every second for every pane, beside agents committing in
+# the same tree. Porcelain `git diff` refreshes the index and writes it
+# back, holding index.lock while it does, which makes an agent's own `git
+# add` fail. Each repository has staged and unstaged edits, a staged rename
+# and a file whose mtime no longer matches the index, which is what makes
+# porcelain write. (name, folder)
+CHANGES_CASES = (
+    ("repository with commits", "changes"),
+    ("repository with none yet", "changes-unborn"),
+)
+
+
+def make_changes(repo: Path) -> Path:
+    """A repository in CHANGES_CASES' shape; with no commits when its name
+    says so."""
+    git(repo.parent, "init", "-q", str(repo))
+    for name, lines in (("a.txt", 3), ("b.txt", 2), ("old.txt", 10),
+                        ("still.txt", 1)):
+        (repo / name).write_text("".join(f"{name} {i}\n" for i in range(lines)))
+    git(repo, "add", ".")
+    if not repo.name.endswith("unborn"):
+        git(repo, "commit", "-q", "--no-verify", "-m", "init")
+        git(repo, "mv", "old.txt", "new.txt")
+    (repo / "a.txt").write_text("a.txt 0\nchanged\nadded\nadded\n")
+    (repo / "b.txt").write_text("b.txt 0\nb.txt 1\nstaged\n")
+    git(repo, "add", "b.txt")
+    (repo / "b.txt").write_text("b.txt 0\nb.txt 1\nstaged\nunstaged\n")
+    later = time.time() + 100
+    os.utime(repo / "still.txt", (later, later))
+    return repo
+
+
+def porcelain_changes(repo: Path) -> str:
+    """What git_changes said when it ran porcelain `git diff --numstat`."""
+    added = deleted = 0
+    for args in (("diff", "--numstat"), ("diff", "--cached", "--numstat")):
+        for line in git(repo, *args).splitlines():
+            plus, minus, _ = line.split("\t", 2)
+            added, deleted = added + int(plus), deleted + int(minus)
+    return f"+{added} -{deleted}"
+
+
 def channel_target_pattern() -> re.Pattern[str]:
     """The pattern the television channel pulls the target out with."""
     output = tomllib.loads(CHANNEL.read_text())["source"]["output"]
@@ -1222,6 +1264,23 @@ def main() -> int:
             failures += not ok
             print(f"{'ok  ' if ok else 'FAIL'}  identity {name:36} "
                   f"{'ok' if ok else f'want={want} got={got}'}")
+
+        for name, folder in CHANGES_CASES:
+            repo = make_changes(root / folder)
+            index = repo / ".git" / "index"
+            before = index.read_bytes()
+            got = mod.git_changes(str(repo))
+            ok = index.read_bytes() == before
+            failures += not ok
+            print(f"{'ok  ' if ok else 'FAIL'}  changes  "
+                  f"{name + ', index untouched':36} "
+                  f"{'ok' if ok else 'index rewritten'}")
+            want = porcelain_changes(repo)
+            ok = got == want
+            failures += not ok
+            print(f"{'ok  ' if ok else 'FAIL'}  changes  "
+                  f"{name + ', same as git diff':36} "
+                  f"want={want} got={got}")
 
     for name, text, want in FIT_CASES:
         got = mod.fit(text, mod.IDENTITY_MAX)
@@ -1401,7 +1460,8 @@ def main() -> int:
              + len(WEEKLY_CASES)
              + len(WEEKLY_COLOR_CASES) + len(SORT_CASES)
              + len(COLLAPSE_CASES) + len(PROJECT_CASES)
-             + len(IDENTITY_CASES) + len(FIT_CASES) + 1
+             + len(IDENTITY_CASES) + 2 * len(CHANGES_CASES)
+             + len(FIT_CASES) + 1
              + len(TARGET_CASES) + 1 + 4 + len(CONTEXT_LEVEL_CASES)
              + len(TMUX_CASES) + len(TMUX_HIDDEN_CASES) + 3
              + len(PANE_CASES) + 8)
