@@ -233,6 +233,27 @@ check "it follows to a new window" in_place
 tmux -L "${host}" resize-window -t host -x 200
 check "it keeps its width when the terminal grows" in_place
 
+# Each resize-pane fires a hook that runs follow again, so a width it cannot
+# reach must not be tried over and over.
+t set-hook -g "after-resize-pane[11]" "run-shell -b 'echo >>${scratch}/resizes'"
+resizes() { cat "${scratch}/resizes" 2>/dev/null | wc -l | tr -d ' '; }
+settles() {
+    local before
+    sleep 1
+    before="$(resizes)"
+    sleep 1
+    [[ "$(resizes)" == "${before}" ]]
+}
+t select-layout -t "$(sidebar)" even-vertical
+check "panes stacked across its width do not set off resize after resize" settles
+t select-layout -t "$(sidebar)" main-vertical
+check "and a layout it fits in again gets its width back" in_place
+tmux -L "${host}" resize-window -t host -x 30
+check "nor does a terminal narrower than its width" settles
+tmux -L "${host}" resize-window -t host -x 200
+check "which gets its width back when it grows" in_place
+t set-hook -gu "after-resize-pane[11]"
+
 t split-window -t main:three
 t resize-pane -Z -t main:three
 t switch-client -t main

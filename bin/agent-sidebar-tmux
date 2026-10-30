@@ -188,7 +188,7 @@ follow() {
     if [[ "$(tmux show-options -gqv @agent-sidebar-open)" != 1 ]]; then
         return 0
     fi
-    local viewed window zoomed pane home panes pane_width width
+    local viewed window zoomed pane home panes pane_width width layout
     width="$(setting width)"
     viewed="$(viewed_window)"
     if [[ -z "${viewed}" ]]; then
@@ -223,11 +223,20 @@ follow() {
         open_in "${window}" "${width}" >/dev/null
     elif [[ "${home}" != "${window}" ]]; then
         tmux join-pane -hbf -l "${width}" -d -s "${pane}" -t "${window}"
-    elif ((pane_width != width)); then
+    elif ((pane_width != width)) && [[ "$(tmux display-message -p -t \
+        "${pane}" '#{window_layout}')" != "$(tmux show-options -pqv \
+        -t "${pane}" @agent-sidebar-cramped)" ]]; then
         # A layout change or a resized terminal spread the columns out
         # again. Only when it is off: resize-pane fires the very hooks that
-        # run this.
+        # run this. And not again in a layout where it could not get there
+        # (a window too narrow, the panes stacked by select-layout): each
+        # try would fire the next.
         tmux resize-pane -t "${pane}" -x "${width}"
+        read -r pane_width layout <<<"$(tmux display-message -p \
+            -t "${pane}" '#{pane_width} #{window_layout}')"
+        if ((pane_width != width)); then
+            tmux set-option -p -t "${pane}" @agent-sidebar-cramped "${layout}"
+        fi
     fi
 }
 
