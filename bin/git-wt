@@ -937,6 +937,9 @@ def bootstrap(target: Path, print_index: bool = False) -> int:
         """Whether writing dest would go through a symlink out of the worktree."""
         return not inside(dest.parent.resolve(), worktree)
 
+    # One path that cannot be set up does not stop the others.
+    failed: list[str] = []
+
     with tempfile.TemporaryDirectory() as scratch_dir:
         scratch = Path(scratch_dir)
         matcher = Matcher(scratch)
@@ -963,8 +966,13 @@ def bootstrap(target: Path, print_index: bool = False) -> int:
                 elif escapes(dest):
                     warn(f"  Skipped, would leave the worktree: {path}")
                 else:
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    dest.symlink_to(main / path)
+                    try:
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        dest.symlink_to(main / path)
+                    except OSError as error:
+                        warn(f"  Could not link {path}: {error.strerror or error}")
+                        failed.append(path)
+                        continue
                     say(f"  Linked: {path}")
             exclude_links(common, linked)
 
@@ -996,8 +1004,13 @@ def bootstrap(target: Path, print_index: bool = False) -> int:
                 elif escapes(dest):
                     warn(f"  Skipped, would leave the worktree: {path}")
                 else:
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(source, dest)
+                    try:
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(source, dest)
+                    except OSError as error:
+                        warn(f"  Could not copy {path}: {error.strerror or error}")
+                        failed.append(path)
+                        continue
                     say(f"  Copied: {path}")
 
     say(f"  Index: {index}")
@@ -1027,6 +1040,8 @@ def bootstrap(target: Path, print_index: bool = False) -> int:
             if code != 0:
                 raise Fail("mise task worktree:setup failed; fix it and re-run git-wt bootstrap")
 
+    if failed:
+        raise Fail(f"Could not copy or link {', '.join(failed)}")
     say(green("✓ Worktree bootstrapped"))
     return 0
 
