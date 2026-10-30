@@ -63,6 +63,7 @@ export HOME="${scratch}/home" XDG_STATE_HOME="${scratch}/state"
 mkdir -p "${HOME}"
 readonly messages="${XDG_STATE_HOME}/agent-sidebar/messages.jsonl"
 readonly delivered="${XDG_STATE_HOME}/agent-sidebar/messages-delivered.jsonl"
+readonly nudged="${XDG_STATE_HOME}/agent-sidebar/messages-nudged.jsonl"
 unset TMUX TMUX_PANE
 
 t() { tmux -L "${socket}" "$@"; }
@@ -349,6 +350,9 @@ next() {
 delivered_to() {
     jq -c --argjson id "$1" 'select(.id == $id) | .pane' "${delivered}" 2>/dev/null
 }
+nudged_to() {
+    jq -c --argjson id "$1" 'select(.id == $id) | .pane' "${nudged}" 2>/dev/null
+}
 
 id="$(next)"
 out="$(msg send "${dialog}" "yes please")"
@@ -381,6 +385,35 @@ check "a message to a pane with unsent text in its input is queued" \
     has "${out}" "queued msg ${first} for app-draft ${drafting}: ${drafting} has unsent text in its input."
 check "rather than pasted into the middle of it" same "$(got "${drafting}")" ""
 
+# Waiting long, its sender is told: AGENT_MSG_NUDGE=0 makes any wait long.
+from_shell="$(next)"
+TMUX_PANE="${shell}" agent-msg send "${drafting}" "from a shell" >/dev/null
+blocker="$(start app-blocked codex)"
+wait_for "${blocker}" 'Esc to cancel'
+from_blocked="$(next)"
+TMUX_PANE="${blocker}" agent-msg send "${drafting}" "from a dialog" >/dev/null
+skip="$(size "${orch}")"
+AGENT_MSG_NUDGE=0 agent-msg deliver
+note="$(got "${orch}" "${skip}")"
+check "the sender of a message that waits long is told, by a note" \
+    has "${note}" $'\e[200~[note from agent-msg · msg '"${first}"' to app-draft '"${drafting}"' is still queued after '
+check "saying why it waits, pasted and submitted" \
+    has "${note}" ': '"${drafting}"$' has unsent text in its input · it is pasted once that clears]\e[201~\r'
+check "and recorded as told" same "$(nudged_to "${first}")" "\"${orch}\""
+check "a sender that runs no agent is recorded as told nobody" \
+    same "$(nudged_to "${from_shell}")" null
+check "one blocked on a dialog itself is left to a later pass" \
+    same "$(got "${blocker}") $(nudged_to "${from_blocked}")" " "
+t respawn-pane -k -t "${blocker}" claude
+wait_for "${blocker}" '❯'
+skip="$(size "${orch}")"
+AGENT_MSG_NUDGE=0 agent-msg deliver
+check "which tells it once it clears" \
+    has "$(got "${blocker}")" "[note from agent-msg · msg ${from_blocked} to app-draft ${drafting} is still queued"
+check "and tells a sender only once" same "$(got "${orch}" "${skip}")" ""
+check "while the messages still wait" \
+    same "$(delivered_to "${first}")$(delivered_to "${from_shell}")$(delivered_to "${from_blocked}")" ""
+
 id="$(next)"
 TMUX_PANE="${shell}" agent-msg send "${worker}" "sent from a shell" >/dev/null
 out="$(as_worker reply "${id}" "seen")"
@@ -409,7 +442,7 @@ check "a second deliver --watch leaves it to the one running" same "${status}" 0
 id="$(next)"
 out="$(msg send "${drafting}" "still there?")"
 check "while one runs, a queued message is said to be pasted once it clears" \
-    has "${out}" "agent-msg deliver pastes it once that clears."
+    has "${out}" "agent-msg deliver pastes it once that clears, and tells you if it still waits in 10m."
 t respawn-pane -k -t "${drafting}" claude
 wait_for "${drafting}" '❯'
 for _ in $(seq 50); do
@@ -418,7 +451,7 @@ for _ in $(seq 50); do
 done
 check "deliver --watch pastes the queue, oldest first, once it clears" \
     same "$(got "${drafting}" | tr '\r' '\n' | grep -oE '\[msg [0-9]+' | paste -sd ' ')" \
-    "[msg ${first} [msg ${id}"
+    "[msg ${first} [msg ${from_shell} [msg ${from_blocked} [msg ${id}"
 
 XDG_STATE_HOME="" msg send "${worker}" "hi" >/dev/null
 check "without XDG_STATE_HOME the log is in ~/.local/state" \

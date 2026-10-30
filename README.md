@@ -38,7 +38,7 @@ Without TPM, clone the repository and run its entry point from `~/.tmux.conf`:
 run-shell ~/path/to/agent-sidebar/agent-sidebar.tmux
 ```
 
-Either way, the plugin also starts `agent-msg deliver --watch`, which pastes messages queued for an agent that could not take them yet, for as long as tmux runs.
+Either way, the plugin also starts `agent-msg deliver --watch`, which pastes messages queued for an agent that could not take them yet, and tells the sender of one that waits long, for as long as tmux runs.
 
 Then, once, in a shell:
 

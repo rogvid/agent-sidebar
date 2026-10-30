@@ -20,7 +20,8 @@
 #   log [--json] [--from WHO] [--to WHO] [--with WHO] [--thread ID]
 #       [--last N]           every message, oldest first; WHO is a pane id
 #                            or a session name
-#   deliver [--watch]        paste every queued message that can be now;
+#   deliver [--watch]        paste every queued message that can be now,
+#                            and tell the sender of one that waits long;
 #                            with --watch, every few seconds for as long as
 #                            tmux runs, one watcher at a time (the plugin
 #                            starts it)
@@ -79,6 +80,15 @@
 # the log was one its sender never saw. A message queued for longer than a
 # day is not pasted any more; it stays in its recipient's inbox.
 #
+# A sender is told when its message waits long (AGENT_MSG_NUDGE seconds,
+# 10 minutes by default): deliver pastes a note into its pane saying what
+# still waits and why, once, so it can tell the person it works for. Its
+# line in messages-nudged.jsonl, {"id","time","pane"}, says it was told,
+# with a null pane when it runs no agent any more to tell. A note is not
+# logged and is not a message: it carries no instruction to verify.
+#
+#   [note from agent-msg · msg 19 to shop-feat-login %42 is still queued after 10m: %42 is blocked on a dialog (Do you want to run this command?) · it is pasted once that clears]
+#
 # Addresses are a pane in a session. Pane ids do not survive a session that
 # is killed and started again, and tmux hands them out again from %0 when
 # its server restarts, while a session's name comes back. So a pane's inbox
@@ -100,6 +110,7 @@ readonly dir="${XDG_STATE_HOME:-${HOME}/.local/state}/agent-sidebar"
 readonly log_file="${dir}/messages.jsonl"
 readonly read_file="${dir}/messages-read.jsonl"
 readonly delivered_file="${dir}/messages-delivered.jsonl"
+readonly nudged_file="${dir}/messages-nudged.jsonl"
 readonly lock_file="${dir}/messages.lock"
 # Held by the one deliver --watch running.
 readonly watch_lock="${dir}/deliver.lock"
@@ -110,6 +121,8 @@ readonly interval="${AGENT_MSG_INTERVAL:-3}"
 # How long a queued message waits to be pasted before it is left to the
 # recipient's inbox.
 readonly patience=$((24 * 60 * 60))
+# How long a queued message waits before its sender is told so.
+readonly nudge_after="${AGENT_MSG_NUDGE:-600}"
 
 usage() {
     sed -n '2,/^$/s/^# \{0,1\}//p' "$0"
@@ -122,6 +135,17 @@ die() {
 
 now() {
     date -u +%Y-%m-%dT%H:%M:%SZ
+}
+
+# SECONDS the way a person says it: 45s, 10m, 3h.
+span() {
+    if (($1 < 120)); then
+        echo "$1s"
+    elif (($1 < 7200)); then
+        echo "$(($1 / 60))m"
+    else
+        echo "$(($1 / 3600))h"
+    fi
 }
 
 # Hold the log's lock on fd 9 until the script exits: exclusive, or shared
@@ -245,8 +269,9 @@ header() {
 
 # Where each message on stdin, one a line, can be pasted now, by
 # agent-scan's ROWS: printed as {message, pane}, or {message, wait} saying
-# why it has to wait. That is the pane it was sent to, or once that is
-# gone, the one agent running in its session.
+# why it has to wait, with busy set when an agent is there but cannot take
+# a paste yet. That is the pane it was sent to, or once that is gone, the
+# one agent running in its session.
 route() {
     local rows="$1" live
     live="$(tmux list-panes -a -F '#{session_name}	#{pane_id}' 2>/dev/null |
@@ -257,9 +282,9 @@ route() {
         def checked($pane): row($pane) as $row
             | if $row == null then {wait: "\($pane) runs no agent"}
               elif $row.state == "blocked"
-              then {wait: "\($pane) is blocked on a dialog (\($row.message))"}
+              then {wait: "\($pane) is blocked on a dialog (\($row.message))", busy: true}
               elif ($row.draft // "") != ""
-              then {wait: "\($pane) has unsent text in its input"}
+              then {wait: "\($pane) has unsent text in its input", busy: true}
               else {pane: $pane} end;
         . as $message | .to.pane as $pane | .to.session as $session
         | $live[$session] as $panes
@@ -298,7 +323,7 @@ dispatch() {
     if [[ -z "${pane}" ]]; then
         echo "queued ${what} for ${session} $(jq -r .to.pane <<<"${message}"): $(jq -r .wait <<<"${routed}")."
         if watched; then
-            echo "agent-msg deliver pastes it once that clears."
+            echo "agent-msg deliver pastes it once that clears, and tells you if it still waits in $(span "${nudge_after}")."
         else
             echo "No agent-msg deliver --watch is running to paste it then (the tmux plugin starts one); until one does, it waits in their inbox."
         fi
@@ -372,21 +397,60 @@ queued() {
             and (.time | fromdateiso8601? // 0) >= $since))'
 }
 
-# Paste every queued message that can be now. agent-scan only runs when one
-# is queued for a session that is running.
+# Tell the sender of MESSAGE, which still waits for the reason WAIT, that
+# it does, by agent-scan's ROWS; the caller holds the lock. A sender that
+# is busy itself is told on a later pass, and one that runs no agent any
+# more is not told at all, which is recorded the same, with a null pane.
+nudge() {
+    local message="$1" wait="$2" rows="$3" routed pane note age
+    routed="$(jq -c '{to: .from}' <<<"${message}" | route "${rows}")"
+    pane="$(jq -r '.pane // ""' <<<"${routed}")"
+    if [[ -n "${pane}" ]]; then
+        age="$(($(date +%s) - $(jq '.time | fromdateiso8601' <<<"${message}")))"
+        note="$(jq -r --arg wait "${wait}" --arg age "$(span "${age}")" '
+            (if .kind == "reply" then "reply \(.id)" else "msg \(.id)" end) as $what
+            | "[note from agent-msg · \($what) to \(.to.session) \(.to.pane) is still queued after \($age): \($wait) · it is pasted once that clears]"' \
+            <<<"${message}")"
+        paste_into "${pane}" "${note}" || return 0
+    elif [[ "$(jq '.busy == true' <<<"${routed}")" == true ]]; then
+        return 0
+    fi
+    jq -c --arg time "$(now)" --arg pane "${pane}" \
+        '{id, time: $time, pane: (if $pane == "" then null else $pane end)}' \
+        <<<"${message}" >>"${nudged_file}"
+}
+
+# jq: whether the sender of queued message . is due to be told it still
+# waits, by $due (the latest time it can have been sent) and $told (the
+# ids whose senders were).
+# shellcheck disable=SC2016
+readonly owed='(.time | fromdateiso8601) <= $due and (.id | IN($told[]) | not)'
+
+# Paste every queued message that can be now, and tell the sender of each
+# that has waited too long. agent-scan only runs when one is queued for a
+# session that is running, or a sender is owed a note.
 deliver_queued() {
-    local sessions messages rows routed
+    local sessions told due messages rows routed message
     lock
     sessions="$(tmux list-sessions -F '#{session_name}' 2>/dev/null |
         jq -cR '[., inputs]')" || return 0
+    told="$(slurp "${nudged_file}" | jq -c 'map(.id)')"
+    due="$(($(date +%s) - nudge_after))"
     messages="$(queued | jq -c --argjson sessions "${sessions}" \
-        '.[] | select(.to.session | IN($sessions[]))')"
+        --argjson told "${told}" --argjson due "${due}" \
+        ".[] | select((.to.session | IN(\$sessions[])) or ${owed})")"
     [[ -n "${messages}" ]] || return 0
     rows="$(agent-scan --json)"
     while IFS= read -r -u 3 routed; do
-        deliver_to "$(jq -c .message <<<"${routed}")" "$(jq -r .pane <<<"${routed}")" ||
-            true
-    done 3< <(route "${rows}" <<<"${messages}" | jq -c 'select(.pane)')
+        message="$(jq -c .message <<<"${routed}")"
+        if [[ "$(jq -r '.pane // ""' <<<"${routed}")" != "" ]]; then
+            deliver_to "${message}" "$(jq -r .pane <<<"${routed}")" || true
+        else
+            nudge "${message}" "$(jq -r .wait <<<"${routed}")" "${rows}"
+        fi
+    done 3< <(route "${rows}" <<<"${messages}" |
+        jq -c --argjson told "${told}" --argjson due "${due}" \
+            "select(.pane or (.message | ${owed}))")
 }
 
 deliver() {
