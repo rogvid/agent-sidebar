@@ -1093,13 +1093,24 @@ def parse_changes(lines: list[str]) -> str | None:
 
 
 def git_changes(cwd: str) -> str | None:
-    """Fallback when pane doesn't show `(+X,-Y)`: sum `git diff --numstat`."""
+    """Fallback when pane doesn't show `(+X,-Y)`: sum the numstat of the
+    unstaged and the staged changes."""
     # Not a git repo -> nothing to show
     if git(cwd, "rev-parse", "--is-inside-work-tree") != "true":
         return None
+    # Plumbing, not `git diff`: porcelain refreshes the index and writes it
+    # back, and an agent's own `git add` fails on the index.lock that holds
+    # while it does, every second, for every pane. -M stands in for the
+    # rename detection porcelain does by default. A repository with no
+    # commits yet has no HEAD, and its staged files are compared against
+    # the empty tree, as porcelain does.
+    staged = git(cwd, "diff-index", "--cached", "--numstat", "-M", "HEAD")
+    if staged is None:
+        empty = git(cwd, "hash-object", "-t", "tree", "/dev/null")
+        staged = empty and git(
+            cwd, "diff-index", "--cached", "--numstat", "-M", empty)
     added = deleted = 0
-    for args in (("diff", "--numstat"), ("diff", "--cached", "--numstat")):
-        out = git(cwd, *args)
+    for out in (git(cwd, "diff-files", "--numstat"), staged):
         if out:
             for line in out.splitlines():
                 parts = line.split("\t")
@@ -1263,7 +1274,7 @@ class Row:
     harness: str = ""
     role: str = ""
     # +- line changes for the branch's working tree, parsed from the pane's
-    # statusline `(+X,-Y)` or via `git diff --numstat` fallback. `∅` when
+    # statusline `(+X,-Y)` or via git_changes' numstat fallback. `∅` when
     # clean, `-` outside a repo.
     changes: str = "-"
     # All of what the pane last said, where message is its first line cut
