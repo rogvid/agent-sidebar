@@ -304,6 +304,23 @@ def run(
     return Result(p.returncode, strip_ansi(p.stdout), strip_ansi(p.stderr))
 
 
+def answer_later(cmd: list[str], cwd: Path, meanwhile, answer: str = "y\n") -> Result:
+    """Runs cmd, does meanwhile while its [y/N] prompt waits, then answers."""
+    p = subprocess.Popen(
+        cmd, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, env=env_with(None),
+    )
+    seen = b""
+    while b"[y/N]" not in seen:
+        chunk = os.read(p.stdout.fileno(), 4096)
+        if not chunk:
+            break
+        seen += chunk
+    meanwhile()
+    out, err = p.communicate(answer.encode(), timeout=60)
+    return Result(p.returncode, strip_ansi((seen + out).decode()), strip_ansi(err.decode()))
+
+
 def command(cmd: str, *args: str) -> list[str]:
     if VIA_WRAPPERS and cmd in WRAPPERS:
         return [WRAPPERS[cmd], *args]
@@ -1498,6 +1515,15 @@ def remove_command():
           refused and r.code == 0 and removed(p) and not c.has_branch("feat/squashed"),
           r.desc())
 
+    p = c.add_wt("feat/late")
+    c.commit(p, "late-1.txt", "1\n")
+    ff_merge(c, "feat/late")
+    late: list[str] = []
+    r = answer_later(command("remove", "--no-fetch", "-d", "feat/late"), c.main,
+                     lambda: late.append(c.commit(p, "late-2.txt", "2\n")))
+    check("-d keeps a branch that got a commit while the prompt waited",
+          r.code == 0 and removed(p) and c.tip("feat/late") == late[0], r.desc())
+
     # tmux.
     kill_tmux()
     p = c.add_wt("feat/tmux")
@@ -1592,6 +1618,13 @@ def prune_command():
           and not dirty.exists(), r.desc())
     r = wt("prune", "-f", "--no-fetch", cwd=c.main)
     check("nothing to prune exits 0", r.code == 0 and fresh.exists(), r.desc())
+
+    late = merged_wt("feat/late")
+    tips: list[str] = []
+    r = answer_later(command("prune", "-d", "--no-fetch"), c.main,
+                     lambda: tips.append(c.commit(late, "late-2.txt", "2\n")))
+    check("prune -d keeps a branch that got a commit while the prompt waited",
+          r.code == 0 and not late.exists() and c.tip("feat/late") == tips[0], r.desc())
 
     # The main checkout on a merged branch.
     m = Case("prune-primary")
