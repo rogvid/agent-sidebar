@@ -339,6 +339,9 @@ check "gives it the session git-wt names it" equals \
     "t display-message -p -t =app-feat-x: #{pane_current_path}" "${worktree}"
 check "starts the agent in it" exists "${worktree}/agent-started"
 check "and takes you there" equals client_session app-feat-x
+# The sidebar's session is the one git-wt switch and remove then use.
+wt_session() { TMUX="$(t display-message -p '#{socket_path},#{pid},0')" git-wt session "$1" | cut -f1; }
+check "which git-wt counts as the worktree's" equals "wt_session ${worktree}" app-feat-x
 
 # spawn is new-worktree for an agent starting workers: no popup, no move.
 spawned="$(act spawn "${agent}" feat/y "touch agent-y" || true)"
@@ -347,6 +350,8 @@ check "prints the new agent's pane, in the session git-wt names" equals \
     "t display-message -p -t ${spawned} #{session_name}" app-feat-y
 check "starts the harness it is given there" exists "${project}/feat-y/agent-y"
 check "and leaves you where you were" equals client_session app-feat-x
+check "git-wt counts spawn's session as the worktree's" \
+    equals "wt_session ${project}/feat-y" app-feat-y
 check "spawn refuses a session that already exists" not act spawn "${agent}" feat/y
 check "and types nothing into it" equals "t list-panes -t =app-feat-y: -F #{pane_id}" "${spawned}"
 outsider="$(t new-window -d -t main: -c "${scratch}" -P -F '#{pane_id}' 'sleep 3600')"
