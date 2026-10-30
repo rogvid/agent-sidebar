@@ -182,6 +182,17 @@ INTERRUPT_RE = re.compile(
     r"^\s{0,6}(?:[■⬝▪▫]{2,}\s+)?(?:esc|ctrl\+c)\s+(?:to\s+)?interrupt\b",
     re.IGNORECASE,
 )
+# pi's loader: ` ⠹ Working...`, one braille frame a column in, then its
+# message - `Working...`, `Compacting context... (escape to cancel)` or
+# whatever an extension sets. A transcript quoting one is indented further.
+PI_SPINNER_RE = re.compile(r"^ ?[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s+(\S.*)")
+# codex's status row: `• Working (12s • esc to interrupt)`. The bullet is
+# also its transcript's, and is not drawn at all with reduced motion, so the
+# parenthetical is what marks it. The header is `Working` or whatever codex
+# is reasoning about.
+CODEX_STATUS_RE = re.compile(
+    r"^(?:[•◦] )?(\w[^()]*?)\s+\((?:\d+[hms]\s*)+•\s*\S+ to interrupt\)"
+)
 # claude's approval menu: the selected line `❯ 1. Yes`, boxed or not, plus a
 # sibling option line `  2. No` or the dialog's own prose as corroboration -
 # a lone `❯ 1. …` is also what a user typing "1. do this" looks like.
@@ -681,6 +692,8 @@ def is_chrome(line: str) -> bool:
         or SUMMARY_RE.match(line)
         or DELEGATED_RE.match(line)
         or SPINNER_RE.match(line)
+        or PI_SPINNER_RE.match(line)
+        or CODEX_STATUS_RE.match(line)
         or re.match(r"^\s*[╹┃│]?\s*[▀▄─═]{4,}", line)
     )
 
@@ -743,6 +756,9 @@ def spinner_message(region: list[str]) -> str | None:
         if m:
             verb = re.sub(rf"^\s*{SPINNER_GLYPH}\s+", "", m.group(0))
             return clean(re.sub(r"\s*\(.*", "", verb))
+        m = PI_SPINNER_RE.match(line) or CODEX_STATUS_RE.match(line)
+        if m:
+            return clean(re.sub(r"\s*\(.*", "", m.group(1)))
     return None
 
 
@@ -952,7 +968,8 @@ def classify(lines: list[str]) -> str:
         return "blocked"
 
     tail = body[-TAIL_LINES:]
-    if any(SPINNER_RE.match(line) for line in tail):
+    if any(SPINNER_RE.match(line) or PI_SPINNER_RE.match(line)
+           or CODEX_STATUS_RE.match(line) for line in tail):
         return "running"
     if any(INTERRUPT_RE.match(line) for line in tail):
         return "running"

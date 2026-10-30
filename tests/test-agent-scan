@@ -12,8 +12,8 @@
 
 Every sample below is a real `tmux capture-pane` tail, trimmed to the live
 UI region: claude 2.1.247/2.1.248/2.1.250/2.1.270/2.1.284 and opencode
-1.18.23/1.18.31 across the five states, and pi 0.79.0 idle and in its
-selectors.
+1.18.23/1.18.31 across the five states, pi 0.79.0 idle, running and in
+its selectors, and codex 0.166.0 from its own vt100 snapshot tests.
 They are the regression net for the patterns in agent-scan, which are the
 only thing standing between a status row and a plausible lie.
 
@@ -315,6 +315,52 @@ PI_QUOTED_HINT = """ The selector closes with this row:
 ~/projects/app (main)
 0.0%/0 (auto)                                                        unknown"""
 
+# pi 0.79.0 mid-turn: its loader, a braille frame one column in and three
+# dots rather than claude's ellipsis, sits between the transcript and the
+# editor.
+PI_RUNNING = """ please be slow
+
+
+ ⠹ Working...
+
+────────────────────────────────────────────────────────────
+
+────────────────────────────────────────────────────────────
+~/projects/app
+0.0%/128k (auto)                                                        fake"""
+
+# codex 0.166.0's status row, from its own vt100 snapshots: a bullet that
+# is also its transcript's, a header, then the elapsed time and the
+# interrupt hint in one parenthetical.
+CODEX_RUNNING = """• I'm going to search the repo for where "Change Approved" is rendered.
+
+• Explored
+  └ Search Change Approved
+    Read diff_render.rs
+
+• Working (12s • esc to interrupt)
+
+
+› Ask Codex to do anything
+
+  ? for shortcuts                                 100% context left"""
+
+# The header is whatever codex is reasoning about, and with reduced motion
+# the bullet is not drawn at all.
+CODEX_RUNNING_HEADER = CODEX_RUNNING.replace(
+    "• Working (12s • esc to interrupt)",
+    "Investigating rendering code (1m 05s • esc to interrupt)")
+
+CODEX_IDLE = """› count to 1
+
+
+• 1
+
+
+› Ask Codex to do anything
+
+  ? for shortcuts                                 100% context left"""
+
 # A pane displaying someone else's dialog, with its own input bar below it.
 QUOTED_CLAUDE_DIALOG = CLAUDE_WAITING_EDIT + "\n" + CLAUDE_IDLE
 QUOTED_OPENCODE_DIALOG = OPENCODE_WAITING + "\n" + CLAUDE_IDLE
@@ -366,6 +412,10 @@ STATE_CASES = (
     ("pi blocked (trust dialog)", PI_TRUST, "blocked"),
     ("pi blocked (selector)", PI_SELECTOR, "blocked"),
     ("pi pane quoting its key hints", PI_QUOTED_HINT, "done"),
+    ("pi running", PI_RUNNING, "running"),
+    ("codex running", CODEX_RUNNING, "running"),
+    ("codex running (own header)", CODEX_RUNNING_HEADER, "running"),
+    ("codex done", CODEX_IDLE, "done"),
     ("done pane quoting claude dialog", QUOTED_CLAUDE_DIALOG, "done"),
     ("done pane quoting opencode dialog", QUOTED_OPENCODE_DIALOG, "done"),
     ("done pane quoting a question", QUOTED_ASK_DIALOG, "done"),
@@ -640,6 +690,9 @@ MESSAGE_CASES = (
     # talking, so the real last line has to win.
     ("weekly notice is not a message", "done", CLAUDE_WEEKLY,
      "Counted from 1 to 200."),
+    ("pi running shows its loader", "running", PI_RUNNING, "Working..."),
+    ("codex running shows its header", "running", CODEX_RUNNING_HEADER,
+     "Investigating rendering code"),
 )
 
 
