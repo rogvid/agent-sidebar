@@ -1150,9 +1150,11 @@ async def restore_cases(mod) -> list[tuple[str, bool, str]]:
 
 def message(id: int, sender: tuple[str, str], to: tuple[str, str],
             text: str = "hello", reply_to: int | None = None,
-            ago: float = 120, push: bool | None = None) -> dict:
+            ago: float = 150, push: bool | None = None) -> dict:
     """A line of agent-msg's log, sent ago seconds before now; with push,
-    one logged since agent-msg pastes every message it can."""
+    one logged since agent-msg pastes every message it can. The ages are
+    mid-minute, so a wall clock stepping back a second (as WSL's does)
+    cannot show one a minute younger."""
     def end(address):
         session, pane = address
         return {"pane": pane, "session": session, "project": session,
@@ -1362,8 +1364,8 @@ async def message_cases(mod) -> list[tuple[str, bool, str]]:
     work = ("dotfiles-feat-sidebar-messages-and-more", "%2")
     append(sent,
            message(1, orch, ("koyr", "%1"), "Check the build\nand the tests",
-                   ago=3 * 3600),
-           message(2, ("koyr", "%1"), orch, "Green.", reply_to=1, ago=600),
+                   ago=3 * 3600 + 1800),
+           message(2, ("koyr", "%1"), orch, "Green.", reply_to=1, ago=630),
            message(3, orch, work, "Rebase onto main\nthen report back"),
            message(4, orch, ("koyr", "%7"), "For a pane now gone"))
     append(read, {"id": 2, "time": "2026-09-30T12:00:00Z", "by": "%9"})
