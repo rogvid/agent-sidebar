@@ -949,16 +949,21 @@ PROJECT_CASES = (
     ("bare repo in a hidden folder", "/home/u/koyr/.bare", "koyr"),
 )
 
-# (project, branch) for real repositories in every shape the branch column
-# tells apart. `{sha}` is the detached worktree's HEAD, known only once the
-# repositories exist.
+# (project, branch, the project's folder) for real repositories in every
+# shape the branch column tells apart. `{sha}` is the detached worktree's
+# HEAD, known only once the repositories exist; folders are under the root.
 IDENTITY_CASES = (
-    ("branch in the main checkout", "app", ("app", "main")),
-    ("worktree names its main repo", "app-feature-x", ("app", "feature/x")),
-    ("subfolder of a worktree", "app-feature-x/sub", ("app", "feature/x")),
-    ("detached head shows the commit", "app-detached", ("app", "@{sha}")),
-    ("branch with no commits yet", "fresh", ("fresh", "trunk")),
-    ("outside any repository", "plain", ("plain", "no git")),
+    ("branch in the main checkout", "app", ("app", "main", "app")),
+    ("worktree names its main repo", "app-feature-x",
+     ("app", "feature/x", "app")),
+    ("subfolder of a worktree", "app-feature-x/sub",
+     ("app", "feature/x", "app")),
+    ("detached head shows the commit", "app-detached",
+     ("app", "@{sha}", "app")),
+    ("branch with no commits yet", "fresh", ("fresh", "trunk", "fresh")),
+    ("another project of the same name", "elsewhere/app",
+     ("app", "main", "elsewhere/app")),
+    ("outside any repository", "plain", ("plain", "no git", "plain")),
 )
 
 FIT_CASES = (
@@ -1220,6 +1225,7 @@ def make_repos(root: Path) -> str:
     (root / "app-feature-x" / "sub").mkdir()
     git(app, "worktree", "add", "-q", "--detach", str(root / "app-detached"))
     git(root, "init", "-q", "-b", "trunk", str(root / "fresh"))
+    git(root, "init", "-q", "-b", "main", str(root / "elsewhere" / "app"))
     (root / "plain").mkdir()
     return git(app, "rev-parse", "--short", "HEAD")
 
@@ -1391,13 +1397,16 @@ def main() -> int:
     for var in [v for v in os.environ if v.startswith("GIT_")]:
         del os.environ[var]
     with tempfile.TemporaryDirectory() as tmp:
-        root = Path(tmp)
+        # Resolved, as git gives the folders: the temp dir may be reached
+        # through a link (macOS's /var is /private/var).
+        root = Path(tmp).resolve()
         # Keeps `plain` from finding whatever repository the temp dir
         # happens to sit inside.
         os.environ["GIT_CEILING_DIRECTORIES"] = str(root)
         sha = make_repos(root)
-        for name, folder, (want_project, want_branch) in IDENTITY_CASES:
-            want = (want_project, want_branch.format(sha=sha))
+        for name, folder, (want_project, want_branch, want_dir) in IDENTITY_CASES:
+            want = (want_project, want_branch.format(sha=sha),
+                    str(root / want_dir))
             got = mod.git_identity(str(root / folder))
             ok = got == want
             failures += not ok

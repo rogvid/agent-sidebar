@@ -74,6 +74,7 @@ Fields:
 - `pane_id` - stable tmux id (`%12`). Address panes with this, never `target` (window indices shift).
 - `target` - `session:window.pane`, for reading only.
 - `project` - repo name; every worktree of a project shares it.
+- `project_dir` - the repo's folder, which tells apart two projects of one name; the `cwd` outside a repository.
 - `branch` - checked-out branch, `@<sha>` when detached, `no git` outside a repository.
 - `cwd` - the pane's working directory.
 - `state` - `blocked > interrupted > done > running > delegated`. `blocked`/`interrupted`/`done` need you; `running`/`delegated` do not.
