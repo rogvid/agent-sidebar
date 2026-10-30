@@ -537,7 +537,10 @@ class Merges:
             )
             target_tree = repo.git("rev-parse", f"{target}^{{tree}}").strip()
             lines = merged_tree.stdout.split()
-            if merged_tree.returncode == 0 and lines and lines[0] == target_tree:
+            # Commits that add up to no change, such as one and its revert,
+            # merge as a no-op too, without anything of theirs being there.
+            if (merged_tree.returncode == 0 and lines and lines[0] == target_tree
+                    and not repo.ok("diff", "--quiet", f"{target}...{ref}")):
                 return f"merged into {target}, squashed"
         for label, head in self.requests().get(branch, []):
             if head == tip:
