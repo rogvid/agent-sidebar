@@ -116,7 +116,9 @@ def read(file: Path | None = None) -> dict[str, Any]:
             data = tomllib.load(handle)
     except FileNotFoundError:
         return {}
-    except (OSError, tomllib.TOMLDecodeError) as error:
+    # tomllib decodes the bytes itself, and lets a file that is not UTF-8
+    # through as a UnicodeDecodeError.
+    except (OSError, tomllib.TOMLDecodeError, UnicodeDecodeError) as error:
         raise ConfigError(f"{file}: {error}") from None
     try:
         for key, value in data.items():
@@ -162,7 +164,8 @@ def _parse(key: str, raw: str) -> Any:
         except ValueError:
             return None
         return value if value > 0 else None
-    return raw or None
+    # One line, as in the file: bash reads the answers a line each.
+    return raw if raw and "\n" not in raw else None
 
 
 def get(

@@ -39,8 +39,9 @@ def load_config():
     return module
 
 
-# (name, file contents or None for no file, settings wanted or None for
-# broken, a piece of the error wanted)
+# (name, file contents - text, or bytes for what no editor should save - or
+# None for no file, settings wanted or None for broken, a piece of the error
+# wanted)
 READ_CASES = (
     ("no file is no settings", None, {}, None),
     ("an empty file is no settings", "", {}, None),
@@ -68,6 +69,7 @@ READ_CASES = (
      "one line of text"),
     ("an unknown table", '[sidebar]\nwidth = 40\n', None,
      "unknown setting 'sidebar'"),
+    ("not UTF-8", b'hide = ["\xff"]\n', None, "utf-8"),
 )
 
 # (name, git config in the project, variables, file, key, want). Per
@@ -97,6 +99,9 @@ GET_CASES = (
      {"AGENT_SIDEBAR_WIDTH": "wide"}, {"width": 40}, "width", 40),
     ("hide has no variable", {}, {"AGENT_SIDEBAR_HIDE": "x"}, {}, "hide",
      []),
+    # bash reads the answers a line each, as for the file.
+    ("a variable over two lines falls through", {},
+     {"AGENT_SIDEBAR_COMMAND": "a\nb"}, {"command": "x"}, "command", "x"),
 )
 
 # Session names against hide = ["orchestrator", "scratch-*"].
@@ -144,7 +149,9 @@ def main() -> int:
 
     for name, text, want, error_part in READ_CASES:
         file.unlink(missing_ok=True)
-        if text is not None:
+        if isinstance(text, bytes):
+            file.write_bytes(text)
+        elif text is not None:
             file.write_text(text)
         settings, error = mod.load(file)
         if want is None:
@@ -225,6 +232,13 @@ def main() -> int:
     ok = (out.returncode == 0 and out.stdout == "36\n"
           and "ignoring" in out.stderr and str(config) in out.stderr)
     report("cli", "get on a broken file still answers, the defaults", ok,
+           "" if ok else f"got={out!r}")
+
+    config.write_bytes(b'hide = ["\xff"]\n')
+    out = cli(home, "check")
+    ok = (out.returncode == 1 and str(config) in out.stderr
+          and "Traceback" not in out.stderr)
+    report("cli", "check names a file that is not UTF-8", ok,
            "" if ok else f"got={out!r}")
 
     config.write_text('[sidebar]\nwidth = 40\n')
