@@ -13,7 +13,9 @@
 Every sample below is a real `tmux capture-pane` tail, trimmed to the live
 UI region: claude 2.1.247/2.1.248/2.1.250/2.1.270/2.1.284 and opencode
 1.18.23/1.18.31 across the five states, pi 0.79.0 idle, running and in
-its selectors, and codex 0.166.0 from its own vt100 snapshot tests.
+its selectors, and codex 0.166.0 from its own vt100 snapshot tests. The
+drafts are live: codex 0.166.0, opencode 1.18.30 and pi 0.79.0 with text
+typed and not sent.
 They are the regression net for the patterns in agent-scan, which are the
 only thing standing between a status row and a plausible lie.
 
@@ -463,6 +465,53 @@ CODEX_IDLE_DRAFT = """› count to 1
 
   gpt-5 default · /tmp/project"""
 
+# A live codex 0.166.0 with a two-line draft, the second wrapped.
+CODEX_DRAFT = """  >_ OpenAI Codex (v0.166.0)
+     /tmp/project
+
+
+› half a thought
+  and a second line that goes on for quite a while so that it wraps past the edge of this hundred
+  column pane
+
+  GPT-6.1-Sol default · /tmp/project"""
+
+# codex's trust prompt at launch, live, which has its options where the
+# composer goes and closes with key hints of its own.
+CODEX_TRUST = """  Folder access
+  /tmp/project
+
+  Trust this folder? Codex can read, edit, and run files here, subject to your permission
+  settings. Folder settings can run code automatically, even without a model request. Continue
+  only if you trust these files. Your trust decision will be saved.
+
+› 1. Trust and continue
+  2. Back to Agent Command Center
+
+  enter continue · esc back"""
+
+# A live opencode 1.18.30 session with a draft in its box. The row under
+# the text names the agent and model.
+OPENCODE_DRAFT = """  ┃
+  ┃  count to 1
+  ┃
+
+     Done counting to one.
+
+     ▣  Build · Fake M · 2.7s
+
+  ┃
+  ┃  half a thought
+  ┃
+  ┃  Build · Fake M Fake
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   /tmp/project                                                      tab       ctrl+p
+                                                                     agents    commands"""
+OPENCODE_EMPTY = OPENCODE_DRAFT.replace("  ┃  half a thought\n", "  ┃\n")
+
+# Live pi 0.79.0 with a draft in its editor.
+PI_DRAFT = PI_IDLE.replace("\n\n────", "\nhalf a thought\n────")
+
 # claude in its default permission mode, with no statusline: the input box
 # and its `? for shortcuts` hint are all there is under the transcript.
 CLAUDE_DEFAULT_QUOTED_YESNO = """● The installer will ask: Overwrite existing config? (y/n)
@@ -554,36 +603,6 @@ CONTEXT_CASES = (
     ("statusline under an agent tray", CLAUDE_DELEGATED_PAIR, "75.5k"),
     ("opencode footer, lowercase k", OPENCODE_IDLE, "12.4k"),
     ("no statusline visible", OPENCODE_WAITING, "-"),
-)
-
-# Unsent text in the input box: agent-msg holds a message back rather than
-# paste it into the middle of what someone is writing.
-DRAFT_CASES = (
-    ("claude, empty prompt", CLAUDE_IDLE, ""),
-    ("claude, prompt put back after a stop", CLAUDE_INTERRUPTED,
-     "Run this bash command in the foreground: ping -c 40 127.0.0.1"),
-    ("claude, typed and not sent", TYPED_NUMBERED_LINE, "1. do this thing"),
-    ("claude, working", CLAUDE_RUNNING_TIMED, ""),
-    ("pi, empty editor", PI_IDLE, ""),
-    ("opencode, no box it can read", OPENCODE_IDLE, ""),
-)
-
-# The same, from a capture with its escapes (capture-pane -e): claude puts
-# its suggested next prompt, greyed, in an empty box, and that is nobody's
-# typing.
-STYLED_BOX = ("\x1b[2m\x1b[37m✻\x1b[0m \x1b[2m\x1b[37mWorked for 42s\x1b[0m\n"
-              "\x1b[37m" + "─" * 60 + "\n{}\n\x1b[37m" + "─" * 60 + "\n"
-              "\x1b[39m  \x1b[38;5;96m⎇ main\x1b[2m\x1b[37m | \x1b[0m"
-              "\x1b[38;5;178m(+0,-0)\n")
-STYLED_DRAFT_CASES = (
-    ("a suggested prompt, dim",
-     "\x1b[39m❯\xa0\x1b[2mreassign #535 and #536 to Simone\x1b[0m", ""),
-    ("an empty box with a dim prompt", "\x1b[2m❯\xa0\x1b[0m", ""),
-    ("typed", "\x1b[39m❯\xa0reassign #535", "reassign #535"),
-    ("typed, ahead of a dim completion",
-     "\x1b[39m❯\xa0fix the \x1b[2mbug in login\x1b[0m", "fix the"),
-    ("typed in a colour with a 2 in its number",
-     "\x1b[39m❯\xa0\x1b[38;5;2mgreen words\x1b[0m", "green words"),
 )
 
 AGE_CASES = (
@@ -745,6 +764,64 @@ OPENCODE_BLOCK_WHOLE = (
 
 # Fixed clock so the `· done H:MM` arithmetic is deterministic: 2026-08-27
 # at 23:34 local time, the moment these captures were taken.
+# Unsent text in the input box: agent-msg holds a message back rather than
+# paste it into the middle of what someone is writing.
+DRAFT_CASES = (
+    ("claude, empty prompt", CLAUDE_IDLE, ""),
+    ("claude, prompt put back after a stop", CLAUDE_INTERRUPTED,
+     "Run this bash command in the foreground: ping -c 40 127.0.0.1"),
+    ("claude, typed and not sent", TYPED_NUMBERED_LINE, "1. do this thing"),
+    ("claude, working", CLAUDE_RUNNING_TIMED, ""),
+    ("pi, empty editor", PI_IDLE, ""),
+    ("pi, typed and not sent", PI_DRAFT, "half a thought"),
+    ("opencode, empty box", OPENCODE_IDLE, ""),
+    ("opencode, empty box in a session", OPENCODE_EMPTY, ""),
+    ("opencode, typed and not sent", OPENCODE_DRAFT, "half a thought"),
+    ("opencode, its sidebar beside the box", OPENCODE_SIDEBAR, ""),
+    ("opencode, typed beside its sidebar",
+     OPENCODE_SIDEBAR.replace("┃" + " " * 17, "┃  half a thought ", 1),
+     "half a thought"),
+    ("codex, typed and not sent", CODEX_DRAFT,
+     "half a thought and a second line that goes on for quite a while so "
+     "that it wraps past the edge of this hundred column pane"),
+    ("codex, its status line under it", CODEX_IDLE_DRAFT,
+     "run the tests next and then commit"),
+    ("codex, an approval in its place", CODEX_APPROVAL_EXEC, ""),
+    ("codex, a narrow approval", CODEX_APPROVAL_NARROW, ""),
+    ("codex, a picker in its place", CODEX_PICKER, ""),
+    ("codex, its trust prompt", CODEX_TRUST, ""),
+)
+
+# The same, from a capture with its escapes (capture-pane -e): claude puts
+# its suggested next prompt, greyed, in an empty box, and that is nobody's
+# typing.
+STYLED_BOX = ("\x1b[2m\x1b[37m✻\x1b[0m \x1b[2m\x1b[37mWorked for 42s\x1b[0m\n"
+              "\x1b[37m" + "─" * 60 + "\n{}\n\x1b[37m" + "─" * 60 + "\n"
+              "\x1b[39m  \x1b[38;5;96m⎇ main\x1b[2m\x1b[37m | \x1b[0m"
+              "\x1b[38;5;178m(+0,-0)\n")
+STYLED_DRAFT_CASES = (
+    ("a suggested prompt, dim",
+     "\x1b[39m❯\xa0\x1b[2mreassign #535 and #536 to Simone\x1b[0m", ""),
+    ("an empty box with a dim prompt", "\x1b[2m❯\xa0\x1b[0m", ""),
+    ("typed", "\x1b[39m❯\xa0reassign #535", "reassign #535"),
+    ("typed, ahead of a dim completion",
+     "\x1b[39m❯\xa0fix the \x1b[2mbug in login\x1b[0m", "fix the"),
+    ("typed in a colour with a 2 in its number",
+     "\x1b[39m❯\xa0\x1b[38;5;2mgreen words\x1b[0m", "green words"),
+)
+
+# Live, styled (capture-pane -e): codex greys its placeholder with SGR 2,
+# and draws your typing plain.
+STYLED_CODEX = ("\x1b[1m›\x1b[0m {}\n\n"
+                "  \x1b[38;2;246;226;183mGPT-6.1-Sol default\x1b[39m · "
+                "\x1b[38;2;171;223;167m/tmp/project\n\x1b[39m  "
+                "\x1b[1m←\x1b[0m for agents · \x1b[1m?\x1b[0m for shortcuts\n")
+STYLED_CODEX_CASES = (
+    ("codex's placeholder, dim",
+     "\x1b[2mAsk Codex to do anything\x1b[0m", ""),
+    ("codex, typed", "half a thought", "half a thought"),
+)
+
 NOW = time.mktime((2026, 8, 27, 23, 34, 0, 0, 0, -1))
 
 DURATION_CASES = (
@@ -1300,12 +1377,14 @@ def main() -> int:
         print(f"{'ok  ' if ok else 'FAIL'}  draft    {name:36} "
               f"want={want!r} got={got!r}")
 
-    for name, box, want in STYLED_DRAFT_CASES:
-        got = mod.pane_draft(STYLED_BOX.format(box).splitlines(), styled=True)
-        ok = got == want
-        failures += not ok
-        print(f"{'ok  ' if ok else 'FAIL'}  draft    {name:36} "
-              f"want={want!r} got={got!r}")
+    for screen, cases in ((STYLED_BOX, STYLED_DRAFT_CASES),
+                          (STYLED_CODEX, STYLED_CODEX_CASES)):
+        for name, box, want in cases:
+            got = mod.pane_draft(screen.format(box).splitlines(), styled=True)
+            ok = got == want
+            failures += not ok
+            print(f"{'ok  ' if ok else 'FAIL'}  draft    {name:36} "
+                  f"want={want!r} got={got!r}")
 
     for name, sample, want in AGE_CASES:
         got = mod.parse_age(mod.visible_lines(sample))
@@ -1607,6 +1686,7 @@ def main() -> int:
           f"{'ok' if ok else f'want={shown} got={status_bar!r}'}")
 
     total = (len(STATE_CASES) + len(CONTEXT_CASES) + len(DRAFT_CASES) + len(STYLED_DRAFT_CASES)
+             + len(STYLED_CODEX_CASES)
              + len(AGE_CASES)
              + len(BLOCK_CASES) + len(COLOR_CASES) + len(DURATION_CASES)
              + len(MESSAGE_CASES) + len(FULL_MESSAGE_CASES)

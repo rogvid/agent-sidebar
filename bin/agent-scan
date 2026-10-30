@@ -232,7 +232,16 @@ CODEX_QUESTION_RE = re.compile(r"^\s{0,2}Question \d+/\d+\b")
 # codex's composer: `› Ask Codex to do anything`, or a draft, with only
 # indented rows - the draft's own, the footer - under it. Its transcript
 # marks your messages the same way, but has its answers at column 0 below.
-CODEX_COMPOSER_RE = re.compile(r"^› ")
+# Its dim placeholder left out of a styled capture, the row is a bare `›`.
+CODEX_COMPOSER_RE = re.compile(r"^›(?:\s|$)")
+# The key hints a codex dialog or picker closes with, when it puts its
+# options in the composer's place with `›` on the chosen one: `Press enter
+# to confirm or esc to cancel`, `enter select · esc back`, `enter continue
+# · esc back` on the trust prompt, `… | enter to submit answer | …`.
+CODEX_KEYS_RE = re.compile(
+    r"^\s{0,2}(?:[^|·]*[|·]\s+)*(?:Press\s+)?enter\s+(?:to\s+)?"
+    r"(?:confirm|select|continue|submit)\b"
+)
 # Plain shell-style confirmations, for agents that do not draw a menu.
 YESNO_RE = re.compile(r"\[y/n\]|\(y/n\)\s*[?:]?\s*$", re.IGNORECASE | re.MULTILINE)
 # The input bar under the prompt box: claude's permission-mode hint and
@@ -676,31 +685,49 @@ def cut_cells(line: str, width: int) -> str:
     return line
 
 
+def opencode_box(lines: list[str]) -> tuple[int, int] | None:
+    """Where opencode's input box is: its first `┃` row and its `╹▀▀▀`
+    rule. The rule is only taken from the last rows, where nothing but the
+    hint bar sits below it, so a claude transcript quoting one cannot pass
+    for it."""
+    tail = range(max(len(lines) - 3, 0), len(lines))
+    end = next((i for i in reversed(tail)
+                if OPENCODE_BOX_END_RE.match(lines[i])), None)
+    if end is None:
+        return None
+    top = end
+    while top > 0 and OPENCODE_BOX_RE.match(lines[top - 1]):
+        top -= 1
+    return top, end
+
+
+def codex_composer(lines: list[str]) -> int | None:
+    """Where codex's composer is: its `›` row, the last one with nothing but
+    indented rows below it."""
+    composer = next((i for i in range(len(lines) - 1, -1, -1)
+                     if CODEX_COMPOSER_RE.match(lines[i])), None)
+    if composer is not None and all(
+            not line[:1].strip() for line in lines[composer + 1:]):
+        return composer
+    return None
+
+
 def transcript_region(lines: list[str]) -> list[str]:
     """Everything above the agent's input box.
 
     claude draws the box as two full-width rules; the transcript ends at the
     first of them. opencode's ends at the `┃` rows above its `╹▀▀▀` rule,
-    and it is cut to the rule's width to leave the sidebar out. The rule is
-    only taken from the last rows, where nothing but the hint bar sits below
-    it, so a claude transcript quoting one cannot pass for it. codex's ends
-    at its composer's `›` row, the last one with nothing but indented rows
-    below it. Agents that draw none of these fall through to the whole
-    pane, and the chrome filter below sorts out their footer.
+    and it is cut to the rule's width to leave the sidebar out. codex's ends
+    at its composer's `›` row. Agents that draw none of these fall through
+    to the whole pane, and the chrome filter below sorts out their footer.
     """
-    tail = range(max(len(lines) - 3, 0), len(lines))
-    end = next((i for i in reversed(tail)
-                if OPENCODE_BOX_END_RE.match(lines[i])), None)
-    if end is not None:
-        top = end
-        while top > 0 and OPENCODE_BOX_RE.match(lines[top - 1]):
-            top -= 1
+    box = opencode_box(lines)
+    if box is not None:
+        top, end = box
         width = cells(lines[end])
         return [cut_cells(line, width) for line in lines[:top]]
-    composer = next((i for i in range(len(lines) - 1, -1, -1)
-                     if CODEX_COMPOSER_RE.match(lines[i])), None)
-    if composer is not None and all(
-            not line[:1].strip() for line in lines[composer + 1:]):
+    composer = codex_composer(lines)
+    if composer is not None:
         return lines[:composer]
     borders = [i for i, line in enumerate(lines) if BORDER_RE.match(line)]
     if len(borders) >= 2:
@@ -911,7 +938,34 @@ def scrolled_up(lines: list[str]) -> bool:
 
 
 def input_draft(lines: list[str]) -> str:
-    """Unsent text sitting in the input box, if any."""
+    """Unsent text sitting in the input box, if any.
+
+    opencode's is the box's `┃` rows but the last, which names the agent and
+    model, cut to the rule's width like the transcript. It greys a
+    placeholder in only on its home screen, where the box floats mid-pane
+    and is not read. codex's is its composer's `›` row and the indented
+    rows under it down to the first blank one, where its footer starts, and
+    none while a dialog or picker has the composer's place. claude's and
+    pi's is what sits between the box's two rules.
+    """
+    box = opencode_box(lines)
+    if box is not None:
+        top, end = box
+        width = cells(lines[end])
+        text = " ".join(cut_cells(line, width).strip().lstrip("┃")
+                        for line in lines[top:end - 1])
+        return " ".join(text.split())
+    composer = codex_composer(lines)
+    if composer is not None:
+        below = lines[composer + 1:]
+        if any(CODEX_KEYS_RE.match(line) for line in below):
+            return ""
+        rows = [lines[composer][1:]]
+        for line in below:
+            if not line.strip():
+                break
+            rows.append(line)
+        return " ".join(" ".join(rows).split())
     borders = [i for i, line in enumerate(lines) if BORDER_RE.match(line)]
     if len(borders) < 2:
         return ""

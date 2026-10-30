@@ -7,7 +7,9 @@
 # and reads their state off the screen: one waits at a prompt with
 # bracketed paste on and records every byte it is sent (`claude draft` has
 # unsent text in its input box, and `claude suggest` a dim suggested
-# prompt), one sits on a permission dialog.
+# prompt), one sits on a permission dialog. `codex draft` and `opencode
+# draft` have unsent text in input of their own shape, and `codex idle`
+# only codex's dim placeholder.
 #
 # Run: tests/test-agent-msg     (or `mise run test`)
 
@@ -43,10 +45,26 @@ printf '\e[?2004h❯ '
 stty raw -echo
 cat >"${received}/\${TMUX_PANE#%}"
 EOF
-# An agent waiting on a permission dialog.
+# An agent waiting on a permission dialog, or at codex's own composer,
+# which has no box around it.
 cat >"${scratch}/bin/codex" <<EOF
 #!/bin/bash
-printf 'Do you want to run this command?\n❯ 1. Yes\n  2. No\n\nEsc to cancel\n'
+if [[ "\${1:-}" == draft ]]; then
+    printf '› half a thought\n\n  ? for shortcuts\n'
+elif [[ "\${1:-}" == idle ]]; then
+    printf '› \e[2mAsk Codex to do anything\e[0m\n\n  ? for shortcuts\n'
+else
+    printf 'Do you want to run this command?\n❯ 1. Yes\n  2. No\n\nEsc to cancel\n'
+fi
+stty raw -echo
+cat >"${received}/\${TMUX_PANE#%}"
+EOF
+# opencode with unsent text in its box, above the box's agent and model row.
+cat >"${scratch}/bin/opencode" <<EOF
+#!/bin/bash
+printf '  ┃\n  ┃  half a thought\n  ┃\n  ┃  Build · Big Pickle OpenCode Zen\n'
+printf '  ╹%s\n' "\$(printf '▀%.0s' {1..60})"
+printf '   ~/app  tab agents  ctrl+p commands\n'
 stty raw -echo
 cat >"${received}/\${TMUX_PANE#%}"
 EOF
@@ -415,6 +433,21 @@ suggesting="$(start app-suggest 'claude suggest')"
 wait_for "${suggesting}" 'run the tests again'
 check "a dim suggested prompt in the box is nobody's typing, so it is pasted" \
     has "$(msg send "${suggesting}" "hello")" "sent msg "
+# codex and opencode draw no box like claude's. Sent from the shell, so the
+# messages left waiting tell nobody.
+for harness in codex opencode; do
+    pane="$(start "app-${harness}-draft" "${harness} draft")"
+    wait_for "${pane}" 'half a thought'
+    id="$(next)"
+    out="$(TMUX_PANE="${shell}" agent-msg send "${pane}" "when you have a moment")"
+    check "${harness}'s unsent text is seen, and the message queued" \
+        has "${out}" "queued msg ${id} for app-${harness}-draft ${pane}: ${pane} has unsent text in its input."
+    check "rather than pasted into the middle of it" same "$(got "${pane}")" ""
+done
+codex_idle="$(start app-codex-idle 'codex idle')"
+wait_for "${codex_idle}" 'Ask Codex'
+check "codex's dim placeholder is nobody's typing, so it is pasted" \
+    has "$(msg send "${codex_idle}" "hello")" "sent msg "
 
 # A message to a pane that is gone goes to the one agent left in its
 # session, but not back to its own sender.
