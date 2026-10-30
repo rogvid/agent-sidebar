@@ -97,8 +97,9 @@ check "talking to the server that started it" \
 
 t "${plain}" run-shell "${plugin}"
 check "a re-source starts no second watcher" same "$(watchers)" "${watcher}"
+# The command, not just its name: the checkout's own path may contain that.
 check "a re-source adds no second count" \
-    same "$(count "$(t "${plain}" show-options -gv status-right)" agent-scan)" 1
+    same "$(count "$(t "${plain}" show-options -gv status-right)" "agent-scan' --tmux")" 1
 check "nor a second PATH entry" \
     same "$(count "$(t "${plain}" show-environment -g PATH)" "${repo}/bin")" 1
 check "nor a second hook" \
