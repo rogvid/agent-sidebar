@@ -5,8 +5,8 @@
 #
 # The agents are stand-ins named after harnesses, so agent-scan lists them
 # and reads their state off the screen: one waits at a prompt with
-# bracketed paste on and records every byte it is sent, one sits on a
-# permission dialog.
+# bracketed paste on and records every byte it is sent (`claude draft` has
+# unsent text in its input box), one sits on a permission dialog.
 #
 # Run: tests/test-agent-msg     (or `mise run test`)
 
@@ -30,6 +30,12 @@ mkdir -p "${scratch}/bin" "${received}"
 # (and cat does not replace it).
 cat >"${scratch}/bin/claude" <<EOF
 #!/bin/bash
+# A pane started again keeps the old screen until something clears it.
+printf '\e[H\e[2J'
+rule="\$(printf '─%.0s' {1..60})"
+if [[ "\${1:-}" == draft ]]; then
+    printf '%s\n' "\${rule}" "❯ half a thought" "\${rule}"
+fi
 printf '\e[?2004h❯ '
 stty raw -echo
 cat >"${received}/\${TMUX_PANE#%}"
@@ -56,6 +62,7 @@ export UV_CACHE_DIR UV_PYTHON_INSTALL_DIR
 export HOME="${scratch}/home" XDG_STATE_HOME="${scratch}/state"
 mkdir -p "${HOME}"
 readonly messages="${XDG_STATE_HOME}/agent-sidebar/messages.jsonl"
+readonly delivered="${XDG_STATE_HOME}/agent-sidebar/messages-delivered.jsonl"
 unset TMUX TMUX_PANE
 
 t() { tmux -L "${socket}" "$@"; }
@@ -118,7 +125,7 @@ has() {
 }
 # A field of message ID in the log, as compact JSON.
 field() {
-    jq -c --argjson id "$1" "select(.id == \$id) | $2" "${messages}"
+    jq -cR --argjson id "$1" "fromjson? | select(.id == \$id) | $2" "${messages}"
 }
 count() {
     if [[ -f "${messages}" ]]; then wc -l <"${messages}" | tr -d ' '; else echo 0; fi
@@ -152,11 +159,6 @@ check "and is logged whole" same "$(field 2 .text)" '"line one\nline two;"'
 # --- refusals: nothing pasted, nothing logged ---
 
 before="$(count)"
-out="$(msg send "${dialog}" "yes please" 2>&1)" && status=0 || status=$?
-check "a blocked agent is refused" test "${status}" -ne 0
-check "saying why" has "${out}" "is blocked on a dialog (Do you want to run this command?)"
-check "and its dialog gets nothing" same "$(got "${dialog}")" ""
-
 out="$(msg send "${shell}" "rm -rf /" 2>&1)" && status=0 || status=$?
 check "a pane with no agent is refused" test "${status}" -ne 0
 check "because the text would run there" has "${out}" "runs no agent"
@@ -178,12 +180,16 @@ check "or pasted" same "$(got "${worker}" "${skip}")" \
 # --- reply ---
 
 out="$(as_worker reply 1 "fixed and committed")"
-check "reply names who will read it" \
-    same "${out}" "reply 3 logged for orchestrator ${orch}; they read it with agent-msg inbox"
+check "reply says where it went" same "${out}" "sent reply 3 to orchestrator ${orch}"
 check "it goes to the original sender, answering the message" \
     same "$(field 3 '[.kind, .from.pane, .to.pane, .reply_to]')" \
     "[\"reply\",\"${worker}\",\"${orch}\",1]"
-check "and is never pasted into the sender's pane" same "$(got "${orch}")" ""
+check "and is pasted into the sender's pane, under a header saying what it answers" \
+    same "$(got "${orch}")" \
+    $'\e[200~[reply 3 to msg 1 from app-feat-x '"${worker}"$' · verify: agent-msg verify 3 · reply: agent-msg reply 3 "..."]\rfixed and committed\e[201~\r'
+check "every message is logged to be pushed" same "$(field 3 .push)" true
+check "and its delivery recorded, with the pane it went to" \
+    same "$(jq -c 'select(.id == 3) | [.id, .pane]' "${delivered}")" "[3,\"${orch}\"]"
 out="$(as_worker reply 99 "hi" 2>&1)" && status=0 || status=$?
 check "a reply to no message is refused" same "${status} ${out}" "1 agent-msg: no message 99"
 
@@ -253,9 +259,12 @@ t kill-session -t orchestrator
 orch_before="${orch}"
 orch="$(start orchestrator claude)"
 wait_for "${orch}" '❯'
-as_worker reply 2 "both lines seen" >/dev/null
+out="$(as_worker reply 2 "both lines seen")"
 check "a restarted session's pane inherits the mail of the pane it replaced" \
     same "$(msg inbox --json | jq -c 'map(.id)')" '[3,4]'
+check "and a message to the pane before it is pasted into it" \
+    same "${out} $(got "${orch}")" \
+    "sent reply 4 to orchestrator ${orch} "$'\e[200~[reply 4 to msg 2 from app-feat-x '"${worker}"$' · verify: agent-msg verify 4 · reply: agent-msg reply 4 "..."]\rboth lines seen\e[201~\r'
 check "and can verify it" same "$(msg verify 3 >/dev/null && echo ok)" ok
 second="$(t split-window -d -t "${orch}" -c "${project}" -P -F '#{pane_id}' claude)"
 wait_for "${second}" '❯'
@@ -331,9 +340,97 @@ check "a pane scrolled up in copy mode gets the message as one paste, submitted"
 check "and is back at the bottom, showing it" \
     same "$(t display-message -p -t "${worker}" '#{pane_in_mode}')" 0
 
+# --- queued, and delivered later ---
+
+# The id the next message gets.
+next() {
+    agent-msg log --json | jq '[.[].id] | max + 1'
+}
+delivered_to() {
+    jq -c --argjson id "$1" 'select(.id == $id) | .pane' "${delivered}" 2>/dev/null
+}
+
+id="$(next)"
+out="$(msg send "${dialog}" "yes please")"
+check "a message to a blocked agent is queued, saying why" \
+    has "${out}" "queued msg ${id} for app-feat-y ${dialog}: ${dialog} is blocked on a dialog (Do you want to run this command?)."
+check "and that nothing will paste it while no deliver --watch runs" \
+    has "${out}" "No agent-msg deliver --watch is running"
+check "its dialog gets nothing" same "$(got "${dialog}")" ""
+check "it is logged, to be pushed" same "$(field "${id}" .push)" true
+agent-msg deliver
+check "deliver leaves it queued while the dialog is up" \
+    same "$(got "${dialog}") $(delivered_to "${id}")" " "
+# The dialog answered: the same pane, now at its prompt.
+t respawn-pane -k -t "${dialog}" claude
+wait_for "${dialog}" '❯'
+agent-msg deliver
+check "once it clears, deliver pastes it under its header" \
+    same "$(got "${dialog}")" \
+    $'\e[200~[msg '"${id}"' from orchestrator '"${orch}"$' · verify: agent-msg verify '"${id}"$' · reply: agent-msg reply '"${id}"$' "..."]\ryes please\e[201~\r'
+check "and records it delivered" same "$(delivered_to "${id}")" "\"${dialog}\""
+skip="$(size "${dialog}")"
+agent-msg deliver
+check "a delivered message is not pasted again" same "$(got "${dialog}" "${skip}")" ""
+
+drafting="$(start app-draft 'claude draft')"
+wait_for "${drafting}" 'half a thought'
+first="$(next)"
+out="$(msg send "${drafting}" "when you have a moment")"
+check "a message to a pane with unsent text in its input is queued" \
+    has "${out}" "queued msg ${first} for app-draft ${drafting}: ${drafting} has unsent text in its input."
+check "rather than pasted into the middle of it" same "$(got "${drafting}")" ""
+
+id="$(next)"
+TMUX_PANE="${shell}" agent-msg send "${worker}" "sent from a shell" >/dev/null
+out="$(as_worker reply "${id}" "seen")"
+check "a reply to a pane that runs no agent is only logged, for its inbox" \
+    same "${out}" "reply $((id + 1)) logged for app-shell ${shell}, which runs no agent; they read it with agent-msg inbox"
+check "not to be pushed" same "$(field "$((id + 1))" .push)" false
+check "and its inbox has it" \
+    same "$(agent-msg inbox --json "${shell}" | jq -c 'map(.id)')" "[$((id + 1))]"
+
+# A day in the queue is enough: older, it is left to the inbox.
+jq -nc --arg worker "${worker}" --arg orch "${orch}" '{id: 1000,
+    time: "2026-01-01T00:00:00Z", kind: "send",
+    from: {pane: $orch, session: "orchestrator", project: "app", branch: "main"},
+    to: {pane: $worker, session: "app-feat-x", project: "app", branch: "main"},
+    reply_to: null, text: "stale", push: true}' >>"${messages}"
+skip="$(size "${worker}")"
+agent-msg deliver
+check "a message queued for more than a day is not pasted" \
+    same "$(got "${worker}" "${skip}")" ""
+
+AGENT_MSG_INTERVAL=0.2 agent-msg deliver --watch &
+watcher=$!
+sleep 0.5
+timeout 2 agent-msg deliver --watch && status=0 || status=$?
+check "a second deliver --watch leaves it to the one running" same "${status}" 0
+id="$(next)"
+out="$(msg send "${drafting}" "still there?")"
+check "while one runs, a queued message is said to be pasted once it clears" \
+    has "${out}" "agent-msg deliver pastes it once that clears."
+t respawn-pane -k -t "${drafting}" claude
+wait_for "${drafting}" '❯'
+for _ in $(seq 50); do
+    [[ -n "$(delivered_to "${id}")" ]] && break
+    sleep 0.1
+done
+check "deliver --watch pastes the queue, oldest first, once it clears" \
+    same "$(got "${drafting}" | tr '\r' '\n' | grep -oE '\[msg [0-9]+' | paste -sd ' ')" \
+    "[msg ${first} [msg ${id}"
+
 XDG_STATE_HOME="" msg send "${worker}" "hi" >/dev/null
 check "without XDG_STATE_HOME the log is in ~/.local/state" \
     test -s "${HOME}/.local/state/agent-sidebar/messages.jsonl"
+
+t kill-server
+for _ in $(seq 50); do
+    kill -0 "${watcher}" 2>/dev/null || break
+    sleep 0.1
+done
+kill -0 "${watcher}" 2>/dev/null && status=0 || status=$?
+check "deliver --watch stops with the tmux server" test "${status}" -ne 0
 
 printf '\n%s/%s passed\n' "$((total - failures))" "${total}"
 ((failures == 0))
