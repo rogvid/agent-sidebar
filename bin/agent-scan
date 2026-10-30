@@ -51,7 +51,9 @@ for tools that lay them out themselves (agent-sidebar). Names are not cut
 short there, and each row also carries the pane's tmux id, its working
 directory, how far into context rot it is (`context_level`: ok, warn, rot,
 or unknown), and `message_full`: the whole of what the pane last said, where
-`message` is the first line of it, cut short, such as all of a recap.
+`message` is the first line of it, cut short, such as all of a recap, and
+`draft`: unsent text in its input box ("" when the box is empty or not one
+agent-scan can read).
 
 --tmux prints one coloured count per state in tmux's own style syntax, for
 the status bar, and nothing at all when no agent is running.
@@ -852,6 +854,13 @@ def input_draft(lines: list[str]) -> str:
     return clean(" ".join(line.strip() for line in box)).strip()
 
 
+def pane_draft(lines: list[str]) -> str:
+    """What sits unsent in the pane's input box: someone is writing there,
+    so agent-msg holds a message back rather than paste into it."""
+    body, _ = split_tray(lines)
+    return input_draft(body)
+
+
 def pick_message(state: str, lines: list[str], whole: bool = False) -> str:
     """What the pane is saying: the opening line of its last words, or with
     WHOLE all of them."""
@@ -1200,6 +1209,9 @@ class Row:
     # the harness does not say; see harness_session).
     argv: tuple[str, ...] = ()
     session_id: str = ""
+    # Unsent text in the input box, "" when it is empty or the harness's
+    # box is not one agent-scan can read.
+    draft: str = ""
 
 
 def sort_key(row: Row) -> tuple[int, int, float, str]:
@@ -1272,6 +1284,7 @@ def collect_rows(hide: Sequence[str] = ()) -> list[Row]:
             hidden=config.hidden(pane.session, hide),
             argv=tuple(info[harness_agent.pid][1]),
             session_id=harness_session(harness_agent, account),
+            draft=pane_draft(lines),
         ))
 
     rows.sort(key=sort_key)
