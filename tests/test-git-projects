@@ -100,5 +100,22 @@ hidden_root="$(PATH="${repo}/bin:${PATH}" git-projects "${scratch}/.hidden-root"
 check "a hidden root asked for by name is searched" \
     [ "${hidden_root}" == "${scratch}/.hidden-root/inside" ]
 
+# A repository deleted between find seeing it and stat dating it: the stat
+# stand-in deletes it first, the way a concurrent rm -rf would.
+vanish="${scratch}/vanish"
+project "${vanish}/stays" "2025-01-01"
+project "${vanish}/goes" "2025-01-01"
+mkdir -p "${scratch}/stubs"
+cat >"${scratch}/stubs/stat" <<EOF
+#!/usr/bin/env bash
+rm -rf "${vanish}/goes"
+PATH="${PATH}" exec stat "\$@"
+EOF
+chmod +x "${scratch}/stubs/stat"
+vanished="$(PATH="${scratch}/stubs:${repo}/bin:${PATH}" git-projects "${vanish}")" ||
+    vanished="exit $?"
+check "a repository vanishing mid-scan is left out, the rest listed" \
+    [ "${vanished}" == "${vanish}/stays" ]
+
 printf '\n%s/%s passed\n' "$((total - failures))" "${total}"
 ((failures == 0))

@@ -53,8 +53,9 @@ done |
         stamp="$({ stat -c %Y "${git_dir}/logs/HEAD" \
             "${git_dir}"/worktrees/*/logs/HEAD 2>/dev/null || true; } |
             sort -nr | head -1)"
+        # One deleted since find saw it is no project any more.
         if [[ -z "${stamp}" ]]; then
-            stamp="$(stat -c %Y "${git_dir}")"
+            stamp="$(stat -c %Y "${git_dir}" 2>/dev/null)" || continue
         fi
         printf '%s\t%s\n' "${stamp}" "${project}"
     done |
