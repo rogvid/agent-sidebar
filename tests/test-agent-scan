@@ -1061,6 +1061,35 @@ def scan_real_panes(root: Path) -> tuple[dict[str, dict | None], str]:
     return {name: rows.get(pane) for name, pane in panes.items()}, status_bar
 
 
+def git_calls(mod, brief: bool) -> tuple[list[str], list[str]]:
+    """The trees collect_rows runs git_changes in, and every git call it
+    makes, scanning three opencode panes in two trees whose screens do not
+    show their changes."""
+    panes = [mod.Pane(f"%{i}", "s", str(i), "0", 100 + i, cwd)
+             for i, cwd in enumerate(("/t/a", "/t/a", "/t/b"))]
+    info = {pane.pid: ("opencode", ["opencode"], 0.0) for pane in panes}
+    changes: list[str] = []
+    calls: list[str] = []
+    real = (mod.list_panes, mod.process_snapshot, mod.capture_pane,
+            mod.git, mod.git_changes)
+
+    def counted_changes(cwd: str) -> str | None:
+        changes.append(cwd)
+        return real[4](cwd)
+
+    mod.list_panes = lambda: panes
+    mod.process_snapshot = lambda: (info, {})
+    mod.capture_pane = lambda _pane_id: OPENCODE_IDLE
+    mod.git = lambda cwd, *args: calls.append(cwd) and None
+    mod.git_changes = counted_changes
+    try:
+        mod.collect_rows(brief=brief)
+    finally:
+        (mod.list_panes, mod.process_snapshot, mod.capture_pane,
+         mod.git, mod.git_changes) = real
+    return changes, calls
+
+
 def git(cwd: Path, *args: str) -> str:
     """Run git with an identity and none of the user's hooks or signing."""
     return subprocess.run(
@@ -1441,6 +1470,20 @@ def main() -> int:
     print(f"{'ok  ' if ok else 'FAIL'}  pane     {'no conversation where none is recorded':36} "
           f"{'ok' if ok else f'got={got}'}")
 
+    # Every pane asks git every second, so a tree is asked once, and the
+    # status bar, which shows only how many agents are in each state, does
+    # not ask at all.
+    changes, _ = git_calls(mod, brief=False)
+    ok = changes == ["/t/a", "/t/b"]
+    failures += not ok
+    print(f"{'ok  ' if ok else 'FAIL'}  scan     {'one git_changes per tree':36} "
+          f"{'ok' if ok else f'got={changes}'}")
+    _, calls = git_calls(mod, brief=True)
+    ok = calls == []
+    failures += not ok
+    print(f"{'ok  ' if ok else 'FAIL'}  scan     {'no git for the status bar':36} "
+          f"{'ok' if ok else f'got={calls}'}")
+
     hidden = scanned[HIDDEN_SESSION]
     ok = hidden is not None and hidden["hidden"] is True
     failures += not ok
@@ -1464,7 +1507,7 @@ def main() -> int:
              + len(FIT_CASES) + 1
              + len(TARGET_CASES) + 1 + 4 + len(CONTEXT_LEVEL_CASES)
              + len(TMUX_CASES) + len(TMUX_HIDDEN_CASES) + 3
-             + len(PANE_CASES) + 8)
+             + len(PANE_CASES) + 10)
     print(f"\n{total - failures}/{total} passed")
     return 1 if failures else 0
 

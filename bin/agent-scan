@@ -1316,7 +1316,10 @@ def sort_key(row: Row) -> tuple[int, int, float, str]:
     )
 
 
-def collect_rows(hide: Sequence[str] = ()) -> list[Row]:
+def collect_rows(hide: Sequence[str] = (), brief: bool = False) -> list[Row]:
+    """Every agent pane's row. BRIEF rows carry only what the status bar
+    shows - the state and whether the row is hidden - and the target and
+    agent, leaving out what costs a git call or a read of another process."""
     panes = list_panes()
     if not panes:
         return []
@@ -1334,15 +1337,32 @@ def collect_rows(hide: Sequence[str] = ()) -> list[Row]:
     # conflict and no warning, so it is worth saying out loud.
     trees = Counter(pane.cwd for pane, _, _ in agent_panes)
     # One lookup per tree rather than per pane, for the same reason.
-    identities = {cwd: git_identity(cwd) for cwd in trees}
+    identities = {} if brief else {cwd: git_identity(cwd) for cwd in trees}
+    # git_changes too, but only for the trees whose panes do not show their
+    # own: their statusline already says.
+    tree_changes: dict[str, str] = {}
 
     rows: list[Row] = []
     for pane, harness_agent, role in agent_panes:
         lines = visible_lines(capture_pane(pane.pane_id))
         state = classify(lines)
+        if brief:
+            rows.append(Row(
+                state=state, project="", branch="", target=pane.target,
+                pane_id=pane.pane_id, cwd=pane.cwd, agent=harness_agent.name,
+                harness=harness_agent.name, role=role, context="-",
+                duration="-", since=None, block="-", weekly="-", age="-",
+                message="", flag=" ",
+                hidden=config.hidden(pane.session, hide),
+            ))
+            continue
         since = state_seconds(state, lines, now)
         project, branch = identities[pane.cwd]
-        changes = parse_changes(lines) or git_changes(pane.cwd) or "-"
+        changes = parse_changes(lines)
+        if changes is None:
+            if pane.cwd not in tree_changes:
+                tree_changes[pane.cwd] = git_changes(pane.cwd) or "-"
+            changes = tree_changes[pane.cwd]
         account = harness_account(harness_agent)
         message, message_full = messages(state, lines)
         rows.append(Row(
@@ -1488,7 +1508,7 @@ def cmd_scan(
     if error:
         # Only stderr: the rows still go out, just with nothing hidden.
         print(f"agent-scan: ignoring {error}", file=sys.stderr)
-    rows = collect_rows(config.get("hide", settings=settings))
+    rows = collect_rows(config.get("hide", settings=settings), brief=as_tmux)
     if as_tmux:
         # An empty line, not a message: the status bar shows whatever this
         # prints.
